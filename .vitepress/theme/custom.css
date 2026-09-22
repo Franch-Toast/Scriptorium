@@ -1,0 +1,22 @@
+/* Scriptorium 站点级微调与贡献热力图色板（GitHub 风格，明暗双主题） */
+
+:root {
+  --tk-contrib-l0: #ebedf0;
+  --tk-contrib-l1: #9be9a8;
+  --tk-contrib-l2: #40c463;
+  --tk-contrib-l3: #30a14e;
+  --tk-contrib-l4: #216e39;
+}
+
+.dark {
+  --tk-contrib-l0: #161b22;
+  --tk-contrib-l1: #0e4429;
+  --tk-contrib-l2: #006d32;
+  --tk-contrib-l3: #26a641;
+  --tk-contrib-l4: #39d353;
+}
+
+/* 中文正文行高与两端渲染观感微调 */
+.vp-doc p {
+  line-height: 1.8;
+}

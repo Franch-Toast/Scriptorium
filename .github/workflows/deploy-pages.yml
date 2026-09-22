@@ -1,0 +1,58 @@
+# 推送 main 自动构建并发布到 GitHub Pages（项目站，https://<user>.github.io/<repo>/）
+# 首次启用前：仓库 Settings → Pages → Build and deployment → Source 选择 "GitHub Actions"
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 拉取完整历史——贡献热力图数据来自 git log
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # base 取仓库名，改仓库名无需改此文件；prebuild 钩子会先生成热力图数据
+      - name: Build VitePress site
+        run: pnpm build
+        env:
+          BASE_PATH: /${{ github.event.repository.name }}/
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
