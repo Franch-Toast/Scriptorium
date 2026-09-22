@@ -9,5 +9,5 @@ article: false
 
 当前内容：
 
-- [历史总结](./历史总结/)
-  - [LruMap 迁移复盘（示例归档）](./历史总结/LruMap%20迁移复盘（示例归档）)
+- 历史总结
+  - [LruMap shared_ptr\<const T\> 全量迁移报告](./历史总结/LruMap%20shared_ptr-const%20T-%20全量迁移报告) —— /sandbox 全仓库 LruMap 值存储向 COW 语义偏特化的迁移复盘
