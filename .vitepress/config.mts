@@ -95,7 +95,7 @@ export default defineConfig({
     ],
     sidebar,
     socialLinks: [
-      { icon: "github", link: "https://github.com/your-name/Scriptorium" },
+      { icon: "github", link: "https://github.com/Franch-Toast/Scriptorium" },
     ],
     search: {
       provider: "local",

@@ -1,10 +1,10 @@
-# 推送 main 自动构建并发布到 GitHub Pages（项目站，https://<user>.github.io/<repo>/）
+# 推送 master 自动构建并发布到 GitHub Pages（项目站，https://<user>.github.io/<repo>/）
 # 首次启用前：仓库 Settings → Pages → Build and deployment → Source 选择 "GitHub Actions"
 name: Deploy GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   workflow_dispatch:
 
 permissions:
