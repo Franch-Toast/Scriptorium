@@ -178,3 +178,54 @@ TLOG_writebuffersize=128  # 同语义，单位 KiB
   3. **console sink 目标**：dem 现在 `stdout_color_sink`（写 stdout），MLOG 是 `stderr_color_sink`（写 stderr）→ 语义变化需确认下游。
   4. **自研能力**：journalctl/命令输出抓取、`SetDumpPath` 等 MLOG 不提供，仍需 dem 保留。
 - 现状"stdout/stderr 重定向到文件"**不依赖自研日志栈**，故改用 MLOG 后依然成立。
+
+
+---
+
+## 六、第5轮：dem stderr buffer 生命周期修复
+
+> 变量名现状：本文档前几轮提到的 `MLOG_writebuffersize` / `TLOG_writebuffersize` / `FILE_BUFFER_SIZE` 已统一更名为 **`LOG_FILE_BUFFER_SIZE`**（spdlog / mcu_common / driver / dem 四仓库）。
+
+### 1. Reviewer 的指出
+
+`dem/src/main.cc` 中 `static std::vector<char> g_stderr_buf` 作为 stderr 的 caller buffer，会在**退出期被析构**，而 glibc stderr 仍持有该 buffer（`_IO_buf_base`）；`_IO_cleanup` 的最终 flush 与其它静态析构期的 stderr 写入构成 **use-after-free**。原 `static char[64*1024]`（.bss）无此风险。
+
+**结论：正确，已实证复现。**
+
+### 2. 机制
+
+- glibc 退出时 `_IO_cleanup`（flush 所有 stdio 流）通过 **`__libc_atexit` 段**注册，在 `__run_exit_handlers` 中**晚于** `__exit_funcs` 链执行；而 C++ 静态对象析构正是注册在 `__exit_funcs`。
+- 因此顺序为：`static vector` 析构（释放 128K buffer）→ `_IO_cleanup` flush stderr（读已释放的 `_IO_buf_base`）→ UAF。
+
+### 3. 实验证据（本机 glibc）
+
+| 实验 | 结果 |
+|-|-|
+| ASan 初测（static vector / static array） | 均未报错——sanitizer 自身接管/无缓冲化 stderr，掩盖了问题 |
+| `MALLOC_PERTURB_=170` + static vector（仅主流程写 stderr） | **stderr 输出 0 字节，数据全丢** |
+| `MALLOC_PERTURB_=170` + static 数组（对照） | 输出完整 |
+| static vector + **静态析构期写 stderr**（复刻 reviewer 场景） | **SIGSEGV，exit=139** |
+| 进程生命周期 buffer（修复方案） | exit=0，两段输出均完整 |
+
+### 4. 修复（`dem/src/main.cc`）
+
+buffer 改为**进程生命周期、永不释放**（语义等同原静态数组，同时保留 `LOG_FILE_BUFFER_SIZE` 可配置）：
+
+```cpp
+static char* g_stderr_buf = nullptr;          // 故意不释放
+...
+g_stderr_buf = static_cast<char*>(std::malloc(buf_size));
+if (g_stderr_buf != nullptr) {
+    setvbuf(stderr, g_stderr_buf, _IOFBF, buf_size);
+}
+```
+
+`malloc` 失败时降级为"不设缓冲"，保持正确性；注释说明为何不能用会析构的容器。
+
+### 5. 验证
+
+复刻 main.cc 逻辑 + strace：默认 128K 时 3000 行仅 **1 次 write(82890)**；`LOG_FILE_BUFFER_SIZE=4` 时按 4K 攒块（20 次 write）；3000 行内容完整无丢失。
+
+### 6. 同类问题说明
+
+与第 3 轮 spdlog 的 `restore_log_buffer` 属**同一类**问题（caller buffer 生命周期 vs stdio 引用）。spdlog 侧已通过 `restore_log_buffer`（sink 析构）/ `fclose`（file_helper）处理；dem `main.cc` 的手工设置此前遗漏，故需单独修。已 grep 确认全仓库 `setvbuf` / `static std::vector` 仅此一处。
