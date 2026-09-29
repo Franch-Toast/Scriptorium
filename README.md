@@ -11,7 +11,7 @@
                     │   Scriptorium（本仓库，唯一源）      │
                     │   PARA 内容 + VitePress 站点工程    │
                     └────────────────┬─────────────────┘
-                                     │ push main
+                                     │ push release tag
               ┌──────────────────────┼───────────────────────┐
               ▼                      ▼                       ▼
    ① GitHub Pages            ② 内部 Serverless           ③ 飞书云盘
@@ -74,32 +74,38 @@ Scriptorium/
 ## 日常使用：如何新增一篇文档
 
 1. 在对应分区目录下新建 `语义化标题.md`（目录结构即站点导航，**不要平铺**）；
-2. 建议带上 frontmatter：
+2. 普通文档可以直接只写正文，例如先写一级标题和内容；随后运行脚本自动补充 frontmatter：
 
-   ```yaml
-   ---
-   title: 文档标题
-   date: 2026-09-21
-   description: 一句话摘要（可选，更新记录卡片优先展示）
-   categories:
-     - 正典阁
-   tags:
-     - 笔记
-   ---
+   ```bash
+   pnpm docs:frontmatter
    ```
+
+   脚本只处理没有 frontmatter 的普通文档，已有 frontmatter 的文档保持不变。默认根据一级标题/文件名推导 `title`，使用脚本运行日期生成 `date`，根据所属分区生成 `categories`，并从首段生成 `description`。
 
 3. 卡片摘要：优先取 frontmatter 的 `description` 字段；未写时回退到正文首个段落——在首段后加一行 `<!-- more -->`，"更新记录"页会截取此前内容作为摘要；
 
-4. `git commit` + `git push` 到 `main`——约 1~2 分钟后站点自动更新；
-   贡献热力图与更新记录也会随之记录这次更新。
+4. 本地检查并构建：
 
-无需注册路由、无需改任何配置：各库侧边栏由 [vitepress-sidebar](https://github.com/jooy2/vitepress-sidebar) 按 `config.mts` 里的分区配置扫描生成；藏经阁的库介绍与文档计数、更新记录的卡片流，均由构建期数据（`posts.data.mts` / `gen-contributions.mjs`）自动驱动。
+   ```bash
+   pnpm docs:frontmatter --check
+   pnpm build
+   ```
+
+5. `git commit` 后推送分支，确认内容后创建并推送 `v*` tag，tag 才会触发 GitHub Pages 发布：
+
+   ```bash
+   git push origin master
+   git tag -a v2026.09.29 -m "docs: 发布 2026.09.29"
+   git push origin v2026.09.29
+   ```
+
+无需注册路由、无需改任何配置：各库侧边栏由 [vitepress-sidebar](https://github.com/jooy2/vitepress-sidebar) 按 `config.mts` 里的分区配置扫描生成；各分区首页的“当前内容”由 `DirectoryContents` 构建期扫描生成；藏经阁的库介绍与文档计数、更新记录的卡片流，均由构建期数据（`posts.data.mts` / `gen-contributions.mjs`）自动驱动。
 
 ## 发布管线
 
 ### ① GitHub Pages（已就绪）
 
-- 触发：`push` 到 `main`，或手动 `workflow_dispatch`；
+- 触发：推送匹配 `v*` 的 tag，或手动 `workflow_dispatch`；普通分支 push 不自动发布；
 - 流程：完整拉取历史（`fetch-depth: 0`，热力图需要）→ `pnpm build`（自动注入 `BASE_PATH=/<仓库名>/`）→ 发布；
 - **首次启用**：GitHub 仓库 → Settings → Pages → Build and deployment → Source 选择 **GitHub Actions**；
 - 站点地址：`https://<user>.github.io/<repo>/`。
@@ -142,8 +148,9 @@ Scriptorium/
 - **页面白屏、资源 404？** 大概率 `base` 不对：本地用默认 `/`，GitHub Pages 用 `BASE_PATH=/<仓库名>/ pnpm build`；
 - **`/updates`、`/catalogue` 这些地址怎么实现的？** `@pages/` 下功能页的 frontmatter 带 `permalink`，由 `vitepress-plugin-permalink` 的 `createRewrites`（VitePress rewrites 机制）在 dev/build 时落地为根路径物理文件，纯静态托管可直接访问；新增功能页同理，无需额外配置；
 - **热力图是空的？** 数据来自 git 提交历史（`docs/` 下，按天统计修改篇次），新 clone 后先跑 `pnpm dev` 或 `pnpm build` 生成；CI 使用完整历史（`fetch-depth: 0`），无需担心；
+- **新文档如何生成 frontmatter？** 先将文档放入六大分区，再运行 `pnpm docs:frontmatter`；已有 frontmatter 的文档不会被改写，构建和 CI 使用 `pnpm docs:frontmatter --check` 检查遗漏；
 - **新文档没出现在侧边栏？** 检查文件是否在六大分区目录内、是否被误放进 `@pages/`（该目录不参与侧边栏）；
-- **更新记录/藏经阁计数少了？** 这两处只统计带 frontmatter `date` 的内容文档，检查新文档的 frontmatter；
+- **更新记录/藏经阁计数少了？** 这两处统计普通文档的 frontmatter `date`，运行 `pnpm docs:frontmatter --check` 检查是否有遗漏；
 
 ## 维护边界
 

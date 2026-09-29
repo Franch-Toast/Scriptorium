@@ -5,11 +5,12 @@
   "description": "Scriptorium — 个人文档知识库站点（VitePress + vitepress-theme-teek），Hub-and-Spoke 架构中的唯一内容源仓库",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/gen-contributions.mjs && vitepress dev .",
-    "prebuild": "node scripts/gen-contributions.mjs",
+    "dev": "pnpm docs:frontmatter --check && node scripts/gen-contributions.mjs && vitepress dev .",
+    "prebuild": "pnpm docs:frontmatter --check && node scripts/gen-contributions.mjs",
     "build": "vitepress build .",
     "preview": "vitepress preview .",
-    "gen:contributions": "node scripts/gen-contributions.mjs"
+    "gen:contributions": "node scripts/gen-contributions.mjs",
+    "docs:frontmatter": "node scripts/docs-frontmatter.mjs"
   },
   "packageManager": "pnpm@10.32.1",
   "devDependencies": {
