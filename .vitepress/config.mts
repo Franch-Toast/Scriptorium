@@ -1,6 +1,7 @@
 import { defineConfig } from "vitepress";
 import { generateSidebar } from "vitepress-sidebar";
 import { createRewrites } from "vitepress-plugin-permalink";
+import { withMermaid } from "vitepress-plugin-mermaid";
 import { defineTeekConfig } from "vitepress-theme-teek/config";
 
 // Teek 主题配置：关闭博客风首页，保留 VitePress 原生 Hero 落地页
@@ -70,8 +71,9 @@ const sidebar = {
 // GitHub Pages 项目站部署时由 CI 注入 BASE_PATH（如 /Scriptorium/），本地开发默认 "/"
 const base = process.env.BASE_PATH || "/";
 
-export default defineConfig({
-  extends: teekConfig,
+export default withMermaid(
+  defineConfig({
+    extends: teekConfig,
   // 内容目录（相对 VitePress root=项目根）：docs 只放页面与文档内容，工程全部在根 .vitepress
   srcDir: "docs",
   // 依赖缓存显式指回根 .vitepress（VitePress 默认会落在 srcDir 下的 .vitepress/cache）
@@ -119,6 +121,15 @@ export default defineConfig({
     lightModeSwitchTitle: "切换到浅色模式",
     darkModeSwitchTitle: "切换到深色模式",
   },
+  // dev 服务器显式绑定 IPv4：vitepress dev 默认 host=localhost，在 Node 17+
+  // 的 DNS 解析顺序下只会绑 [::1]（IPv6），而浏览器访问 localhost 常走
+  // 127.0.0.1（IPv4），造成“服务已启动但浏览器一片空白”的假故障
+  vite: {
+    server: { host: "127.0.0.1" },
+    // mermaid 强制纳入依赖预构建：否则 dev 首次访问才按需优化，
+    // 数千个未打包源模块逐个请求，慢网络下页面长时间无法挂载
+    optimizeDeps: { include: ["mermaid"] },
+  },
   markdown: {
     lineNumbers: true,
     image: { lazyLoading: true },
@@ -130,4 +141,11 @@ export default defineConfig({
       detailsLabel: "详细信息",
     },
   },
-});
+  }),
+  // mermaid 全局配置：fence ```mermaid 代码块由插件渲染为客户端组件；
+  // 深浅色主题由插件监听 html.dark 自动重渲染，无需在此设置 theme
+  {
+    securityLevel: "loose",
+    startOnLoad: false,
+  },
+);
