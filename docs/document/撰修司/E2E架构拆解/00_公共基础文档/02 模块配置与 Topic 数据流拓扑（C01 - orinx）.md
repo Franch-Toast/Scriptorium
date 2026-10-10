@@ -1,14 +1,25 @@
 ---
 title: "02 模块配置与 Topic 数据流拓扑（C01 / orinx）"
 date: 2026-09-20
-description: "名词表：Topic/Channel＝church 框架中以字符串命名的消息通道；jsonnet＝JSON 超集配置语言，组件的输入/输出通道在此声明；DEM 配"
+description: "从组件 jsonnet 配置出发梳理全部输入输出 Topic：发布者、订阅者、数据结构与配置-代码双向校验结论、不匹配项清单。"
 categories:
   - 撰修司
 tags:
   - E2E
 ---
 
-# 02 模块配置与 Topic 数据流拓扑（C01 / orinx）
+> **30 秒导读**：把每个"频道"（Topic）列成表：谁在广播、谁在收听、传的是什么数据，并逐条核对配置与代码是否一致。
+> **本篇回答**：感知和规划之间传了哪些消息？哪些配置声明了但实际没人用？触发规划的 Topic 有什么讲究？
+> **先修阅读**：《00 入门》§2（church＝神经系统的比喻出处）。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **Topic / Channel**：电台频道——发布者对着频道名广播、订阅者按频道名收听，双方不需要认识彼此（完整卡片见 §2）。
+> - **jsonnet**：带变量的配置模板——每条 Topic 谁发谁收，都在这里声明。
+> - **FrameSync**：拍合影的摄影师——12 路传感器同一帧到齐才放行（详见 [**Perception/01 §2**](../Perception/01%20输入数据接入与预处理.md)）。
+> - **FrameDone**：交卷铃——每帧算完后按写死的顺序逐路发布，最后发的那路是给下游的发令枪（完整卡片见 §6.1）。
+> - **required / all_new / optional**：点名必须到 / 每条新消息都收 / 有就拿没有拉倒——三档订阅纪律。
+> - **iceoryx 共享内存**：跨进程大消息只传「柜子号」不搬货（详见 [**Perception/01 §3.2**](../Perception/01%20输入数据接入与预处理.md)）。
+
 
 > **读者对象**：具备 C/C++ 基础、了解自动驾驶基本概念、不熟悉本仓库的开发者。  
 > **仓库基准**：perception / planning / driver 检出于 `Stable_Master_4.0_new`；`/sandbox/platform/church` 无该分支，**本文 church 代码基于 dev_master**（差异已经项目组确认）。所有路径为仓库工作区绝对路径。  
@@ -18,6 +29,8 @@ tags:
 ---
 
 ## 1. Component 配置详解
+
+**一句话结论**：配置分四层、车型优先——C01 的每条 Topic 都是「jsonnet 声明在先、代码实现在后」，本节先看清声明从哪来。
 
 ### 1.1 配置层级与装载链（C01 实际生效路径）
 
@@ -138,7 +151,19 @@ C01（orinx 平台 C01PT）的组件通道配置分四层，从上到下覆盖�
 
 ## 2. 输入 Topic 清单（C01 主线）
 
+**一句话结论**：C01 主线输入 30 余路——感知收传感器（12 路 framesync 齐帧）、规划收感知（/perception/objects 触发 + required 三件套硬校验）、控制收规划与定位；每路的类型标签决定它的装配纪律。
+
+**读表三步**：① 先看类型标签——framesync/required/optional/all_new 决定这路数据「多重要、怎么等」；② 再看 proto 类型——类型名就是去查数据结构定义的钥匙（全库各篇 07 索引都给出 proto 文件路径）；③ 最后看来源/去向组件——同一条 Topic 在多张表出现是正常的（一发多收），把多张表横向串起来才是完整拓扑（§5 的图就是串联结果）。
+
 **频率说明**：感知帧同步基准 `frame_nano_base: 100000000`（100ms），故感知/规划主线频率约 10Hz（推断）；相机原始采集帧率仓库内未声明（未验证）。`ros_wrapper.cpp` 中 `kPublishFrequency=10` 实为 `Advertise` 的队列长度参数，非频率。
+
+> **📘 概念｜Topic / Channel（消息频道）**
+> **是什么**：church 框架里组件间收发消息的统一机制——每条消息都以字符串频道名（如 `/perception/objects`）标记，发布者对着频道名广播、订阅者按频道名收听，双方不需要认识彼此。它与「函数调用」的区别是解耦：发布者不知道谁在听、也不等听众处理完；它与图内「stream（输入流）」的区别是范围——Channel 是组件间/进程间的消息通道，stream 是组件内部图中 Calculator 之间的连线（jsonnet 里带 `stream` 字段的 channel 会映射为图输入流，见 §2.2 证据）。
+> **类比与角色映射**：Topic 就是电台频道——发布者＝电台（对着频率广播）；订阅者＝收音机（调到频率就听）；频道名＝频率（如 `/sensors/camera/camera_1_raw_data_proto`）；同进程直通＝隔壁邻居对讲（不走电台）；跨进程 iceoryx 共享内存＝跨仓调货只给提货单（货不动）。
+> **🎯 为什么这样设计**：按名收发让组件彻底解耦——发布方实现可替换（ROS 模式与 church 模式共存，订阅方不变，§2.1 对照）；且「配置声明频道名 ↔ 代码使用频道名」两边可对账，本篇 §6 的交叉验证才能机检不一致。
+> **🗂 代码在哪里**：声明在 `driver/config/component/*.jsonnet` 的 input_channels/output_channels；收发 API 在 `/sandbox/platform/church/node/node.h`（AddPublisher/AddSubscriber/Publish）与 `/sandbox/platform/church/component/component.h`（MakeOnboardMessage，§6.4）。
+
+**FrameSync 帧同步**（讲解篇见 [**Perception/01 §2**](../Perception/01%20输入数据接入与预处理.md)）：12 路传感器交作业快慢不一，帧同步等齐了才一起处理——拍集体照，绝不提前按快门；本篇表格里的 `framesync` 类型标签就是它的收听策略。
 
 ### 2.1 感知输入（PerceptionComponent，perception_orin.jsonnet `input_channels`）
 
@@ -170,10 +195,10 @@ C01（orinx 平台 C01PT）的组件通道配置分四层，从上到下覆盖�
 > 核心逻辑：
 > 
 > ```cpp
-> constexpr std::`array<std::string_view, 12>` kInShmpoolTopics = {
+> constexpr std::array&lt;std::string_view, 12> kInShmpoolTopics = {
 >     "/sensors/lidar/combined_point_cloud_proto",
 >     "/sensors/camera/camera_1_raw_data_proto", /* ... camera_2~6, traffic_2, panoramic_1~4 */ };
-> const std::`unordered_set<std::string>` kFrameSyncTopics = { /* 上述 12 路 raw + compressed */ };
+> const std::unordered_set&lt;std::string> kFrameSyncTopics = { /* 上述 12 路 raw + compressed */ };
 > // Process():
 > auto onboard_msg = FindFirstMessage(input_msgs, "/sensors/lidar/combined_point_cloud_proto");
 > ```
@@ -189,7 +214,7 @@ ROS 独立运行模式（对照）的订阅回调在：
 > ```cpp
 > pcd_sub_ = node_handler_.`Subscribe<deeproute::drivers::PointCloud2>`(
 >     topic_info.pcd_topic(), kMaxQueueSize,
->     [&perception_pipeline](const std::`shared_ptr<drivers::PointCloud2>`& point_cloud) {
+>     [&perception_pipeline](const std::shared_ptr&lt;drivers::PointCloud2>& point_cloud) {
 >       perception_pipeline.AddInput(point_cloud);
 >     });
 > ```
@@ -270,6 +295,10 @@ ROS 独立运行模式（对照）的订阅回调在：
 
 ## 3. 输出 Topic 清单（C01 主线）
 
+**一句话结论**：输出清单里藏着全链路的「合同」——/perception/objects 给规划（触发）、/planner/trajectory 给控制（方向盘）；supervision 标记是核心频道的重点监控名单。
+
+**supervision 是什么**：它是车端监控体系对核心频道的标记——被标记的 Topic 会有独立的迟到/丢帧监控（supervision 机制细节超出本篇边界，不展开）。从清单看，全程被 supervision 标记的正是「感知→规划→控制」主干四频道：/perception/objects、/perception/ras_map、/planner/trajectory、/control/control_command——任何一条断流都直接威胁驾驶功能，监控资源自然向主干倾斜。
+
 ### 3.1 感知输出（perception_orin.jsonnet `output_channels` = perception_graph_l2avp_orin.cfg `output_stream`）
 
 | Topic | 数据结构 | 去向 | 频率 |
@@ -335,7 +364,7 @@ ROS 独立运行模式（对照）的订阅回调在：
 > ```cpp
 > onboard_msg = FindFirstMessage(input_msgs, "/planner/trajectory");
 > if (onboard_msg) { sSingletonAdcTrajectory->SetAdcTrajectory(
->     std::`dynamic_pointer_cast<const ADCTrajectory>`(onboard_msg->payload())); }
+>     std::dynamic_pointer_cast&lt;const ADCTrajectory>(onboard_msg->payload())); }
 > ...
 > control_manager_->ControlProcess();
 > output_msgs->emplace_back(MakeOnboardMessage(kControlCommandTopic, ctrl_cmd));  // "/control/control_command"
@@ -346,6 +375,8 @@ ROS 独立运行模式（对照）的订阅回调在：
 ---
 
 ## 4. 内部 Topic 清单（perception ↔ planning）
+
+**一句话结论**：同进程也走 channel——两组件间 7 类 Topic 全部按名通信，其中 /perception/objects 刻意最后发（触发契约）、/planner/trajectory 回灌预测、/planner/context 只给自己。
 
 C01 上两组件同进程（§1.1），但仍通过 church channel 通信（进程内直通 + iceoryx 共享内存对外，`platform/church/node/iceoryx_*.cc`）：
 
@@ -434,11 +465,23 @@ control.AEBCommand| CAN
     CAN -->|/canbus/downstream_mcu 等| MCU
 ```
 
+**图 5-1 · C01 主线数据流拓扑**（边标签即频道名，proto 类型见 §2/§3 清单）
+
+**读图提示**：① 最粗的三条干线：传感器→感知（进料）、感知→规划（看→想）、规划→控制→底盘（想→动）；② PL→PC 的 /planner/trajectory 回灌边最容易被忽略——它让感知预测「我这么走，别人会怎么反应」；③ 感知与规划画在同一框里（同进程），但边标签仍是频道名——同进程 channel 直通，形态不变。
+
 ---
 
 ## 6. 配置与代码交叉验证
 
+**一句话结论**：配置声明与代码实现逐条对账——10 项一致、4 项差异全部有代码级证据，这是全库唯一一处「配置↔代码」双向机检。
+
 ### 6.1 关键顺序证据（感知→规划的发布顺序）
+
+> **📘 概念｜FrameDone（帧完成发布）**
+> **是什么**：感知图/规划图算完一帧后，由 FrameDoneCalculator 按配置顺序把本帧全部输出 Topic 逐个发布的收尾节点。它不是「通知谁」的信号，而是「这一帧的结果正式出图」的动作——顺序是配置写死的：感知 5 路（OUTPUT:0~4），/perception/objects 排最后；规划 13 路（OUTPUT:0~12）。与 Trigger 的区别：Trigger 决定「什么时候开始算」（数据到/定时/等齐），FrameDone 决定「算完后按什么顺序交卷」（见 [**公共 01 §2**](01%20进程启动与%20Church%20框架初始化链路（C01%20-%20orinx）.md) 的 Trigger 卡片）。
+> **类比与角色映射**：交卷铃——考试结束按座号顺序交卷：座号顺序＝OUTPUT:0~4 的配置顺序；最后一个交的（/perception/objects）恰好是隔壁教室等的信号；隔壁教室＝PlanningComponent 的 TRIGGER 通道。
+> **🎯 为什么这样设计**：/perception/objects 是规划的触发源，最后发保证规划被唤醒时其余 4 路输入已在队列里等着——否则规划开工了料还没到齐（证据：下方配置注释 "Keep this sequence to ensure..."）。
+> **🗂 代码在哪里**：`perception_graph_l2avp_orin.cfg` 的 perception_frame_done 节点（下方案证块）；规划侧 planning_graph.cfg OUTPUT:0~12。
 
 > 文件路径：/sandbox/driver/config/component/perception_graph_l2avp_orin.cfg  
 > 函数名：perception_frame_done（FrameDoneCalculator）  
@@ -490,6 +533,29 @@ control.AEBCommand| CAN
 - church `Node::Publish` → iceoryx 的跨进程分发细节属框架内部（01 篇边界），本文仅引用 API 位置：`/sandbox/platform/church/node/node.h`（AddPublisher/AddSubscriber/Publish）与 `/sandbox/platform/church/component/component.h`（Component::Process、MakeOnboardMessage）。
 
 ---
+
+## 7. FAQ 与自测
+
+**Q1（新手误解）：/planner/context 是规划发给别人用的吗？**
+A：不是。它是规划自己的状态转储（FrameContext），在子图内部经 back edge 自回灌给下一帧的 Preprocess 计算器（§2.2 表与 §4 表均标注「自回灌」）；外部组件不应消费它做决策——这是全库最高频误解之一（06 问题清单亦有记录，详见 [**Planning/00 §8**](../Planning/00%20Planning%20模块架构总览.md) FAQ）。
+
+**Q2：同进程的感知和规划为什么还要走 Topic，直接函数调用不是更快？**
+A：channel 是 church 的统一通信抽象（§2 卡片）：统一了触发、缓存、监控与跨进程扩展性——今天同进程直通，明天要把规划拆去独立进程，业务代码不用改。函数调用快在纳秒级，而感知→规划的节奏是 100ms 一帧，通信开销可忽略。
+
+**Q3：/planner/signals_request 声明了却没人发，这种「死通道」为什么留着？**
+A：未完成功能的残留（planning_graph.cfg 注释 "no one publish it"，§6.3 #1）。留着无害但会误导新人以为感知会收到红灯检测请求——本篇把它列入差异清单正是为了显式提醒；是否删除属代码维护决策，文档只记录事实。
+
+**Q4：required 和 optional 的区别只在「缺失报不报错」吗？**
+A：不止。required（如 /perception/objects、traffic_lights_status、ras_map_plus）在规划 Preprocess 里是硬校验——缺失直接返回 InvalidArgumentError 中断本帧（§2.2 证据块）；optional 缺失只是本帧少一路数据。all_new 则是装配策略（收走窗内全部新消息）；读表时要分清「触发类型」与「装配类型」两个维度（详见 [**Planning/01**](../Planning/01%20Planning%20输入数据接入与有效性校验.md)）。
+
+**自测（能答上来才算读懂）**
+
+1. 感知 5 路输出的发布顺序是什么？哪条配置注释保证了这个顺序？
+   （答：OUTPUT:0 extra_objects → 1 ras_map → 2 ras_map_parking → 3 traffic_lights_status → 4 objects；perception_graph_l2avp_orin.cfg 的 "Keep this sequence to ensure the planning module receives the trigger topic after the other four input topics"（§6.1）。）
+2. 规划的输出中，哪一路给了控制、哪一路回灌了感知、哪一路只给自己？
+   （答：/planner/trajectory 给 CbwControlComponent 且同时回灌感知做预测；/planner/context 自回灌（§3.2、§4）。）
+3. 判断题：「同进程组件间通信必须走 iceoryx 共享内存」——对吗？
+   （答：错。同进程 channel 直通（§4），iceoryx 只用于跨进程大消息零拷贝（[**Perception/01 §3.2**](../Perception/01%20输入数据接入与预处理.md)）。）
 
 ## 附：核心必答问题速答
 

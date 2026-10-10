@@ -1,7 +1,7 @@
 ---
 title: "07 Perception 代码索引与学习指南"
 date: 2026-09-20
-description: "分支基线：perception/planning/driver 在 Stable_Master_4.0_new；platform/church 在 dev_ma"
+description: "感知代码索引与学习指南：核心文件、学习路径、常见误区与调试方法。"
 categories:
   - 撰修司
 tags:
@@ -9,7 +9,18 @@ tags:
   - E2E
 ---
 
-# 07 Perception 代码索引与学习指南
+> **30 秒导读**：感知部分的随查手册：核心文件清单、推荐阅读顺序、常见误区与调试方法。
+> **本篇回答**：想读感知代码从哪个文件进？调试用什么工具？哪些是历史遗留？
+> **先修阅读**：无，随查随用。
+>
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **随查手册**：§1/§2 找文件与函数，§3 按路线学，§4 避坑，§5 调试。
+> - **两套入口**：车端走 perception_component.cc（church 模式），main.cpp 是独立进程形态——读代码别进错门（§4.1）。
+> - **帧节拍**：frame_id = 时间戳/100ms（帧基 100ms），不是传感器自己的帧号（[**FrameSync 帧同步**（Perception/01 §2）](01%20输入数据接入与预处理.md)）。
+> - **在途帧上限**：kMaxFramesInFlight=2，第 3 帧等回边（[**在途帧背压**（Perception/01 §2.3）](01%20输入数据接入与预处理.md)）。
+> - **线程名即配置**：线程池名匹配 perception.json 条目即得调度属性；cfg 里的 thread_name_prefix "nn_" 反而不生效（§4.3）。
+> - **shm 大消息**：跨进程大消息 data 字段是块索引字符串，必须 AcquireReadabledBlock 还原并持有 ShmBlockPtr（§4.4）。
+
 
 > 所属系列：C01车型E2E架构拆解 · Perception 通用机制  
 > 读者：具备 C/C++ 基础、不熟悉本仓库的开发者  
@@ -17,6 +28,8 @@ tags:
 > 分支基线：perception/planning/driver 在 Stable_Master_4.0_new；platform/church 在 dev_master（文中路径以当前检出为准，涉及 church 处存在分支差异）
 
 ## 1. 核心文件索引表
+
+**一句话结论**：索引按"装载层→顶层→calculators→submodules→平台框架"五层组织——从上往下读是数据流方向，从下往上是依赖方向。
 
 ### 1.1 车端挂载入口（driver 侧）
 
@@ -87,6 +100,10 @@ tags:
 
 ## 2. 核心函数索引（按模块分类）
 
+**一句话结论**：函数按"装载→输入→同步→输出→框架→线程→监控→崩溃"分类——排查问题时先定位类别再查函数，比全文搜索快得多。
+
+**怎么用这张表**：先根据症状确定类别（例：进程崩了查「崩溃」行、没输出了查「输出」行），再看一句话说明确认函数职责是否匹配，最后按文件路径直达实现。表中的函数名可直接复制到编辑器全局搜索——它们都是仓内真实存在的符号，比记行号可靠。
+
 | 模块 | 函数 | 一句话说明 |
 |-|-|-|
 | 装载 | PerceptionComponent::Init | 伪命令行 `perception -launch_mode=church -perception_config_filename=...` + ParseCommandLineFlags |
@@ -109,6 +126,10 @@ tags:
 | 帧上下文 | PerceptionFrameContextManager::ActivateFrameContext / BuildSnapshot | 槽位激活（清旧）/ 每10帧快照 |
 
 ## 3. 推荐学习路径
+
+**一句话结论**：官方 README 的阅读顺序+本系列验证结果=8 步路线：配置面→帧同步→装配→数据结构→主子图→子模块→输出→运行面。
+
+**零基础读者的补充建议**：走到第 5 步（子模块）前，先翻一遍[**AI 概念字典**](../../../正典阁/技术栈/AI/00%20AI%20概念字典导航.md)——BEV、多目标跟踪、检测框、置信度、IoU 这些词会在子模块文档里高频出现，预先混个脸熟，阅读会流畅得多。
 
 perception README（/sandbox/perception/README.md，196行）给出了官方阅读顺序，结合本系列验证结果整理如下：
 
@@ -139,6 +160,10 @@ graph_scheduler + 触发器 + 线程表
 + 06篇监控/崩溃链路]
 ```
 
+**图 3-1 · 感知推荐学习路径（8 步进阶路线）**（S0~S2 是框架面，S3~S6 是算法面，S7 是运行面）
+
+**读图提示**：① 前 3 步都是"框架面"——先把节拍与装配搞懂再碰算法；② 第 5 步按需深入，不必八个子模块全走一遍；③ 每步的"验收标准"见下方表格，能答上来再进下一步。
+
 | 步骤 | 前置知识 | 验收标准（能回答的问题） |
 |-|-|-|
 | 0 配置面 | jsonnet/mediapipe graph cfg 语法 | 帧基为什么是 100ms？nn_internal_designated 谁在用？ |
@@ -148,9 +173,11 @@ graph_scheduler + 触发器 + 线程表
 | 4 主子图 | mediapipe back_edge 概念 | TriggerNextFrameCalculator 的回边作用？ |
 | 5 子模块 | 各算法域基础知识 | 各子图入口 cfg 与 linker_hook 在哪？ |
 | 6 输出 | planning IMMEDIATE 触发机制 | 为什么 /perception/objects 必须最后发？ |
-| 7 运行面 | 本系列 04/06 篇 | 线程名如何映射到调度策略？FATAL 后发生什么？ |
+| 7 运行面 | [**本系列 04**](04%20线程调度与运行机制.md)/[**06 篇**](06%20异常处理与容错机制.md) | 线程名如何映射到调度策略？FATAL 后发生什么？ |
 
 ## 4. 重点难点与常见误区
+
+**一句话结论**：六大误区都源于"以为车端代码和教科书一样"——两套入口、线程归属、线程名、shm 语义、帧语义、重名触发器，读代码前先对答案。
 
 ### 4.1 两套入口形态
 
@@ -170,7 +197,7 @@ graph_scheduler + 触发器 + 线程表
 
 **误区**：以为 proto 的 data 字段永远是像素/点云数据。实际：跨进程大消息 data 里是编码的块索引字符串（<64 字节判断），必须走 AcquireReadabledBlock 还原；忘记持有 ShmBlockPtr 会导致读到的数据被发布方覆写（seq 比对失败）。**另**：单帧结束时 shm_blocks\_.clear() 的释放时机决定了 ShmBlock 生命周期，调试数据覆写问题先看这里。
 
-### 4.5 帧（FrameSync）语义
+### 4.5 帧（FrameSync）语义（完整机制见 [**FrameSync 帧同步**（Perception/01 §2）](01%20输入数据接入与预处理.md)）
 
 - frame_id = 时间戳 / 100ms（整数除法），不是传感器自己的帧号；
 - 超时≠丢帧：TimeoutAssemble 输出残缺帧；12 路里 lidar 主帧（sensors\_\_lidar\_\_combined_point_cloud_proto）决定拍点；
@@ -185,6 +212,8 @@ graph_scheduler + 触发器 + 线程表
 - proto_msg 检出版本与 perception 代码存在字段缺失（FrameContext，A篇 1.2 差异）。
 
 ## 5. 调试与验证方法
+
+**一句话结论**：调试三板斧——MLOG 关键字检索、bag 回放对帧、cfg 只读实验；ERROR 及以上即时刷盘，优先找 FATAL/ERROR。
 
 ### 5.1 日志检索（MLOG 关键字表）
 
@@ -219,4 +248,31 @@ graph_scheduler + 触发器 + 线程表
 2. `grep -rn "kMaxFramesInFlight" platform/church/graph/calculators/frame_sync_calculator.cc` —— 确认平台在途帧数（C01_PT=2）；
 3. 比对 thread_config/C01/perception.json 与运行时 `ps -T -o comm,psr` 线程名/核绑定。
 
-（完，约 7.5 千字）
+---
+
+## 6. FAQ 与自测
+
+**Q1：车端感知的代码入口是 main.cpp 吗？（新手最常见误解）**
+
+不是。车端走 driver 侧 perception_component.cc（church 模式，伪命令行装载）；main.cpp 是 ROS/独立进程形态的入口，两形态共用算法管线（§4.1）。
+
+**Q2：cfg 里配了 thread_name_prefix "nn_"，为什么线程名不是 nn_ 开头？**
+
+因为 graph_scheduler.cc UpdateExecutor 只传 (num_threads, exec.name()) 给 GraphExecutor，带 ThreadOptions 的 Create() 工厂未被此路径调用——实际线程池名 = executor 名（§4.3）。
+
+**Q3：proto 的 data 字段读出来像乱码？**
+
+跨进程大消息的 data 是编码的块索引字符串（<64 字节判断），必须走 AcquireReadabledBlock 还原，并持有 ShmBlockPtr 防止发布方覆写（§4.4）。
+
+**自测**（先自己想，再看缩进答案）：
+
+1. 12 路输入等齐的判定基准是什么？frame_id 怎么算？
+    帧基 100ms；frame_id = 时间戳/100ms（整数除法），lidar 主帧决定拍点，超时走 TimeoutAssemble 出残缺帧（§4.5）。
+2. 图 1s 无帧和单路断流分别查什么日志？
+    "There is no incoming frame"（watch_dog，每秒检查）；"No message arrived for a long time"（channel_suspend_alarm，30s 断流）。
+3. 为什么 `/perception/objects` 必须最后发布？
+    它是触发规划的"发令枪"：最后发布保证规划被唤醒时其余 4 路辅助数据已就位（§2 输出行、FrameDone 机制见公共 02 §6.1）。
+
+---
+
+（完，约 9 千字）

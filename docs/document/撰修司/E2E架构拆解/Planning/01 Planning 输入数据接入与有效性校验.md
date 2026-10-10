@@ -1,7 +1,7 @@
 ---
 title: "01 Planning 输入数据接入与有效性校验"
 date: 2026-09-20
-description: "分析对象：C01（orinx C01PT，L2_driving）Planning 组件的全部输入通道、Church 触发汇聚机制、PlanningInputPr"
+description: "规划输入接入与校验：required 四件套硬校验、FindLastMessage 取最新帧、/planner/context 归属澄清。"
 categories:
   - 撰修司
 tags:
@@ -9,7 +9,19 @@ tags:
   - E2E
 ---
 
-# 01 Planning 输入数据接入与有效性校验
+> **30 秒导读**：规划的"进料口与体检"：四样必需输入缺一不可，触发帧取最新、其余取同批。
+> **本篇回答**：规划需要哪些输入？缺了会怎样？为什么 objects 取最新帧？
+> **先修阅读**：《00 入门》§3 步骤 7~8；《Perception 05 输出》。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **required**：点名必须到——装配时缓存为空，这一帧就不开工（详见 §2 人话版）。
+> - **all_new**：迟到名单全收——自上次消费以来攒的消息一条不漏，老→新排队。
+> - **optional**：有就拿没有拉倒——锦上添花型输入，缺了照常跑。
+> - **TRIGGER**：发令枪——只有 /perception/objects 到达才触发规划；它与另外 4 路输入的先后顺序是感知侧 FrameDone 契约写死的（完整卡片见 [**公共 02 §6.1**](../00_公共基础文档/02%20模块配置与%20Topic%20数据流拓扑（C01%20-%20orinx）.md)）。
+> - **AnyCalculator（planning_assemble_node）**：收发室大爷——攒齐触发+回边条件才把一帧料打包（按 topic 排序）送进生产线。
+> - **FindFirst / FindLast**：一帧内同 topic 可能有多条（all_new 攒批），First＝最早、Last＝最新——代码里取哪头都是显式选择。
+> - **硬校验两道门**：装配层 required 缓存空→本帧不触发；预处理层红绿灯/路网地图缺失→整帧报错（§5）。
+
 
 > 分析对象：C01（orinx C01PT，L2_driving）Planning 组件的全部输入通道、Church 触发汇聚机制、`PlanningInputPreprocessCalculator` 逐路解析、时间戳对齐与有效性校验。  
 > 术语首现加粗；**required（必须存在）、optional（可选）、all_new（全量新消息）** 为 jsonnet 通道类型。
@@ -17,6 +29,10 @@ tags:
 ---
 
 ## 1. 输入通道全景
+
+**一句话结论**：规划输入 24 路，类型只有三档——1 路触发（required 的 /perception/objects）、2 路硬校验 required、其余多为 optional；/planner/context **不在**其中（它是自回灌，不是外部输入）。
+
+**为什么输入校验值得单独一篇**：规划是「被动触发」的模块——感知不发枪它永不启动，而感知发布的契约（哪路先到、谁和谁同帧）全写在本篇；线上「规划不动了」的问题，十有八九最后查到的是「某路输入没到」而不是规划本身。先读懂进料口的规矩，排查问题才有下手处。
 
 通道声明唯一来源：`/sandbox/driver/config/component/planning.jsonnet`（L20-150）。逐条列表如下：
 
@@ -52,6 +68,8 @@ tags:
 ---
 
 ## 2. Church 触发与汇聚机制
+
+**一句话结论**：规划图没有固定节拍——/perception/objects 一到就尝试触发（IMMEDIATE），由 AnyCalculator 检查「上一帧干完了没（回边）+ 有新触发消息没」，两条件都满足才装配下一帧。
 
 **触发**：仅 `/perception/objects` 是触发通道；`trigger_policy: "IMMEDIATE"` 表示消息到达即尝试触发（planning.jsonnet L11-19）。
 
@@ -104,9 +122,15 @@ tags:
 > - `NEAR`：直接 `MLOG(FATAL)` 不支持（L202-205）。  
 > 装配结果按 topic 排序（`SortOnboardMessage`）后作为 `planning_input` 下发。若所有通道都无新消息（`assemble_indexes == prev_assemble_indexes_`），本次不触发（L210-212）。
 
+**人话版**：把 Assemble 的四种通道类型想成工头点卯——ALL_NEW 是「把到岗名单全交上来」（老→新排队，一条不漏）；REQUIRED 是「关键工种必须到，缺人今天不开工」（缓存为空返回 false，本帧不触发，但不报错不报警）；OPTIONAL 是「来了就搭把手，没来不影响开工」；NEAR 是「这规矩我们不认」（直接 MLOG(FATAL)，本仓库无人使用）。注意 REQUIRED 的「失败」是静默跳帧——与 §3 预处理层缺料「整帧报错」是两种不同级别的惩罚。
+
 ---
 
 ## 3. PlanningInputPreprocessCalculator 逐路解析
+
+**一句话结论**：预处理器把一包排序好的消息按 topic 逐条「拆快递」——必填的两路（红绿灯、路网地图）缺了就整帧退货，其余各取所需填进 PlanningFrameData。
+
+**拆快递时的两个通用技巧**：§3.3 的 car_state/pose 融合用的是**最近邻配对**——在时间轴上找与定位时间戳最接近的车状态（时间对齐原理见 [**AI 字典·采样与插值**](../../../正典阁/技术栈/AI/采样与插值.md)，感知侧同款问题见公共 05 §3 FrameSync）；「先入缓存再按需取」是本篇反复出现的模式——车状态缓存 50 条、路网沿用上一帧，都是「上游频率与我不同，自己攒一个缓冲」的工程应对。
 
 `planning_sub_graph.cfg` 中 `planning_input_node` 节点接收 `PLANNING_INPUT:planning_input`，`Process()` 把消息向量解析进 `PlanningFrameData`（定义见 `planning/planning/planning_api.h:51-79`：车状态、红绿灯响应、FrameContext、rasmap、感知目标、融合地图等成员）。
 
@@ -142,10 +166,10 @@ tags:
 > message = FindFirstMessage(input_msgs, "/map/ras_map_plus");
 > if (message) {
 >   auto rasmap_plus_ptr =
->       std::`dynamic_pointer_cast<const deeproute::map::RASMapPlus>`(
+>       std::dynamic_pointer_cast&lt;const deeproute::map::RASMapPlus>(
 >           message->payload());
 >   outputs->rasmap_plus_ =
->       std::`make_shared<deeproute::map::RASMapPlus>`(*rasmap_plus_ptr);
+>       std::make_shared&lt;deeproute::map::RASMapPlus>(*rasmap_plus_ptr);
 > } else {
 >   MLOG(INFO) << "map/ras_map_plus is required, but not found";
 >   return absl::InvalidArgumentError("missing map/ras_map_plus");
@@ -174,7 +198,7 @@ tags:
 >   for (size_t i = car_state_first_index; i <= car_state_last_index; ++i) {
 >     auto onboard_msg = input_msgs[i];
 >     auto vs_msg_ptr =
->         std::`dynamic_pointer_cast<const deeproute::common::VehicleState>`(
+>         std::dynamic_pointer_cast&lt;const deeproute::common::VehicleState>(
 >             onboard_msg->payload());
 >     // note: if  repeated key, `emplace` will fail and do nothing
 >     cached_vehicle_state_.emplace(vs_msg_ptr->timestamp(), *vs_msg_ptr);
@@ -197,7 +221,7 @@ tags:
 > message = FindFirstMessage(input_msgs, "/localization/pose");
 > if (message) {
 >   auto ins_msg_ptr =
->       std::`dynamic_pointer_cast<const deeproute::drivers::gnss::Ins>`(
+>       std::dynamic_pointer_cast&lt;const deeproute::drivers::gnss::Ins>(
 >           message->payload());
 >   const auto ins_timestamp =
 >       `static_cast<uint64_t>`(ins_msg_ptr->measurement_time());
@@ -236,7 +260,7 @@ tags:
 >   for (size_t i = rasmap_first_index; i <= rasmap_last_index; ++i) {
 >     message = input_msgs[i];
 >     auto rasmap =
->         std::`dynamic_pointer_cast<const deeproute::perception::RASMap>`(
+>         std::dynamic_pointer_cast&lt;const deeproute::perception::RASMap>(
 >             message->payload());
 >     cached_rasmap_->emplace(
 >         `static_cast<uint64_t>`(rasmap->time_measurement()), *rasmap);
@@ -277,6 +301,8 @@ tags:
 
 ## 4. 时间戳对齐与帧匹配
 
+**一句话结论**：规划输入侧只有一个显式对齐点——定位位姿与车状态按「时间最近、容差 0.5s」配对；其余通道靠「装配窗口内取第一条/最新一条」隐式对齐。
+
 ### 4.1 FindFirstMessage 的语义：按 topic 二分取第一条
 
 > 文件路径：/sandbox/platform/church/cache/cache_helper.cc  
@@ -285,13 +311,13 @@ tags:
 > 
 > ```cpp
 > OnboardMessageConstPtr FindFirstMessage(
->     const std::`vector<OnboardMessageConstPtr>`& inputs,
+>     const std::vector&lt;OnboardMessageConstPtr>& inputs,
 >     const std::string& topic_name) {
 >   size_t index = FindFirstMessageIndex(inputs, topic_name);
 >   return (index != (size_t)-1) ? inputs[index] : nullptr;
 > }
 > 
-> size_t FindFirstMessageIndex(const std::`vector<OnboardMessageConstPtr>`& inputs,
+> size_t FindFirstMessageIndex(const std::vector&lt;OnboardMessageConstPtr>& inputs,
 >                              const std::string& topic_name) {
 >   // BinarySearch() will return first matched element
 >   auto iter = BinarySearch(
@@ -319,6 +345,8 @@ tags:
 
 ## 5. 有效性校验汇总
 
+**一句话结论**：校验分两级、惩罚分轻重——装配层缺料静默跳帧（不触发），预处理层缺关键料整帧报错，其余异常打 WARN 后带旧值继续跑：宁可慢一点也不裸奔。
+
 | 层级 | 校验 | 代码证据 | 失败行为 |
 |-|-|-|-|
 | 装配层（AnyCalculator） | REQUIRED 通道缓存为空 | any_calculator.cc:185-193 | 返回 false，不产生 planning_input（本帧不触发） |
@@ -331,9 +359,34 @@ tags:
 
 说明：`/canbus/car_state` 虽为 jsonnet required（框架装配层会保证有消息才触发），但**代码层**对其缺失没有硬报错——`FindFirstMessage` 返回空时直接使用 `temp_car_state` 的默认值继续走（L221-225 无 else 分支），依赖后续 NaN/时间差检查兜底。**推断**：这是框架 required 语义与代码防御的双保险设计。
 
+```mermaid
+graph TB
+    A["12 路输入"] --> B{"装配层 REQUIRED
+缓存为空?"}
+    B -- "是" --> Z1["不触发：本帧静默跳过"]
+    B -- "否" --> C["预处理层逐路解析"]
+    C --> D{"关键料缺失?
+红绿灯 / ras_map_plus"}
+    D -- "是" --> E["InvalidArgumentError
+整帧失败"]
+    C --> F{"NaN / 时间差超限?"}
+    F -- "是" --> G["WARN 后沿用旧值继续"]
+    G --> H{"核心层流为空 /
+NaN / L4 无路由?"}
+    C --> H
+    H -- "是" --> I["本帧不发布"]
+    H -- "否" --> L["进入规划主流程"]
+```
+
+**图 5-1 · 规划输入有效性校验流水线（装配→预处理→核心三层）**（B 是静默跳帧层，D/E 是硬校验层，F/G 是软告警层）
+
+**读图提示**：① 三层校验惩罚分轻重：装配层不触发、预处理层硬报错、NaN/时间差只告警带旧值继续；② 红绿灯与 ras_map_plus 是仅有的两个代码层硬校验通道（required 四件套的另外两个靠框架保证）；③ 所有失败出口都不产生轨迹——规划侧"宁可不跑，不带病跑"。
+
 ---
 
 ## 6. adapter / FactoryCenter 历史体系（onboard 未启用）
+
+**一句话结论**：ROS 时代的历史数据接入方案，车端链路完全不经过——读代码遇到 adapter/ 直接当「古董展厅」看，别顺着调用。
 
 `planning/planning/adapter/` 下存在一套基于 ROS node handler 的**适配器（Adapter）**体系，是历史数据接入方案：
 
@@ -350,7 +403,7 @@ tags:
 >   ...
 > class FactoryCenter {
 >  public:
->   static void Init(std::`map<int, std::string>`& node2topic);
+>   static void Init(std::map&lt;int, std::string>& node2topic);
 >   enum AdapterCode {
 >     PerceptionObjects,
 >     PerceptionObjectsPub,
@@ -367,6 +420,30 @@ onboard 是否启用：**未启用**。证据：全 planning 仓库中 `FactoryC
 - `planning/planning/visualizer/rviz_visualizer.cpp:197/285/6694`（RViz 可视化发布）。
 
 车端数据链路（见第 2、3 节）完全不经过 FactoryCenter，而是 `jsonnet 声明 → CHANNEL_CACHES → AnyCalculator → PlanningInputPreprocessCalculator`。差异说明：基线第 5 条"历史 adapter::FactoryCenter 50+，onboard 未启用，仅 sim/debug"与代码一致。
+
+---
+
+## 7. FAQ 与自测
+
+**Q1（新手误解）：/planner/context 是规划订阅的外部输入吗？要在 jsonnet 里声明吗？**
+不是。§1 的 24 路输入通道表里没有 /planner/context——它不在 jsonnet 输入通道中，而是**规划子图内回边自回灌**：上一帧的规划上下文经子图内部流回到下一帧（§1 差异④、§3.5），FindFirstMessage 找到的是子图内部传递的消息，不是从中间件订阅的。
+
+**Q2：required 通道缺了消息，规划会崩吗？会报警吗？**
+分两层：框架装配层（AnyCalculator）里 REQUIRED 缓存为空→本次装配失败，**本帧静默不触发**（无报错日志，§2 人话版）；预处理层代码硬校验的是 /perception/traffic_lights_status 与 /map/ras_map_plus，缺失→`InvalidArgumentError` **整帧失败**（§3.1/3.2）。另注意 /canbus/car_state 虽声明 required，代码层缺失并不硬报错，靠 NaN/时间差检查兜底（§5 说明）。
+
+**Q3：为什么 /perception/objects 取最新一条，/perception/extra_objects 却取第一条？**
+显式选择而非随意：objects 是触发源，规划要基于**最新**感知结论，故 FindLastMessage；extra_objects 是补充料，取同批装配窗口的第一条即可与触发帧同源（§3.5）。同一 topic 一帧内多条时 First＝最早、Last＝最新（§4.1）。
+
+**Q4：adapter/FactoryCenter 那 50+ 适配器什么时候启用？**
+车端永不启用。全仓调用点仅 3 处，全在仿真/调试/RViz 可视化路径（§6）；车端数据走「jsonnet → CHANNEL_CACHES → AnyCalculator → 预处理」这条新链路。
+
+**自测**（答案在缩进行里）：
+1. Assemble 的四种通道类型各自的装配语义是什么？
+    答：ALL_NEW 取全部未消费消息（老→新）；REQUIRED 取最新、缓存空则装配失败；OPTIONAL 有新消息才取最新；NEAR 直接 MLOG(FATAL) 不支持（§2）。
+2. 定位位姿与车状态怎么对齐？容差多大？
+    答：在 car_state 缓存（≤50 条）中取与 ins 时间戳差最小者，容差 kTimeDiffTolerance=500000 微秒即 0.5s，超差打 WARN 不覆盖（§3.3、§4.2）。
+3. AnyCalculator 的 FINISHED 回边起什么作用？
+    答：防重入——上一帧没干完（planning_done 未到）时即使新触发消息到达也不开始下一帧装配（§2）。
 
 ---
 

@@ -1,7 +1,7 @@
 ---
 title: "01 进程启动与 Church 框架初始化链路（C01 / orinx）"
 date: 2026-09-20
-description: "名词表：Church＝车端中间件框架（组件化 + 图调度 + 消息传输）；DEM＝DrDEM/dem_launch 进程守护启动器（QNX 侧）；graphpi"
+description: "从 mainboard 入口到 church 框架初始化的完整进程生命周期：DEM 拉起、配置装配、组件注册、线程模型与退出重启机制。"
 categories:
   - 撰修司
 tags:
@@ -9,7 +9,17 @@ tags:
   - E2E
 ---
 
-# 01 进程启动与 Church 框架初始化链路（C01 / orinx）
+> **30 秒导读**：讲清"进程是怎么活起来的"：谁拉起它、配置从哪来、组件怎么注册、崩溃后谁负责重启。
+> **本篇回答**：mainboard 进程是谁拉起的？church 框架初始化做了哪些步骤？进程崩溃后怎么恢复？
+> **先修阅读**：《00 入门》§1"一辆车的一天"（DEM 队长点名的比喻出处）。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **DEM**：车端"车队队长"，按车型花名册拉起/重启业务进程。
+> - **mainboard**：车端业务主进程，感知、规划等四个组件都装在它里面（单进程 E2E 的"厂房"）。
+> - **church**：车端中间件框架，管三件事——组件怎么创建（Component）、消息怎么传（Topic）、节奏谁定（Trigger）。
+> - **Calculator**：mediapipe 图里最小的计算工位，吃输入流、吐输出流。
+> - **Trigger**：组件的闹钟/门铃——数据到了干活（IMMEDIATE）、定时干活（PERIODIC）、等齐了干活（FRAMESYNC）。
+
 
 > **读者对象**：具备 C/C++ 基础、了解自动驾驶基本概念、不熟悉本仓库的开发者。  
 > **仓库基准**：perception / planning / driver 检出于 `Stable_Master_4.0_new`；`/sandbox/platform/church`**无该分支，本文基于其 dev_master**（差异已经项目组确认）。全文文件路径均为仓库工作区绝对路径。  
@@ -19,6 +29,10 @@ tags:
 ---
 
 ## 1. 进程入口与启动参数
+
+**一句话结论**：进程入口是 `mainboard` 的一行 `church_main()`——真正决定"装什么、怎么跑"的是 DEM 传入的 4 份 jsonnet 配置，本文 §2~§4 就是把这条链拆开讲。
+
+**为什么值得单讲启动**：车端进程不是你 `./mainboard` 手点出来的——它由整车状态机守着、按配置花名册拉起，崩了还要自己爬起来。把这条链读通，你就拿到了车端排障的第一把钥匙：任何「组件没起来」的问题，都能沿着 §6 的 15 步溯源表定位到具体环节；反过来，想在车上新加一个进程或改启动顺序，也从这份花名册下手。
 
 ### 1.1 可执行文件：mainboard
 
@@ -55,6 +69,12 @@ tags:
 > 逻辑说明：入口仅一行，全部逻辑下沉到 church 框架（§2.2）。
 
 ### 1.2 谁拉起 mainboard：DrDEM/dem_launch（证据：部署脚本与守护配置）
+
+> **📘 概念｜DEM 与 EM 状态机**
+> **是什么**：DEM（DrDEM/dem_launch）是车端的进程守护者——它手里有一份按车型写好的"花名册"（`driver/config/dem/c01-pt/*.jsonnet`），只有当整车状态机（**EM**，如 kFullFunction/kDriving）进入允许工作的状态时，才按册拉起对应业务进程；进程崩了，也由它按 `recovery_method` 决定扶不扶、怎么扶。
+> **类比**：**EM 状态机**是整车的"作息表"（到点才允许开工），**DEM** 是照表点名的车队队长（开工叫人、人倒了负责扶起来），**jsonnet 花名册**是员工档案（写清楚每个岗位叫谁来、带什么工具上班）。
+> **🎯 为什么这样设计**：把"什么时候跑、跑哪个进程、崩了怎么办"全部收进配置层，业务代码完全不感知进程管理——换车型只换一份花名册，这正是下面证据里 `recovery_method: RECOVERY_RESET`、`state_start_config` 存在的意义。
+> **🗂 代码在哪里**：证据块见下（start_dem.sh / dr_dem_config_manual.json / perception.jsonnet）。
 
 车端（orinx＝QNX + Drive Orin）由 **DrDEM** 守护进程拉起业务进程：
 
@@ -96,7 +116,7 @@ tags:
 >       "recovery_method": "RECOVERY_RESET", "stop_timeout_sec": 5, ...
 > ```
 > 
-> 逻辑说明：进程名 perception、类型 church_node；依赖 `mps_server`（NVIDIA MPS 服务）先 kRunning；`orin_flags` 是 orin 平台专用命令行覆盖；`recovery_method=RECOVERY_RESET` 描述崩溃恢复策略（§4.4）。jsonnet 经 `jsonnet_to_json` 规则编译（dem/c01-pt/BUILD），由 dem_launch 加载执行。
+> 逻辑说明：进程名 perception、类型 church_node；依赖 `mps_server`（NVIDIA MPS 服务——让多个进程共享同一块 GPU 的官方中间层，感知的 NN 推理要在它就绪后才能跑）先 kRunning；`orin_flags` 是 orin 平台专用命令行覆盖；`recovery_method=RECOVERY_RESET` 描述崩溃恢复策略（§4.4）。jsonnet 经 `jsonnet_to_json` 规则编译（dem/c01-pt/BUILD），由 dem_launch 加载执行。
 
 dem `flags` 的键与 church 命令行长选项一一对应：`module_conf→-m/--module_conf`、`params→-p/--parameter`、`dispatcher_mode→-M`、`dispatcher_poll_hz→-H`、`max_logfile_num→-n`（对照 §1.3 选项表）。**该映射由键名对照得出（推断）；dem_launch 无源码，未直接验证**。等价的完整实车命令行形如：`mainboard -m perception_orin.jsonnet -m planning.jsonnet -m data_agent_rt.jsonnet -m lom_infer.jsonnet -p /task/task_type=L2_driving -M poll -H 1000 -n 200`（推断）。
 
@@ -136,11 +156,25 @@ flowchart TB
 
 ## 2. Church 框架核心机制
 
+**一句话结论**：church ＝「注册表创建组件 + 触发器定节奏 + 图调度器排活」三件套，理解了这一节，任何 church 进程的代码组织方式都能一眼看懂。
+
+> **📘 概念｜Trigger 触发器**
+> **是什么**：组件收到消息后什么时候"干活"？church 用触发器定义节奏，配置里的 `trigger_policy` 有四种：**IMMEDIATE**——数据一到立刻执行；**PERIODIC**——固定周期醒来执行；**FRAMESYNC**——等所有约定输入都到齐才执行（配合 FrameSyncCalculator）；**NOTRIGGER**——不自动触发，由图调度驱动。
+> **类比**：**IMMEDIATE** 像门铃——客人（数据）一到立刻开门；**PERIODIC** 像闹钟——不管有没有人按，整点就醒；**FRAMESYNC** 像拍合影——摄影师等所有人都站好位才按快门，缺一个都不行。
+> **🎯 为什么这样设计**：把"节奏"从业务代码里抽出来交给配置——同一个组件在感知里用 FRAMESYNC 等传感器齐帧，控制用 IMMEDIATE 每 20ms 跟着定位走，改节奏只改 jsonnet 一行，不改一行代码。C01 主线：规划被 `/perception/objects` 门铃唤醒，控制被 `/localization/pose` 门铃唤醒（约 20ms 一次节拍）。
+> **🗂 代码在哪里**：`component/` 下 `immediate_trigger.h` / `periodic_trigger.h` / `framesync_trigger.h` / `notrigger_trigger.h`；组件生命周期中 `InitializeTrigger()` 装配（§2.4 证据块）。
+
 ### 2.1 代码布局与核心类
 
 `/sandbox/platform/church/` 目录职责：`mainboard`（church_main/ChurchApp/配置装配）、`node`（Node 与传输层 iceoryx/intra/ros）、`component`（Component 基类/触发器/监控）、`graph`（GraphScheduler/watch_dog，graphpipe）、`scheduler`（DDLScheduler 等）、`task`（ComponentTask）、`module`（就绪/崩溃上报）、`streaming`、`cache`。
 
 核心类：`ChurchApp`（进程内应用骨架）、`Component`（组件基类）、`Node`（组件的消息收发上下文）、`Trigger`（触发器）、`ComponentRegistry`（组件工厂注册表）、`GraphScheduler`/`DDLScheduler`/`ConditionalScheduler`（三种调度器）。
+
+> **📘 概念｜graphpipe 与 Calculator**
+> **是什么**：graphpipe 是 church 内嵌的 mediapipe 风格图执行引擎：把计算逻辑写成一个个 **Calculator**（最小计算单元，声明自己吃什么输入流、吐什么输出流），再用一份 `.cfg` 图配置（文本协议）把多个 Calculator 接成一张有向图，框架按图自动调度——数据流到哪，哪一级就算。感知的核心算法（检测、跟踪、预测）全部以 Calculator 形态挂在感知图里。
+> **类比**：流水线图纸（图配置）+ 工位（Calculator）：图纸写明上一步的产物传给哪个工位，工人只管自己那道工序，不用知道整条线长什么样。
+> **🎯 为什么这样设计**：图执行把"数据流依赖"显式化——谁等谁、谁能并行，框架一眼看清并自动排布线程（§5.3 的 `num_threads: 5` 就是图执行线程池）；新增一个算法步骤 ＝ 图上加一个节点，不动现有代码。
+> **🗂 代码在哪里**：`/sandbox/platform/church/graph/`（GraphScheduler/watch_dog）；C01 感知图 `/sandbox/driver/config/component/perception_graph_l2avp_orin.cfg`（§5.3 有节选）。
 
 ### 2.2 初始化全流程（church_main → ChurchApp）
 
@@ -160,7 +194,7 @@ flowchart TB
 >   ChurchConfig church_config;
 >   MCHECK(InitializeChurchConfigFromParams(init_params, church_config)); // 5) 配置装配
 >   deeproute::church::node::Initialize(GenerateTransportConfigFromChurchConfig(church_config)); // 6) 传输层(iceoryx等)
->   g_church_app = std::`make_unique<ChurchApp>`(std::move(church_config));
+>   g_church_app = std::make_unique&lt;ChurchApp>(std::move(church_config));
 >   MCHECK(g_church_app->Initialize());                            // 7) 加载组件
 >   RegisterStopSignals();                                         // 8) SIGINT/SIGTERM
 >   deeproute::base::logger::InstallFailureResourceReclaimer(
@@ -174,6 +208,8 @@ flowchart TB
 > ```
 > 
 > 逻辑说明：初始化顺序固定为 **参数→日志/信号→配置→传输层→组件加载→信号注册→Run 阻塞等待退出信号**；`Run()` 内部流程见 §4.1。
+>
+> 人话版：这段初始化像开店营业前准备——查名单（解析参数）、开灯挂牌（日志/信号）、进货上架（配置装配）、铺电话线（传输层）、员工到位（组件加载）、挂"营业中"（Run 阻塞运行）；每一步失败都直接歇业（MCHECK 致命检查）。
 
 `ChurchApp::Initialize()` 逐 module 加载组件；`Run()` 启动监控器与调度器后 `WaitForSignal()` 信号量阻塞：
 
@@ -187,7 +223,7 @@ flowchart TB
 >     if (!LoadModule(module)) return false;              // 顺序加载每个 module
 >   }
 >   if (SchedulerType::GRAPH == scheduler_type()) {
->     graph_scheduler_ = std::`make_unique<GraphScheduler>`(MakeComponentPointerVector());
+>     graph_scheduler_ = std::make_unique&lt;GraphScheduler>(MakeComponentPointerVector());
 >     schedule_monitor_->InstallOnGraph(*graph_scheduler_);
 >   } else {
 >     schedule_monitor_->InstallOnNodes(MakeNodePointerVector());
@@ -220,8 +256,8 @@ flowchart TB
 > class ComponentRegistry {
 >  public:
 >   static void Register(const std::string& name,
->                        std::function<std::`shared_ptr<Component>`()> func);
->   static std::`shared_ptr<Component>` Create(const std::string& name);
+>                        std::function&lt;std::shared_ptr&lt;Component>()> func);
+>   static std::shared_ptr&lt;Component> Create(const std::string& name);
 > };
 > #define CHURCH_REGISTER_FACTORY_FUNCTION_INTERNAL2(name, var_name, ...) \
 >   namespace { struct ComponentRegistry_##var_name {                     \
@@ -229,7 +265,7 @@ flowchart TB
 >       deeproute::church::ComponentRegistry::Register(#name, __VA_ARGS__);} \
 >   }; } static ComponentRegistry_##var_name component_registry_##var_name;
 > #define CHURCH_REGISTER_COMPONENT(name) \
->   CHURCH_REGISTER_FACTORY_FUNCTION(name, std::`make_unique<name>`)
+>   CHURCH_REGISTER_FACTORY_FUNCTION(name, std::make_unique&lt;name>)
 > ```
 > 
 > 逻辑说明：`CHURCH_REGISTER_COMPONENT(PerceptionComponent)` 生成一个全局静态对象，**动态库被 dlopen（或 mainboard 静态链接）时其构造函数执行，把"类名→工厂函数"写入全局注册表**。
@@ -244,11 +280,11 @@ flowchart TB
 > for (auto& component : module_config.components()) {
 >   const std::string& class_name = component.class_name();      // 如 "PlanningComponent"
 >   const std::string& component_name = component.config().name();
->   auto node = std::`make_unique<Node>`(component_name, kLatencyWarnThreshold);
->   std::optional<std::`shared_ptr<Component>`> component_optional =
+>   auto node = std::make_unique&lt;Node>(component_name, kLatencyWarnThreshold);
+>   std::optional&lt;std::shared_ptr&lt;Component>> component_optional =
 >       ::deeproute::church::ComponentRegistry::Create(class_name);   // 工厂实例化
 >   if (!component_optional.has_value() || !component_optional.value()) return false;
->   std::`shared_ptr<Component>` base = std::move(component_optional.value());
+>   std::shared_ptr&lt;Component> base = std::move(component_optional.value());
 >   for (auto& param : church_config_.param()) base->SetParam(param.key(), param.value()); // -p 参数注入
 >   if (!base->Initialize(node.get(), component.config())) return false;
 >   base->SetParam(kChannelTypeKey, ChannelType_Name(global_channel_type_));
@@ -263,6 +299,12 @@ flowchart TB
 
 ### 2.4 组件生命周期
 
+> **📘 概念｜Component 组件**
+> **是什么**：church 的业务容器——业务逻辑继承 `Component` 基类，实现三个钩子：`Init()`（初始化）、`Proc()`（每来一批数据被调一次）、`Shutdown()`（收尾）。组件自己不创建线程、不直接读消息队列：什么时候被调（Trigger）、消息从哪来（订阅通道）、结果发哪去（发布通道）全部由框架按配置装配。
+> **类比**：车间工位——上岗前接好水电（Startup 先注册发布器再初始化再挂订阅器），来料加工（Proc），下班断电（Shutdown）；"什么时候来料、料从哪条传送带来"是厂务（框架）的事。
+> **🎯 为什么这样设计**：业务代码与线程/传输/调度解耦——同一段业务代码可以跑在 church 组件、独立进程、仿真三种形态下（感知核心 `InitPerceptionStream` 在 church 组件与独立 main.cpp 两处共用，见本节末证据说明）。
+> **🗂 代码在哪里**：`component/component.cc`（Initialize/Startup/Shutdown，证据块见下）；业务侧 `PerceptionComponent` / `PlanningComponent`（§2.3 证据块）。
+
 > 文件路径：/sandbox/platform/church/component/component.cc  
 > 函数名：Component::Initialize / Component::Startup  
 > 核心逻辑：
@@ -271,7 +313,7 @@ flowchart TB
 > bool Component::Initialize(Node* node, const ComponentConfig& config) {
 >   Check_Component_Version(); config_ = config; node_ = node; name_ = config.name();
 >   LoadParamsFromCloudConfig();                       // 云端参数下发
->   context_manager_ = std::`make_unique<ContextManager>`();
+>   context_manager_ = std::make_unique&lt;ContextManager>();
 >   if (config.task().has_context_config()) { ...RegisterDumpPolicy(...); }
 >   InitChannelCaches();  InitializeTrigger();         // 输入缓存 + 触发器
 >   return true;
@@ -285,6 +327,8 @@ flowchart TB
 > ```
 > 
 > 逻辑说明：生命周期为 `Initialize`（框架侧装配）→ `Startup`（注册发布器→Init→注册订阅器）→ 运行期反复 `Proc()`（由触发器/图调度驱动）→ `Shutdown`/`Clear`。触发器实现于 component/ 下 `framesync_trigger.h`、`immediate_trigger.h`、`periodic_trigger.h`、`notrigger_trigger.h`，对应 jsonnet 中 `trigger_policy: FRAMESYNC/IMMEDIATE/PERIODIC`。
+>
+> 发布器/订阅器对接的**消息频道**（Topic/Channel）详见《02 模块配置与 Topic 数据流拓扑》：组件按频道名收发，同进程内直通、跨进程才走 iceoryx 共享内存。
 
 业务组件示例——**PerceptionComponent::Init() 并不起感知算法**，而是构造伪命令行解析 gflags，真正的感知初始化在图计算 calculator 中调用 `InitPerceptionStream`（同样走 `CreateGraphManager`，与独立进程 main.cpp 完全共用一套核心，见 /sandbox/perception/perception/church_component/perception_component_api.cpp:39）：
 
@@ -308,7 +352,17 @@ flowchart TB
 
 ## 3. 配置加载流程
 
+**一句话结论**：配置分两层——DEM 层定义"跑哪些进程"，组件层定义"进程里装哪些组件"；覆盖优先级从高到低是：云端配置 > task_type 条件图 > 车型 jsonnet > 命令行默认。
+
+**为什么分两层、优先级这样排**：进程层回答「这台车上跑哪几个进程、谁先谁后、崩了怎么办」（运维视角），模块层回答「进程里装哪些组件、消息怎么流」（开发视角）——两层解耦后，往进程里加组件不必动进程编排，换车型只换进程层花名册。覆盖优先级「云端 > task_type > 车型 jsonnet > 默认」的排序逻辑同理：越靠近线上、越能不重编不动配置文件就生效的东西，话语权越大——云端调参永远压过出厂默认。
+
 ### 3.1 两层配置体系
+
+> **📘 概念｜jsonnet**
+> **是什么**：Google 出品的 JSON 超集配置语言——在 JSON 基础上加变量、函数、导入，最终编译输出纯 JSON。车端两层配置（DEM 进程定义、组件定义）都是 jsonnet 写的，构建期经 `jsonnet_to_json` 规则编译。
+> **类比**：带变量的配置模板——车型差异（如 c01-pt）做成开头几行变量赋值，换车型不用复制整份配置。
+> **🎯 为什么这样设计**：车端配置存在大量"结构相同、参数微调"的重复（多车型×多状态×多进程），jsonnet 用变量消除复制粘贴，让差异一目了然。
+> **🗂 代码在哪里**：`dem/c01-pt/*.jsonnet`（§1.2）、`driver/config/component/*.jsonnet`（下表）；编译规则 `dem/c01-pt/BUILD`。
 
 | 层 | 文件 | 消费者 | 作用 |
 |-|-|-|-|
@@ -318,6 +372,12 @@ flowchart TB
 部署映射已被实车快照证实：`driver/config/component/planning.jsonnet` → 部署为 `${DEEPROUTE_PATH}/planning/config/planning.jsonnet`；`driver/config/component/perception_orin.jsonnet` → `${DEEPROUTE_PATH}/perception/config/perception_orin.jsonnet`（对照部署快照 planning/config/、perception/config/ 目录内容）。
 
 ### 3.2 jsonnet → ChurchConfig 的解析
+
+> **📘 概念｜protobuf**
+> **是什么**：Google 的序列化格式与代码生成工具——消息结构定义在 `.proto` 文件里（字段名/类型/编号），工具自动生成 C++ 等语言的读写类。车端所有运行时消息（感知 objects、规划轨迹、配置结构体）都是 proto 对象。
+> **类比**：标准化表格——模板（.proto）约定好每格填什么，任何语言都能按同一模板填和读，还自带跨机器传输的打包/解包。
+> **🎯 为什么这样设计**：跨进程/跨模块传递的数据必须有统一契约；proto 二进制编码紧凑（车端大消息必须省带宽）、字段可演进（加字段不破坏老代码）。
+> **🗂 代码在哪里**：本节证据块 `base::GetProtoFromJsonnetFile`（jsonnet→proto 反序列化）；消息定义散布各仓 `proto/` 目录（见各篇 07 索引）。
 
 > 文件路径：/sandbox/platform/church/mainboard/config_utils.cc  
 > 函数名：ReadAllJsonModuleConfig  
@@ -351,9 +411,21 @@ flowchart TB
 
 调度器类型判定（同一文件 `RedetermineSchedulerType`）：组件带 `graph_config_path` → **SchedulerType::GRAPH**；存在 `PERIODIC/IMMEDIATE` 触发策略 → CONDITIONAL；`LEGACY` 不支持（FATAL）。C01 主进程 perception/Planning 均有 graph_config_path，且仓库默认 `--config=with_graphpipe`（perception/.bazelrc:48、planning/.bazelrc:46），故运行 GRAPH 调度器。
 
+> **📘 概念｜GraphScheduler 与调度器三形态**
+> **是什么**：调度器决定"组件的 Proc 何时被调"。church 有三种：**GRAPH**——组件声明了图配置（graph_config_path），各组件的图被合并成一张大图按数据流调度；**CONDITIONAL**——按组件各自的 Trigger（PERIODIC/IMMEDIATE）独立调度；**DDL**——按截止期（deadline）调度。C01 主进程因 perception/planning 都带图配置而运行 GRAPH。
+> **类比**：总调度台——GRAPH 模式下，所有车间的流水线图纸被合并成一张全厂大图纸，由一个调度台统一排班。
+> **🎯 为什么这样设计**：感知和规划同进程（§3.4），若各排各的线程容易互抢资源；合并成一张图后框架能全局安排执行顺序与线程池，还挂上 WatchDog 监控（§4.4）。
+> **🗂 代码在哪里**：`graph/graph_scheduler.cc`（合并图 `GenerateCalculatorGraphConfig`）；判定逻辑 `RedetermineSchedulerType`（本节上文）。
+
 车型选择机制：dem 与 thread/stream 配置经 **bazel config_setting（如 `@deeproute_build_tools//:C01-PT_setting`）在构建期选入 `config/dem/c01-pt`**（/sandbox/driver/config/dem/BUILD:10-12），即车型差异在打包期固化，运行期不切换。
 
 ### 3.4 问题 A 结论：C01 下 perception 与 planning 同进程（已验证）
+
+> **📘 概念｜单进程 E2E（本文最核心结论）**
+> **是什么**：C01 把感知（Perception）与规划（Planning）两个组件装进**同一个 mainboard 进程**（dem 配置里同一个 `binary_path` 挂 4 份 module_conf），进程内消息经 church channel 直通，不跨进程、不走序列化。
+> **类比**：两个部门合租一间办公室——递材料喊一声就到（直通），不用打包发邮局（跨进程序列化＋共享内存）。
+> **🎯 为什么这样设计**：省掉感知→规划这条最高频链路的跨进程开销与序列化延迟（每 100ms 一帧）；代价是共享进程资源与故障域合并（感知崩了规划陪葬，一起被 DEM 重启）——权衡细节见下方证据链。
+> **🗂 代码在哪里**：本节下方证据链 4 条（jsonnet 同 binary_path、线程表共存等）。
 
 证据链（均可复查）：
 
@@ -403,6 +475,8 @@ sequenceDiagram
 
 ### 4.2 组件加载与初始化顺序（已验证）
 
+**读图三提示**（上图自上而下）：① `ChurchApp::Initialize → CreateComponentsAndInitialize` 是**串行**的——四个组件按 `-m` 顺序逐个创建，前一个失败整体启动失败；② GraphScheduler 是**先 StartAllComponents（注册发布器→Init→注册订阅器）再合并建图**，顺序不能颠倒——订阅器没注册完图就跑起来会丢帧；③ 最后一行 `Trigger/Proc 循环` 才是日常运行态：这条启动链只走一次，之后每 100ms 循环的是 §5 的图执行线程池。
+
 顺序由两个层面决定：
 
 1. **创建顺序**＝`-m` 传参顺序＝jsonnet 内 components 数组顺序：`perception_orin.jsonnet(PerceptionComponent) → planning.jsonnet(PlanningComponent) → data_agent_rt.jsonnet → lom_infer.jsonnet`（ChurchApp::Initialize 的 for 循环）。
@@ -418,6 +492,12 @@ DDL 调度器路径（非 C01 主进程，但组件失败语义一致）：`Star
 
 进程内（不重启，只告警/上报）：
 
+> **📘 概念｜WatchDog（图看门狗）**
+> **是什么**：graphpipe 的健康监控线程：每秒检查图内各节点有无新帧进来，超过 1 秒没新帧打 WARN 日志（`There is no incoming frame`）；它只告警不重启——重启决策在进程外（§1.2 的 DEM）。
+> **类比**：巡夜人——每小时巡逻一遍，发现没动静就喊一嗓子（上报），但不越权破门。
+> **🎯 为什么这样设计**：卡死的最早征兆就是"图不再吐帧"；把"发现卡了"（框架内）与"怎么办"（告警/人工/DEM 重启）分层，两层职责分离。
+> **🗂 代码在哪里**：`graph/watch_dog.h`（本节证据）。
+
 - **graph_watch_dog**：每秒检查图内节点有无新帧，超 1s 打 WARN "There is no incoming frame"（/sandbox/platform/church/graph/watch_dog.h:46-65）；ChannelSuspendAlarm 监控订阅通道长时间无数据并告警。
 - **崩溃上报**：`InstallFailureResourceReclaimer(RequestChurchAppReclaim, WaitForChurchAppReclaimed)` 挂接 glog failure signal handler；致命信号/崩溃发生时先回收并上报 `ReportAllComponentsAbnormalExit()`（module_crash_reporter.cc:69-80），随后进程退出。
 - anomaly_monitor / schedule_monitor 周期上报组件调度异常事件。
@@ -427,6 +507,10 @@ DDL 调度器路径（非 C01 主进程，但组件失败语义一致）：`Star
 ---
 
 ## 5. 线程模型
+
+**一句话结论**：业务代码不创建线程——church 图执行线程池 ＋ common 线程库按"线程名"匹配优先级与绑核，全部写在 `thread_config/perception.json` 一个文件里。
+
+**为什么按线程名匹配**：C/C++ 里业务代码创建线程时只能起个名字，管不了优先级与绑核；把「线程名 → 优先级/绑核/调度策略」的映射放进独立的 json，调度工程师就能在不重编业务代码的情况下调整整机算力分配——感知、规划、数据回传各抢多少 CPU 一张表写清，排障时用 `pidin -t` 看到线程名即可对号入座（QNX 下查看进程线程的工具）。
 
 ### 5.1 线程配置加载机制
 
@@ -459,7 +543,7 @@ DDL 调度器路径（非 C01 主进程，但组件失败语义一致）：`Star
 |-|-|-|-|
 | t_perception | SCHED_RR / 6 | 1-5 | 感知组件任务线程（task 名与 jsonnet `task.name` 一致） |
 | t_Planning | SCHED_RR / 5 | 1-5 | 规划组件任务线程 |
-| pp / nn_pre / mediapipe / nn_internal_designated | SCHED_RR / 6 | 1-5 | 感知图内后处理/前处理/图执行/NN 线程 |
+| pp / nn_pre / mediapipe / nn_internal_designated | SCHED_RR / 6 | 1-5 | 感知图内后处理/前处理/图执行/[**NN**](../../../正典阁/技术栈/AI/神经网络与推理引擎.md) 线程 |
 | plan_main / plan_worker / plan_stitch / planning_executor / open_space_worker | SCHED_RR / 5 | 1-5 | planning 内部线程池 |
 | t_lom_infer | SCHED_RR / 4 | 6-8 | lock-on-road 推理（独占 6-8 核） |
 | data_agent_executor / desen_dispatch / boxsender_dispatch | SCHED_RR / 1 | 0,9-10 | 数据回传 |
@@ -509,6 +593,26 @@ DDL 调度器路径（非 C01 主进程，但组件失败语义一致）：`Star
 | 15 | 感知核心初始化 | /sandbox/perception/perception/church_component/perception_component_api.cpp；/sandbox/perception/perception/main.cpp | InitPerceptionStream()（两种进程形态共用） |
 
 **全链路调用栈（文字版）**：`EM 状态切换 → dem_launch（读 dem/c01-pt jsonnet）→ exec mainboard → main → church::church_main → ParseSystemArguments → InitializeChurchConfigFromParams（4×jsonnet→ChurchConfig）→ node::Initialize(iceoryx) → ChurchApp::Initialize → LoadModule×4 → ComponentRegistry::Create（静态注册表）→ Component::Initialize → RegisterStopSignals → ChurchApp::Run → GraphScheduler::Start → Component::Startup×N（Publishers→Init→Subscribers）→ CalculatorGraph::Initialize/Run → FrameSyncCalculator 触发 → Component::Proc 循环 → （SIGTERM）ChurchApp::Stop → node::Shutdown → 退出码返回 dem_launch`。
+
+---
+
+## 7. FAQ 与自测
+
+**Q1：为什么感知和规划要塞进同一个进程？分布式各跑各的不是更清晰吗？**
+A：§3.4 有完整证据链。核心理由是数据流：规划每 100ms 都要拿感知的最新结果，同进程内 church channel 直通，省掉跨进程序列化与共享内存往返的延迟和拷贝；代价是共享进程资源、故障域合并（感知崩了规划陪葬，一起被 DEM 重启）。分布式/单组件形态（drvla）在仓库中存在但 C01 未启用。
+
+**Q2：为什么感知初始化"不在"组件 Init 里做，而要拖到图执行阶段？**
+A：§2.4 末的证据说明：`PerceptionComponent::Init()` 只解析伪命令行、准备 gflags，真正的 `InitPerceptionStream` 在图内 calculator 中调用——因为感知初始化需要依赖图执行环境（InputSidePacket、共享内存句柄等），且 church 与独立进程两种形态要共用同一套初始化代码（§6 #15），把初始化放在图内是两种形态的最大公约数。
+
+**Q3：进程崩了会怎样？**
+A：三层响应：glog failure handler 先执行资源回收钩子并上报 `ReportAllComponentsAbnormalExit`（§4.4）→ 进程退出 → DEM 按 `recovery_method: RECOVERY_RESET` 重新拉起（§1.2）。DEM 内部的退避策略未验证（dem_launch 无源码，见附录）。
+
+**自测（能答上来才算读懂）**
+
+1. `CHURCH_REGISTER_COMPONENT` 宏的注册发生在什么时机？框架怎么知道该创建哪个组件？
+   （答：动态库被加载/静态链接时的**静态初始化阶段**——全局对象的构造函数把"类名→工厂函数"写入注册表；框架按 jsonnet 组件配置的 `class_name` 查注册表实例化。§2.3。）
+2. 启动时组件的创建顺序由什么决定？如果 PlanningComponent 的 Init 失败会怎样？
+   （答：`-m` 传参顺序＝jsonnet components 数组顺序：perception→Planning→DataAgent→lom_infer；任一组件 Init/订阅器注册失败即整体启动失败并上报，进程退出。§4.2。）
 
 ---
 

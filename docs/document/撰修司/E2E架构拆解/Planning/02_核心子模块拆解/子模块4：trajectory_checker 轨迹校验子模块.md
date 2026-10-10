@@ -1,7 +1,7 @@
 ---
 title: "子模块4：trajectory_checker 轨迹校验子模块"
 date: 2026-09-20
-description: "分析对象：/sandbox/planning/planning/trajectory_checker（9 文件：trajectory_checker.h/.cp"
+description: "轨迹校验子模块：21 项校验枚举与仅 EM_PLANNER 生效的边界。"
 categories:
   - 撰修司
 tags:
@@ -9,12 +9,28 @@ tags:
   - E2E
 ---
 
-# 子模块4：trajectory_checker 轨迹校验子模块
+> **30 秒导读**："轨迹安检员"：21 项检查一票否决，只有全过的轨迹才能交给控制。
+> **本篇回答**：都检查什么？不过会怎样？哪些规划模式不走安检？
+> **先修阅读**：《00 入门》§3 步骤 9"安检与兜底"。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **轨迹校验**：规划输出→控制输入之间的最后安检门——不生成轨迹，只拦/改轨迹（完整卡片见 §1 末）。
+> - **两型检查互补**：tasks/trajectory_safety 是代价型（影响选线），本模块是门卫型（把关下发）。
+> - **只查 EM_PLANNER**：OpenSpace/ReverseTracking 不走本模块（替代机制未验证）。
+> - **critical vs non-critical**：前者失败即返回（点数/规划失败/时戳/可控性），后者跑完收集全部原因。
+> - **21 项枚举**（基线口径）：碰撞 3+出车道 2+可控性+点数+时戳+上游+地图+舒适度/抖动 5+AEB+内部故障 101。
+> - **唯一改写者**：SafetyChecker（NOA-AEB）触发后原地替换制动曲线+双闪；其余只拦截。
+> - **宁放行不自毙**：检查器自身故障（101）强制放行，避免安全机制瘫痕行车。
+
 
 > 分析对象：/sandbox/planning/planning/trajectory_checker（9 文件：trajectory_checker.h/.cpp、safety_checker.h/.cpp、safety_checker_utils.h/.cpp、BUILD.bazel、CMakeLists.txt、trajectory_checker_test/ 目录）  
 > 分支基线：Stable_Master_4.0_new（当前检出即目标分支）
 
 ## 1. 子模块定位与职责
+
+**一句话结论**：trajectory_checker 是任务链外的最后一道门卫型硬校验——不生成轨迹，只在发布前对最终 ADCTrajectory 复检 21 项（基线口径），与任务链内代价型的 trajectory_safety 互补。
+
+**为什么校验要独立于任务链**：任务链内的代价型检查（trajectory_safety）可能被权衡吞掉——「碰撞代价高，但其他代价都很低，综合下来还是选了它」，这在博弈框架里是合法解，但物理上不可接受。所以必须有一道独立于权衡过程的硬校验：不看代价、只看物理事实（会不会撞、会不会出线、控制跟不跟得上），过不了就不发布。代价型管「选哪条」，门卫型管「发不发」，两层缺一不可。
 
 trajectory_checker 是规划主进程内**最后一道独立安全防线**：不参与轨迹生成，只在每帧规划输出 `ADCTrajectory` 之后、发布给控制之前，对**最终下发轨迹**做可行性/碰撞/可控性复检。它独立于 EmPlanner 任务链（tasks/trajectory_safety 是任务链内的"代价型"安全检查，本模块是任务链外"门卫型"硬校验，两者互补）。
 
@@ -29,7 +45,17 @@ trajectory_checker 是规划主进程内**最后一道独立安全防线**：不
 
 唯一对外入口是 `TrajectoryChecker::RunChecker()`（trajectory_checker.h L77）与 `AbnormalEventsChecker()`，由 Planning 根类持有（planning.h L629 `std::unique_ptr<TrajectoryChecker> trajectory_checker_`）。
 
+> **📘 概念｜轨迹校验（TrajectoryChecker 门卫型硬校验）**
+> **是什么**：规划主进程内最后一道独立安全防线——每帧轨迹生成完、发布给控制之前，对最终下发的 ADCTrajectory 做 21 项（基线口径）可行性/碰撞/可控性复检，不过关就拦截/改写。它与 tasks/trajectory_safety 的区别：那是任务链内的"代价型"检查（碰撞→加 FALLBACK 代价→影响选线，输入 ReferenceLineInfo），本模块是选线完成后的"门卫型"硬校验（碰撞→拦截/改写下发轨迹，输入最终 ADCTrajectory）——一个影响"选哪条"，一个把关"发不发"。它也不与 EmPlanner 任务链重叠执行：只有 EM_PLANNER 走本模块，OpenSpace/ReverseTracking 不校验。
+> **类比与角色映射**：轨迹校验是「登机前的安检门」——旅客（ADCTrajectory）无论多赶时间，都必须过完最后一道门才能登机（下发给控制）。21 项映射：行李 X 光＝碰撞三连查（静止物 UNMOVEABLE/动态物 MOVING/前向动态物 FRONT_MOVING，逐点建 ADC 包围盒做重叠判定）；门框限宽＝出车道 OFF_LANE 与车道线碰撞 LANE_COLLISION；健康体检＝可控性 NOT_CONTROLABLE（曲率/航向变化率/纵向一致性，连续失败≥15 点才判）；登机牌验真＝感知-轨迹时戳匹配；机组资质＝上游模块状态 UPSTREAM_MODULE_FAILED；航图核对＝MAP_ERROR；仪容仪态＝舒适度事件（横摆不适 LAT_UNCOMFORTABLE/急刹 LON_HARD_BRAKE/画龙 WIBBLE/方向盘抖动 STEER_SHAKING/STEER_JERKY，只记事件不拦截）；点数验票＝NOT_ENOUGH_POINT；规划本身弃考＝PLANNER_FAILED；特勤处置＝SafetyChecker（NOA-AEB，唯一会"改写"轨迹的项——碰撞时原地替换为制动曲线并点亮双闪）；安检员自己晕倒＝CHECKER_INTERNAL_FAULT(101)，强制放行避免中断行车。真实数字：critical 失败即刻 return（点数/规划失败/时戳/可控性），non-critical 跑完全部收集原因；失败写入 checker_result.checker_failed+brake_acc 随轨迹下发；点数不足且车速<0.1m/s 时补全 0 停车轨迹兜底。
+> **🎯 为什么这样设计**：任务链内的代价型检查可能被权衡吞掉（"碰撞代价高但其他代价低还是选了它"），必须有独立的最终硬校验兜底；critical/non-critical 分级让"致命问题立即终止、一般问题收集全貌"——一次上报全部失败原因便于排查；检查器自故障放行（101）体现"宁放行、不自毙"——安全机制的失效模式必须优先于业务。
+> **🗂 代码在哪里**：trajectory_checker/trajectory_checker.cpp（RunChecker L34-192 编排、FailureHandler L1706-1720）；safety_checker.cpp（Process L51-77、BrakeDecision L312-331）；调用点 planning_trajectory_process.cpp RunTrajectoryChecker L2529、planning_core.cpp ExecuteTrajectoryValidation L1445。
+>
+> **30 秒最小例子**：规划给出一条 8s 轨迹，控制发布前 RunChecker 逐点扫掠：点数够、时戳匹配、可控性 15 点计数未超；第 40 点的 ADC 包围盒（含后视镜）与右侧锥筒 box 重叠——锥筒用去后视镜 box 重判后无重叠，放行；第 55 点与静止护栏真重叠→FailureHandler(UNMOVEABLE_COLLISION, brake_acc=按 s 位置插值)，checker_failed=true 随轨迹下发，控制按制动请求降级停车。
+
 ## 2. 核心类结构与成员变量
+
+**一句话结论**：TrajectoryChecker 持失败原因/异常事件/调试信息三个集合+SafetyChecker 子检查器；AEB 计数器"外部只能减"防误置位，触发需连续多帧超阈值防抖。
 
 ### 2.1 TrajectoryChecker：结果枚举 + 校验配置 + 状态
 
@@ -55,13 +81,13 @@ trajectory_checker 是规划主进程内**最后一道独立安全防线**：不
 >   void AbnormalEventsChecker(const deeproute::planning::ADCTrajectory *trajectory);
 >  private:
 >   bool is_traj_feasible_;                 // 本帧总体可行性
->   std::`unordered_set<TRAJECTORY_FEASIBILITY>` trajectory_result_;        // 失败原因集合
->   std::`unordered_set<TRAJECTORY_FEASIBILITY>` trajectory_abnormal_events_; // 事件型（不判失败）
->   std::`unordered_map<TRAJECTORY_FEASIBILITY, TrajectoryDebugInfo>` trajectory_debug_;
+>   std::unordered_set&lt;TRAJECTORY_FEASIBILITY> trajectory_result_;        // 失败原因集合
+>   std::unordered_set&lt;TRAJECTORY_FEASIBILITY> trajectory_abnormal_events_; // 事件型（不判失败）
+>   std::unordered_map&lt;TRAJECTORY_FEASIBILITY, TrajectoryDebugInfo> trajectory_debug_;
 >   TrajectoryChecker::SECURITY_WARNING_LEVEL security_warning_level_{PASS};
->   std::`unique_ptr<SafetyChecker>` safety_checker_;
->   std::`vector<common::Box2d>` adc_boxes_;              // 轨迹逐点 ADC 包围盒（含后视镜）
->   std::`vector<common::Box2d>` adc_boxes_without_mirror_; // 去后视镜版（锥筒校验用）
+>   std::unique_ptr&lt;SafetyChecker> safety_checker_;
+>   std::vector&lt;common::Box2d> adc_boxes_;              // 轨迹逐点 ADC 包围盒（含后视镜）
+>   std::vector&lt;common::Box2d> adc_boxes_without_mirror_; // 去后视镜版（锥筒校验用）
 >   deeproute::taskconfig::TrajectoryCheckerConfig checker_config_;
 > };
 > ```
@@ -97,6 +123,8 @@ trajectory_checker 是规划主进程内**最后一道独立安全防线**：不
 
 ## 3. 核心处理流程与调用链
 
+**一句话结论**：只有 EM_PLANNER 走校验（RunTrajectoryChecker 门卫条件）；RunChecker 内部分 critical（失败即返）与 non-critical（跑完收集）两段。
+
 ### 3.1 被谁调用（上行）
 
 ```mermaid
@@ -118,6 +146,10 @@ frame VPA 状态联动]
     C --> J[HandleTrajectoryPublishingAndExceptions
 失败→上报异常事件/清空轨迹点]
 ```
+
+**图 3-1 · 轨迹校验的上行调用链（从规划主循环到发布拦截）**（E 是门卫条件分流，F→H 是校验主体，J 是失败处置出口）
+
+**读图提示**：① E 分流"是否校验"——只有 EM_PLANNER 且检查器存在才进 F；② F 之后 H 是事件型检查（不拦截只上报）；③ J 是失败终点：上报异常事件/清空轨迹点，轨迹不会被带病发布。
 
 > 文件路径：/sandbox/planning/planning/planning_trajectory_process.cpp  
 > 函数名：Planning::RunTrajectoryChecker（L2529-2580）  
@@ -196,6 +228,8 @@ frame VPA 状态联动]
 
 ## 4. 校验项清单与关键逻辑（以代码为准）
 
+**一句话结论**：碰撞类按时间窗降采样逐点建 ADC 包围盒（锥筒用去后视镜版）；可控性各计数器连续失败≥15 点才判；AEB 用 ttc/dtc/brake_dist 三条件+连续帧计数。
+
 | 校验项 | 枚举 | 类型 | 失败处置 |
 |-|-|-|-|
 | 点数检查 TrajectorySizeCheck | NOT_ENOUGH_POINT | critical | 清空轨迹点；车速<0.1m/s 时改填全 0 停车轨迹（trajectory_type=COMBINE_PATH_SPEED_FAILED，brake_acc=-1.0） |
@@ -244,6 +278,8 @@ frame VPA 状态联动]
 > ```
 > 
 > 逻辑说明：静止物碰撞按**时间窗降采样**逐点建 ADC 包围盒与障碍物 box 做重叠判定；`GetBrakeAcc(s)` 按碰撞点纵向位置插值出合理制动减速度写进 `checker_result().brake_acc` 供控制降级参考。
+
+**检查条件里的 AI 名词**：静止物判定的前提是障碍物「无预测」——即感知没有为它生成未来轨迹框（预测框怎么来的，见 [**AI 字典·轨迹预测**](../../../../正典阁/技术栈/AI/轨迹预测.md)）；过滤条件里的「盲区低置信物」用的是感知输出的**置信度**（感知对检测结果的把握程度，见 [**AI 字典·置信度**](../../../../正典阁/技术栈/AI/置信度.md)）——把握不足的对象宁可跳过检查，避免误拦。
 
 ### 4.2 可控性校验证据（ControlableCheck）
 
@@ -306,6 +342,8 @@ frame VPA 状态联动]
 
 ## 5. 失败后果与降级联动
 
+**一句话结论**：失败后果六条联动——轨迹内联标记、发布侧拦截、异常事件上报、VPA 状态联动、检查器自故障放行、低速停车轨迹兜底。
+
 > 文件路径：/sandbox/planning/planning/trajectory_checker/trajectory_checker.cpp + planning_trajectory_process.cpp + planning_core.cpp  
 > 函数名：FailureHandler / AddTrajectoryAbnormalEvent / HandleTrajectoryPublishingAndExceptions  
 > 核心逻辑（FailureHandler，trajectory_checker.cpp L1706-1720）：
@@ -335,9 +373,32 @@ frame VPA 状态联动]
 > 5. **检查器自保护**：`HasInternalFault()`（枚举 101）时 `trajectory_passed_checker=true` 强制放行（RunTrajectoryChecker L2560-2562），避免检查器自身缺陷导致行车中断——"宁放行、不自毙"的降级策略。
 > 6. **低速兜底**：点数检查失败且车速<0.1m/s 时用 `FillStopSpeedIntoTrajectory` 生成原地停车轨迹替代（trajectory_checker.cpp L210-254），保证静止场景仍有合法轨迹下发。
 
+与 [**降级 Fallback**（Planning/06）](../06%20异常处理与降级机制.md) 的关系：本模块拦截后控制侧按 brake_acc 制动、规划侧下帧重算，属于"输出质量防线"；Planning/06 的 Fallback 是"规划算不出好轨迹时"的主动降级——两道防线层次不同。
+
 ## 6. 代码证据与关键片段
 
+**一句话结论**：本篇 6 段代码证据已覆盖调用点/编排/碰撞/可控性/AEB/失败处置全链，无重复片段。
+
 见第 3.1、3.2、4.1、4.2、4.3、5 节 6 段带路径/函数名/行号的代码证据（RunTrajectoryChecker 调用点、RunChecker 编排、UnmoveableCollisionCheck、ControlableCheck、SafetyChecker::Process+BrakeDecision、FailureHandler），此处不再重复。
+
+## 7. FAQ 与自测
+
+**Q1（新手常见误解）**：轨迹校验失败是不是意味着规划下帧重算就行，轨迹照发？
+不是。失败轨迹不会被带病发布——HandleTrajectoryPublishingAndExceptions 对未通过校验的轨迹上报异常事件并清空轨迹点；部分 critical 项（点数/可控性）直接清空 trajectory_point，控制侧只会拿到 checker_failed+brake_acc 的制动请求。
+
+**Q2**：检查器自己出 bug 了怎么办？会不会把好轨迹全拦下导致车辆趴窝？
+不会——设计者考虑了这个失效模式：HasInternalFault()（枚举 101 CHECKER_INTERNAL_FAULT）时 trajectory_passed_checker 强制置 true 放行。安全机制的失效模式优先于业务，"宁放行、不自毙"。
+
+**Q3**：NOA-AEB（SafetyChecker）和其他碰撞检查有什么本质区别？
+其他碰撞检查是"拒绝"——判失败、上报、清轨迹；SafetyChecker 是"改写"——用 RegenerateSpeedPath 重算的制动曲线原地替换输出轨迹并点亮双闪（emergency_light=true），是全模块唯一会修改轨迹的校验项。
+
+**自测**：
+1. RunChecker 里 critical 与 non-critical 校验的处置差异？
+    critical（点数/规划失败/时戳/可控性）失败立即 return false；non-critical（碰撞/出车道/车道线等）失败继续跑完，收集全部失败原因集合后统一上报。
+2. 静止物碰撞检查对锥筒有什么特殊处理？
+    锥筒（TRAFFIC_CONE）用去掉后视镜的 ADC 包围盒判定（adc_boxes_without_mirror_），其余障碍物用含后视镜的完整 box——避免后视镜误蹭锥筒触发误拦。
+3. 点数检查失败且自车低速时怎么兜底？
+    车速<0.1m/s 时 FillStopSpeedIntoTrajectory 生成全 0 停车轨迹（trajectory_type=COMBINE_PATH_SPEED_FAILED，brake_acc=-1.0）替代发布，保证静止场景仍有合法轨迹下发。
 
 ---
 

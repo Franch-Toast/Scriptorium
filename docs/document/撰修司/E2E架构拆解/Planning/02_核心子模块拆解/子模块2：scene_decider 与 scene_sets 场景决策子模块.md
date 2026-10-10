@@ -1,7 +1,7 @@
 ---
 title: "子模块2：scene_decider 与 scene_sets 场景决策子模块"
 date: 2026-09-20
-description: "分支基线：perception/planning/driver @ Stable_Master_4.0_new（当前检出）。本文所有路径均为只读分析结论，未经证"
+description: "场景决策子模块：14 个场景检测器与场景状态管理。"
 categories:
   - 撰修司
 tags:
@@ -9,11 +9,27 @@ tags:
   - E2E
 ---
 
-# 子模块2：scene_decider 与 scene_sets 场景决策子模块
+> **30 秒导读**："分诊台"：先判断现在是什么驾驶场景（跟车/变道/施工区…），再决定走哪套处理流程。
+> **本篇回答**：有哪些场景？怎么检测？场景之间怎么切换？
+> **先修阅读**：《Planning 00 总览》主流程图。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **场景决策**：先定性再解题——14 个检测器把当前局面归类，下游按场景挑参数/分支（完整卡片见 §1 末）。
+> - **两套班底**：scene_sets 是正规军（基类+工厂+管理器，结果挂参考线）；scene_decider 是三个专项判定器（散在 DP path/DP speed 内部）。
+> - **SceneDetectionResult**：统一答卷格式——场景类型+优先级+置信度+SL 区间+关键障碍物+自由参数。
+> - **无状态每帧重算**：场景没有跨帧记忆（施工区例外），检测不到即退出——分类永远反映最新世界。
+> - **重要障碍物前置**：所有检测器共享同一份 important_obstacle_set_，避免 14 人各筛一遍。
+> - **ReferenceLineInfo 是总线**：场景结果挂在每条参考线上——同帧不同参考线场景可以不同（[**ReferenceLineInfo**（Planning/00 §2）](../00%20Planning%20模块架构总览.md)）。
+> - **施工区当前禁用**：CONSTRUCTION_AREA 检测器 IsEnabled 硬编码 false，下游分支是死代码。
+
 
 > 分支基线：perception/planning/driver @ Stable_Master_4.0_new（当前检出）。本文所有路径均为只读分析结论，未经证实处标注"推断"或"未验证"。
 
 ## 1. 子模块定位与职责
+
+**一句话结论**：场景决策=「先定性再解题」——scene_sets（14 检测器场景库）+scene_decider（3 个参考线级判定器）两套班底都不做规划，只产出场景标签/参数给 [**Task 管线**（Planning/00 §2）](../00%20Planning%20模块架构总览.md)。
+
+**为什么先分诊再解题**：如果把「判断局面」和「求解轨迹」揉在一个大函数里，每换一种路况就要动一次求解代码，改动风险随场景数量线性增长。把「定性」拆成独立一层后，求解器保持通用（只认障碍物与限速两种语言），场景检测结果只是往参考线上挂参数——新增一种场景=新增一个检测器，求解代码一行不动。这也是为什么本篇没有任何轨迹生成逻辑：它全部是「给下游递条子」的准备工作。
 
 本仓库 Planning 的"场景决策"由**两个相互独立的子模块**构成，二者均**不做轨迹规划**，只在任务管线（tasks）早期产出"场景标签/场景参数"，供 DP path、DP speed、变道决策、防御性驾驶等下游模块消费。
 
@@ -45,7 +61,7 @@ tags:
 >   const ReferenceLineInfo &ref_line_info_;
 >   bool is_valid_to_away_left_curb_ = false;
 >   bool is_valid_to_away_right_curb_ = false;
->   std::`map<double, RoadEdgeDistInfo>` dict_road_edge_dist_info_;
+>   std::map&lt;double, RoadEdgeDistInfo> dict_road_edge_dist_info_;
 > };
 > ```
 > 
@@ -99,9 +115,19 @@ tags:
 > 
 > 逻辑说明：场景分类为平面枚举而非场景树/状态机；NORMAL_DRIVING 与 UNKNOWN 无检测器（工厂 case 返回 nullptr），仅作兜底语义。
 
-**泊车类场景不在此模块**：目录中无 parking 相关场景检测器（泊车走 mission/open_space 体系，由其他子Agent负责）。
+**泊车类场景不在此模块**：目录中无 parking 相关场景检测器（泊车走 [**OpenSpace 泊车**（子模块7）](子模块7：mission_planner%20与%20open_space%20泊车规划子模块.md) 体系，由其他子Agent负责）。
+
+> **📘 概念｜场景决策（scene_decider 与 scene_sets）**
+> **是什么**：规划在解题前先"定性"当前局面——把这一帧归类为窄道、汇入、环岛、施工区等场景，再让下游任务按场景选参数/分支。本仓库的场景决策由两个独立子模块构成：scene_sets 是"14 个场景检测器"的正规军（基类+工厂+管理器，结果挂 ReferenceLineInfo），scene_decider 是三个"参考线级专项判定器"（路沿回避/软跟车/窄道谨慎限速，散在 DP path/DP speed 内部）。它与 Task 的区别：Task 是固定工序（不管什么场景都跑这条流水线），场景决策是给工序"递条子"——决定 cost 权重、限速、防御策略用哪套；它与交通规则决策的区别：交通规则是"必须遵守的硬约束"（红灯不能闯），场景是"当前局面的软画像"（这里窄，悠着点开）。
+> **类比与角色映射**：场景决策是医院的「分诊台」——病人（一帧数据）进门，分诊护士（14 个检测器）按症状快速归类（外科/内科/急诊＝窄道/汇入/施工区），挂上号（SceneDetectionResult 带 SL 区间+关键障碍物+置信度），再送到对应诊室（DP path 的 cost、DpSpeed 的限速）；分诊台本身不看病（不做轨迹规划），只决定"去哪个诊室、按什么优先级"。真实数字：SceneType 枚举 16 项、14 个检测器按优先级降序执行（工厂创建后 sort）、窄道判定净宽阈值 (0.1, 车宽+1.2)m、动态纵向窗口 clamp(5s×车速, 20, 100)m、施工区降速插值表 {1/800→0.10 … 1/250→0.40}（但 IsEnabled 硬编码 false 当前禁用）。
+> **🎯 为什么这样设计**：同一套 DP/QP 求解器要应付千变万化的路况——把"局面识别"从"求解"里拆出来，求解器保持通用，场景结果作为参数注入（cost 衰减/限速/防御驾驶），避免为每种路况写一个规划器；每帧全量重算、无跨帧状态机（除施工区等少数），保证"分类永远反映最新世界"，代价是场景可能帧间抖动，由下游的连续性约束兜底。
+> **🗂 代码在哪里**：scene_sets/（base_scene_detector.h 基类、scene_detector_factory.cpp 工厂、scene_manager.cpp 管理器、scene_types.h 枚举与 SceneDetectionResult）；scene_decider/（road_edge/soft_follow_lane/speed_caution 三个 decider）；执行入口 frame_utils.cpp InitializeAndDetectScenes()、tasks/dp_path/path_context.cpp、tasks/dp_speed/dp_speed_optimizer.cpp。
+>
+> **30 秒最小例子**：自车 30km/h 跟车，前方 25m 左右各停一辆车（护栏侧+占道侧），可通行净宽 2.4m < 车宽+1.2m——NarrowChannelSceneDetector 在随速动态窗口内找到左右 blocker，产出 NARROW_CHANNEL 场景（channel_width=2.4）；frame_defensive_driving 查到该场景把防御等级拉高，speed_limit_decider 压低限速——规划没改一行求解代码，只是"递了张条子"。
 
 ## 2. 核心类结构与成员变量
+
+**一句话结论**：scene_sets 是「基类→工厂→管理器」三件套——检测器无状态、结果统一为 SceneDetectionResult（SL 区间+关键障碍物+自由参数）。
 
 ### 2.1 scene_sets 体系（基类→工厂→管理器）
 
@@ -114,14 +140,14 @@ tags:
 >  public:
 >   virtual bool DetectScene(const ReferenceLineInfo& reference_line_info,
 >                            const Frame* frame,
->                            std::`vector<SceneDetectionResult>`& results) = 0;
+>                            std::vector&lt;SceneDetectionResult>& results) = 0;
 >   virtual SceneType GetSceneType() const = 0;
 >   virtual ScenePriority GetPriority() const = 0;
 >   virtual bool IsEnabled() const = 0;
 >   static bool SelectImportantObstacles(const ReferenceLineInfo& ras_refline_info);
 >   virtual void UpdateConfigFromFrame(const Frame* frame) { (void)frame; }
 >  protected:
->   static std::`unordered_set<ObstacleId>` important_obstacle_set_;
+>   static std::unordered_set&lt;ObstacleId> important_obstacle_set_;
 >   struct Config { double obstacle_consider_range; };
 >   static Config config_;
 > };
@@ -145,12 +171,14 @@ tags:
 >   double severity{0.0};
 >   double start_s{0.0}, end_s{0.0};   // 场景在参考线上的纵向区间
 >   double start_l{0.0}, end_l{0.0};   // 横向区间
->   std::`vector<ObstacleId>` key_obstacle_ids{};      // 关键障碍物ID
->   std::`unordered_map<std::string, double>` parameters{}; // 场景特定参数
+>   std::vector&lt;ObstacleId> key_obstacle_ids{};      // 关键障碍物ID
+>   std::unordered_map&lt;std::string, double> parameters{}; // 场景特定参数
 > };
 > ```
 > 
 > 逻辑说明：所有场景统一输出 SL 区间 + 关键障碍物 + 自由键值参数，下游无需知道检测器内部实现。scene_decider 三类不使用该结构（见 §5）。
+
+**答卷里的 AI 名词**：SceneDetectionResult 里的 `confidence` 字段是**置信度**——检测器对自己判断的把握程度（0~1），SceneManager 用它与阈值比较决定收不收这条结果（本仓库阈值置 0 即全收，字段留给下游差异化的把握度策略）。置信度是感知与决策里无处不在的通用概念，详见 [**AI 字典·置信度**](../../../../正典阁/技术栈/AI/置信度.md)。
 
 ### 2.3 scene_decider 三类的关键成员
 
@@ -159,6 +187,8 @@ tags:
 - SpeedCautionSceneDecider：`speed_caution_objs_`（谨慎对象向量）、`caution_ratio_/caution_speed_/final_protect_ratio_`、`block_frame_count_`（阻塞帧计数，外部传入）、`passable_area_map_`（s→可通行宽度，纯模型路径使用）。
 
 ## 3. 核心处理流程与函数调用链
+
+**一句话结论**：场景检测发生在帧初始化（planner 运行前），对每条参考线独立全量重算；scene_decider 三类则散在 DP path/DP speed 任务内部按需执行。
 
 ### 3.1 scene_sets：帧初始化阶段全量执行（每条参考线）
 
@@ -175,7 +205,7 @@ tags:
 >   TrafficLightProcess();           // ← 红绿灯入口（见子模块3文档）
 > ```
 > 
-> 逻辑说明：`ReflineInfoProcess` 是 `Frame::Init` 的 Phase 3（`CreateAndProcessReferenceLines` 内调用，frame_reference_line.cpp:3332）。场景检测在障碍物映射（MapObjectsToRefline）、施工区处理之后执行。
+> 逻辑说明：`ReflineInfoProcess` 是 `Frame::Init` 的 Phase 3（`CreateAndProcessReferenceLines` 内调用，frame_reference_line.cpp:3332）。场景检测在障碍物映射（MapObjectsToRefline）、施工区处理之后执行。红绿灯入口 TrafficLightProcess 的机制细节见 [**交通规则决策**（子模块3）](子模块3：traffic_rules%20与%20traffic_light_decider%20交通规则子模块.md)。
 
 > 文件路径：/sandbox/planning/planning/frame/frame_utils.cpp  
 > 函数名：Frame::InitializeAndDetectScenes()  
@@ -201,13 +231,13 @@ tags:
 > ```cpp
 > bool SceneManager::DetectScenes(const ReferenceLineInfo& reference_line_info,
 >                                 const Frame* frame) {
->   std::`lock_guard<std::mutex>` lock(scenes_mutex_);
+>   std::lock_guard&lt;std::mutex> lock(scenes_mutex_);
 >   current_scenes_.clear();
 >   StaticExecBaseSceneDetector(reference_line_info); // 先筛选重要障碍物
 >   for (const auto& detector : scene_detectors_) {
 >     if (!detector->IsEnabled()) continue;
 >     if (frame != nullptr) detector->UpdateConfigFromFrame(frame);
->     std::`vector<SceneDetectionResult>` detector_results;
+>     std::vector&lt;SceneDetectionResult> detector_results;
 >     if (detector->DetectScene(reference_line_info, frame, detector_results)) {
 >       for (const auto& result : detector_results)
 >         if (result.confidence >= config_.confidence_threshold)
@@ -254,9 +284,15 @@ graph TB
     O --> P
 ```
 
-**与 planner/tasks 的关系**：场景检测与 scene_decider 均**早于**任务管线执行或在任务初始化中完成；产物通过 ReferenceLineInfo 传递给 tasks（DpPath、DpSpeed、LaneChangeDecider、STGraph 等）。scene_sets 的下游消费点（代码实证）：tasks/st_graph/speed_limit_decider.cpp:1278（CONSTRUCTION_AREA 限速）、tasks/lane_change_decider/lane_change_decider.cpp:15901（变道保持/基准线判定）、frame/frame_modal_selection.cpp:986/1242/3186（WIDE_LANE/NARROW_CHANNEL/INTERSECTION 参考线选型）、frame/frame_defensive_driving.cpp:4195/4838（NARROW_CHANNEL/TRAFFIC_JAM 防御驾驶）、frame/frame_semantic_map_info.cpp（6 类场景语义上报）、tasks/prediction_regenerator/interaction（LC_ABN_OCCUPANCY/MERGE_IN 交互仿真）。
+**图 3-1 · 场景决策全景流程（帧初始化检测 + 任务内专项判定双路）**（E→J 是 scene_sets 主路，M/N/O 是 scene_decider 任务内支路，四路产物都汇入下游消费 P）
+
+**读图提示**：① 左路（E→J）在帧初始化跑 14 个检测器，结果按 SceneType 聚合挂到每条参考线；② 右路（M/N/O）在 DP path/DP speed 内部执行，产物或挂参考线（N1/N2）或留在任务内（O）；③ 四路最终都汇入 P——下游 speed_limit_decider/lane_change_decider/frame_modal_selection 等按场景查询消费。
+
+**与 planner/tasks 的关系**：场景检测与 scene_decider 均**早于**任务管线执行或在任务初始化中完成；产物通过 [**ReferenceLineInfo**（子模块5）](子模块5：reference_line_info%20参考线子模块.md) 传递给 tasks（DpPath、DpSpeed、LaneChangeDecider、STGraph 等）。scene_sets 的下游消费点（代码实证）：tasks/st_graph/speed_limit_decider.cpp:1278（CONSTRUCTION_AREA 限速）、tasks/lane_change_decider/lane_change_decider.cpp:15901（变道保持/基准线判定）、frame/frame_modal_selection.cpp:986/1242/3186（WIDE_LANE/NARROW_CHANNEL/INTERSECTION 参考线选型）、frame/frame_defensive_driving.cpp:4195/4838（NARROW_CHANNEL/TRAFFIC_JAM 防御驾驶）、frame/frame_semantic_map_info.cpp（6 类场景语义上报）、tasks/prediction_regenerator/interaction（LC_ABN_OCCUPANCY/MERGE_IN 交互仿真）。
 
 ## 4. 核心算法入口与关键逻辑（代表性场景）
+
+**一句话结论**：四个代表场景四种套路——窄道靠左右 blocker 净宽、汇入靠变道意图+语义地图邻接、施工区靠跨帧状态记忆（当前禁用）、谨慎限速靠不可移动障碍物横向间距。
 
 ### 4.1 NarrowChannelSceneDetector（窄道）：进入/退出条件最完整的占道类场景
 
@@ -289,6 +325,8 @@ graph TB
 > 
 > 逻辑说明：**进入条件** = 动态纵向窗口（随速 20–100m）内存在左右两侧 blocker，且某对左右障碍物的可通行横向净宽 ∈ (0.1, 车宽+1.2)m、纵向错位 < 车长；动态障碍物按预测轨迹扩展判定。**退出** = 无状态记忆，下一帧任一条件不满足即不再产出。输出通道宽度、两侧是否含不可移动/低速对象（`two_side_unmovable`、`has_low_speed_obj`）供下游差异化策略（推断：防御性驾驶与速度限制使用）。
 
+其中「预测轨迹」是感知给出的他车未来位置序列（0.5s 间隔×6 点）——这些未来框从哪来、怎么生成，见 [**AI 字典·轨迹预测**](../../../../正典阁/技术栈/AI/轨迹预测.md)。
+
 ### 4.2 MergeInSceneDetector（汇入）：依赖变道意图 + 语义地图邻接关系
 
 > 文件路径：/sandbox/planning/planning/scene_sets/merge_in_scene_detector/merge_in_scene_detector.cpp  
@@ -298,7 +336,7 @@ graph TB
 > ```cpp
 > const auto& lane_change_decider = frame->lane_change_decider();
 > // 1) 有变道意图且原因 ∈ {ROUTING, MERGE}
-> const std::`unordered_set<...LaneChangeReason>` kMergeInValidReasons = {
+> const std::unordered_set<...LaneChangeReason> kMergeInValidReasons = {
 >     ...LaneChangeReason_ROUTING, ...LaneChangeReason_MERGE};
 > // 2) 自车在本车道内
 > if (!reference_line_info.GetConstReferenceLine()->IsOnLane(adc_pose)) return false;
@@ -308,7 +346,7 @@ graph TB
 >       Lane_NeighborType::Lane_NeighborType_MERGE_NEIGHBOR;
 >   if (is_left_merge_neighbor) {
 >     AddSceneDetectionResult(GetSceneType(), adc_init_s,
->                             std::`numeric_limits<double>`::infinity(), 0.0,
+>                             std::numeric_limits&lt;double>::infinity(), 0.0,
 >                             left_lane_width, &results);
 >     return true; }}
 > // 4) 兜底: 左 topo 为 TopoInfo_Type_MERGE, 以汇流点 s 为场景终点
@@ -356,8 +394,8 @@ graph TB
 > 
 > ```cpp
 > // 创建与消费(dp_speed_optimizer.cpp)
-> std::`shared_ptr<SpeedCautionSceneDecider>` speed_caution_scene_decider =
->     std::`make_shared<SpeedCautionSceneDecider>`(is_high_way, block_frame_count,
+> std::shared_ptr&lt;SpeedCautionSceneDecider> speed_caution_scene_decider =
+>     std::make_shared&lt;SpeedCautionSceneDecider>(is_high_way, block_frame_count,
 >         config_.speed_caution_scene_decider_config(), *reference_line_info);
 > if (reference_line_info->reference_line_position() ==
 >     ReferenceLinePosition::REFERENCE_LINE_AT_MIDDLE) {
@@ -378,6 +416,8 @@ graph TB
 
 ## 5. 输入输出数据结构
 
+**一句话结论**：输入统一是 ReferenceLineInfo+Frame，输出走两条路——scene_sets 结果挂 ReferenceLineInfo 全局可查，scene_decider 结果或挂参考线或留在任务内部即用即弃。
+
 | 模块 | 输入 | 输出 | 传递载体 |
 |-|-|-|-|
 | scene_sets 各检测器 | `ReferenceLineInfo`（PathDecision、adc_sl_boundary、PathObject SL 框）、`Frame`（PlanningStartPoint、配置、FrameContext 状态） | `std::vector<SceneDetectionResult>`（含 confidence/severity/SL 区间/关键障碍物/parameters） | `ReferenceLineInfo::scene_sets_`（`shared_ptr<SceneSets>`），下游 `GetSceneSets()->HasScene()/GetScenesOfType()` 查询 |
@@ -387,13 +427,15 @@ graph TB
 
 ## 6. 代码证据与关键片段（补充）
 
+**一句话结论**：工厂按优先级降序创建与执行、重要障碍物统一前置筛选、帧耗时打点证明场景检测是每帧常驻开销。
+
 **片段1：工厂按优先级排序创建检测器**
 
 > 文件路径：/sandbox/planning/planning/scene_sets/scene_detector_factory.cpp  
 > 函数名：SceneDetectorFactory::CreateAllDetectors()
 > 
 > ```cpp
->   std::`vector<SceneType>` all_types = {SceneType::VRU_OCCUPANCY, SceneType::NARROW_CHANNEL,
+>   std::vector&lt;SceneType> all_types = {SceneType::VRU_OCCUPANCY, SceneType::NARROW_CHANNEL,
 >       SceneType::ABN_OCCUPANCY, SceneType::MERGE_IN, SceneType::MERGE_OUT,
 >       SceneType::ROUNDABOUT, SceneType::WIDE_LANE, SceneType::INTERSECTION,
 >       SceneType::TRAFFIC_JAM, SceneType::FRONT_VEHICLE_QUEUE,
@@ -466,7 +508,7 @@ graph TB
 >   return true;
 > }
 > SceneSets* ReferenceLineInfo::GetSceneSets() {
->   if (!scene_sets_) scene_sets_ = std::`make_shared<SceneSets>`();
+>   if (!scene_sets_) scene_sets_ = std::make_shared&lt;SceneSets>();
 >   return scene_sets_.get();
 > }
 > ```
@@ -485,3 +527,22 @@ graph TB
 > ```
 > 
 > 逻辑说明：每次帧初始化必打点，说明该模块为常驻实时链路（非旁路分析工具）。
+
+## 7. FAQ 与自测
+
+**Q1（新手常见误解）**：场景检测器检测到"窄道"后，是不是由它决定怎么绕过去？
+不是。场景决策全程不做轨迹规划——它只产出"场景标签+SL 区间+关键障碍物+参数"挂到参考线上，真正决定怎么绕的是 DP path 的 cost、DpSpeed 的限速等下游任务。分诊台不看病，只挂号分科。
+
+**Q2**：场景有没有"进入/退出"状态机？会不会上一帧窄道下一帧突然消失导致规划抖动？
+没有显式状态机——除施工区等少数用 FrameContext 记忆状态外，绝大多数场景每帧全量重算、检测不到即视为退出。帧间抖动的平滑由下游连续性约束兜底（如限速曲线、cost 衰减），不靠场景层自己记忆。
+
+**Q3**：同一条路有两条参考线（如自车道线和左变道候选线）时，场景结果会互相影响吗？
+不会——场景检测对每条参考线独立执行（InitializeAndDetectScenes 对 em_reference_line_info_ 逐条 InitSceneSets+DetectCurrentScenes），结果挂在各自的 ReferenceLineInfo 上。这正是"左线判出 MERGE_IN、本线没有"成为可能的原因。
+
+**自测**：
+1. scene_decider 与 scene_sets 的架构差异是什么？
+    scene_sets：抽象基类+工厂+管理器，14 个检测器统一产出 SceneDetectionResult 挂 ReferenceLineInfo；scene_decider：无基类无注册，3 个独立类各管一件事，散在 DP path/DP speed 任务内部构造执行。
+2. 窄道场景的进入条件是什么（净宽阈值）？
+    动态纵向窗口 clamp(5s×车速, 20, 100)m 内存在左右 blocker，某对左右障碍物可通行横向净宽 ∈ (0.1, 车宽+1.2)m、纵向错位 < 车长；动态障碍物按预测框序列（0.5s 间隔×6 点）扩展判定。
+3. CONSTRUCTION_AREA 检测器当前生效吗？怎么证明？
+    不生效——IsEnabled() 硬编码 return false，SceneManager::DetectScenes 直接跳过；下游 speed_limit_decider.cpp:1280 的 CONSTRUCTION_AREA 分支因此是死代码。

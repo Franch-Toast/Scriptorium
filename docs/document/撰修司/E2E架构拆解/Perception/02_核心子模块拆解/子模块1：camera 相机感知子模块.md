@@ -1,7 +1,7 @@
 ---
 title: "子模块1：camera 相机感知子模块"
 date: 2026-09-20
-description: "分支说明：perception 及其 submodules 位于 Stable_Master_4.0_new（当前检出即该分支）；平台层 platform/ch"
+description: "相机感知子模块：uni_model 统一检测的图像预处理、模型推理与任务头输出。"
 categories:
   - 撰修司
 tags:
@@ -9,13 +9,28 @@ tags:
   - E2E
 ---
 
-# 子模块1：camera 相机感知子模块
+> **30 秒导读**：相机检测子模块：一套统一模型（uni_model）怎么同时认出车、人、车道线等所有目标。
+> **本篇回答**：图像进来先做什么？模型怎么一次认全？检测结果长什么样？
+> **先修阅读**：《00 入门》§3 步骤 3；《Perception 01 输入》。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **camera 子模块**：相机的「洗照片车间」——C01 上它**不自带检测模型**，负责把图像洗干净（GPU 预处理）再解读大模型的化验单（任务头后处理，§1.3 重要结论）。
+> - **uni_model**：统一检测大模型——一次前向认出车/人/车道线/红绿灯所有目标（完整卡片见 §1.3）。
+> - **任务头拆分**：一个大模型的输出按名字分家——Filter 节点按 name_filter 把各任务头的张量分发给各自的后处理（§3.4）。
+> - **GPU 批量预处理**：同分辨率的相机图合成一个 batch 一次算完，缺图的补零不破坏队形（§3.2）。
+> - **时序特征缓存**：把上一帧 uni_model 的特征留下与本帧图像对齐——时序 BEV 的「记忆力」来源（§3.3）。
+> - **标定**：内参/外参/畸变/lidar2img 四套几何参数，传感器坐标换算的依据（完整卡片见 §5.1）。
+
 
 > 代码根目录：`/sandbox/perception/submodules/camera`（约 338 个源文件）  
 > 分支说明：perception 及其 submodules 位于 `Stable_Master_4.0_new`（当前检出即该分支）；平台层 platform/church 位于 `dev_master`，本文不涉及平台层差异。  
 > 本文所有结论均给出代码证据；无法给出证据的推断处标"推断"。
 
 ## 1. 子模块定位与职责
+
+**一句话结论**：camera 是独立构建的算法仓，但在 C01 L2AVP 里它的角色是「预处理+后处理」——检测本体已上交给统一大模型 uni_model，自己专精图像工程与任务头解读。
+
+**为什么 camera 的角色值得先说清**：目录名叫 camera，容易以为检测模型也在这里——实际上 C01 把「认目标」这件事上交给了统一大模型 uni_model，camera 仓专精两件事：把图像「洗干净」喂给模型（GPU 预处理），把模型输出的「原始数字」翻译成结构化目标（任务头后处理）。分清「模型在哪、后处理在哪」，读代码时才不会在两仓之间迷路。
 
 ### 1.1 代码仓库结构
 
@@ -75,7 +90,17 @@ C01 L2AVP 的相机 3D 检测**不再由 camera 仓内的独立检测模型完�
 
 2D 检测（camera_all）与单目 3D（mono3d）分别有独立推理节点（`camera_all_2d` 用 `camera_all_nn_param_path`）。
 
+> **📘 概念｜uni_model（统一检测大模型）**
+> **是什么**：感知的「一条龙 NN」——单个深度学习模型同时吃 8 路行车相机图像（+点云/雷达特征，BEV 融合），一口气输出 3D 目标框（mono 头）、车道线/道路结构（lane3d/roadmask 头）、交通灯状态（traffic 头）、自车速度（ego_velocity）等所有任务头的原始张量。它与「每种目标一个小模型」的老方案的区别：一次前向推理摊薄 GPU 开销，各任务共享同一套 BEV 特征，跨任务信息互补。注意边界：uni_model 只负责「出原始张量」，把张量解码成 3D 框/车道线是 camera 子模块的任务头后处理（§3.4/§4.1）。
+> **类比与角色映射**：uni_model 是「全科体检医生」——以前眼科/放射科/内科各看各的片子（每种目标一个模型），现在一位全科医生一次看遍所有片子，直接开出全部化验单（各任务头原始输出）；camera 子模块是「化验单解读员」（把原始数字翻译成「3 米外有个锥桶」）；推理本体＝NNInternalCalculator 节点（graph_l2avp.cfg L209~243，输入 imgs）；分诊窗口＝NnInternalDataFilterUnifiedCalculator（按 name_filter 拆头）。
+> **🎯 为什么这样设计**：Orin 上 NN 推理是最贵的资源，单模型多任务把多次前向合成一次；共享 BEV 特征让单目看不准的目标能被车道线/点云特征补全；任务头拆分让算法同学只改自己头的后处理，不碰推理本体。
+> **🗂 代码在哪里**：推理节点 NNInternalCalculator（perception/cfg/graphs/onnx/graph_l2avp.cfg L209~243）；拆头 calculator 在 camera/onboard/calculators/；拆头配置证据见本篇 §3.4。
+>
+> **30 秒最小例子**：8 路图像经 GPU 预处理变成归一化张量 imgs，连同相机内参/位姿喂给 uni_model；0.1s 内它吐出一堆带名字的张量：mono_results（3D 框草稿）、smtc_*（车道线）、pred_tlstatus（红绿灯）。Filter 节点按名字把 mono_results 分给 mono3d 后处理、smtc_* 分给 RASMap 后处理、pred_tlstatus 分给交通灯任务——同一个模型输出，三路各取所需。
+
 ## 2. 核心类结构与成员变量
+
+**一句话结论**：两条主线——onboard/calculators 是图节点（壳），onboard/processor 与 modules 是纯算法（芯）；ImagePreProcessor 握着全部 GPU 预处理资源（CUDA 流/去畸变查找表/裁剪参数）。
 
 ### 2.1 主要类清单
 
@@ -116,6 +141,10 @@ private:
 
 ## 3. 核心处理流程与函数调用链
 
+**一句话结论**：图像之旅＝拆箱（frame_id 建 map）→ 洗照片（GPU 合批预处理）→ 对齐（特征/图像缓存同步）→ 会诊（uni_model 推理）→ 分诊（按名拆头）→ 解读（各任务后处理）；§3.5 的第二张图就是「分诊后」的两条支线。
+
+**「洗照片」洗的是什么**：GPU 批量预处理包含四道工序——解码（压缩图还原成像素）、缩放/裁剪（对齐模型输入尺寸）、去畸变（拉直鱼眼）、[**归一化**](../../../../正典阁/技术栈/AI/归一化.md)（把 0~255 像素值换算成模型期望的数值范围）。这些工序全部在 GPU 上以 CUDA kernel 完成（整体逻辑见 [**CUDA 与 GPU 预处理**](../../../../正典阁/技术栈/AI/CUDA%20与%20GPU%20预处理.md)），产出的是规整的 [**张量**](../../../../正典阁/技术栈/AI/张量%20Tensor.md) imgs。
+
 ### 3.1 从 FrameSync 到 camera 子图
 
 ```mermaid
@@ -140,6 +169,10 @@ UnimodelPreProcessCalculator]
 各任务后处理]
 ```
 
+**图 3-1 · 图像从帧同步到任务后处理的完整链路**（A→J 自上而下，H 是唯一一次 NN 大模型推理）
+
+**读图提示**：① E→F 之间是「洗照片」与「对齐」两步——F 节点拿到的不只是本帧图像，还有上一帧回传的特征（时序 BEV 的记忆，§3.3）；② H 只出现一次：8 路图一次前向，这就是 uni_model 省算力的图示；③ I 节点拆头后 J 是多个并行后处理（mono3d/车道线/交通灯各自独立）。
+
 `camera_inputs` 的构造（上层 perception 主仓，已验证）：
 
 > 文件路径：/sandbox/perception/perception/calculators/perception_input_process_calculator.cc  
@@ -149,7 +182,7 @@ UnimodelPreProcessCalculator]
 > ```cpp
 > // 优先使用 raw 图像，否则使用压缩图
 > if (!input->raw_images.empty()) {
->   std::unordered_map<std::string, std::`shared_ptr<const ::deeproute::drivers::Image>`> raw_frames;
+>   std::unordered_map&lt;std::string, std::shared_ptr&lt;const ::deeproute::drivers::Image>> raw_frames;
 >   for (const auto& img : input->raw_images) {
 >     const auto& image_name = img->header().frame_id();
 >     if (std::find(target_cameras_in_order_.begin(),
@@ -162,12 +195,12 @@ UnimodelPreProcessCalculator]
 > }
 > ```
 > 
-> 逻辑说明：以 `header().frame_id()`（相机名 camera_1~~6/traffic_2/panoramic_1~~4）为 key 装进 map，包成 `TrafficAlgoProcessInputWrapper` 后由 graph 流 `camera_inputs` 送入 camera 子图。
+> 逻辑说明：以 `header().frame_id()`（相机名 camera_1\~6/traffic_2/panoramic_1\~4）为 key 装进 map，包成 `TrafficAlgoProcessInputWrapper` 后由 graph 流 `camera_inputs` 送入 camera 子图。
 
 ### 3.2 GPU 批量预处理
 
 > 文件路径：/sandbox/perception/submodules/camera/camera/onboard/processor/image_pre_processor.cc  
-> 函数名：ImagePreProcessor::`Process<T>`()  
+> 函数名：ImagePreProcessor::Process&lt;T>()  
 > 核心逻辑：
 > 
 > ```cpp
@@ -222,7 +255,15 @@ MONO_TASK_POSTPROCESS_OUTPUT]
     G --> K[RASMap → ras_map_output]
 ```
 
+**图 3-2 · uni_model 输出的两条后处理支线**（左：mono3d 目标；右：车道线 RASMap）
+
+**读图提示**：① 左支线终点 E（CameraFrame）会流入 MultiModalityPreprocessCalculator 与 lidar/radar 装配后交 tracker（§5.3 去向）；② 右支线 RASMap 最终发布为 /perception/ras_map——规划收到的轻量地图从这里来；③ 两支线共用同一个 uni_model_output 源（节点 H）。
+
 ## 4. 核心算法入口与关键逻辑
+
+**一句话结论**：后处理三板斧——topk 选候选→按张量布局解码（深度/朝向/坐标系三步换算）→NMS 去重；跨视场再融合一次防重复。
+
+**三板斧的名词解释**：topk 是「按[**置信度**](../../../../正典阁/技术栈/AI/置信度.md)分数只留前 K 个候选」，省得对几万个网格逐一解码；NMS（[**非极大值抑制**](../../../../正典阁/技术栈/AI/NMS%20非极大值抑制.md)）是「同一目标被相邻网格各报一次时，只留分最高的那个」；解码（ComputeBox）把张量数字换算成真实世界的 3D 框——深度/朝向/坐标系三步换算的细节见 §4.1 证据。
 
 ### 4.1 mono3d 解码（模型输出→3D 框）
 
@@ -282,6 +323,8 @@ MONO_TASK_POSTPROCESS_OUTPUT]
 
 ## 5. 输入输出数据结构
 
+**一句话结论**：输入是「图像 map + 四组标定矩阵」，输出是「CameraFrame 摘要」——中间统一用 NNInternalDataType（GPU 张量容器）流转，全程少拷贝。
+
 ### 5.1 输入
 
 **`TrafficAlgoProcessInputWrapper`**（base/camera/traffic_processor_base.h L27\~76，非 QNX 版本）：
@@ -307,6 +350,14 @@ struct TrafficAlgoProcessInputWrapper {
 
 **Side packet（初始化一次）**：`lidar_to_camera_gpu_matrices`（lidar2img 4x4）、`norm_intrinsic_gpu_matrices`、`extrinsic_gpu_matrices`、`distort_coeff_gpu_matrices`，由 `PerceptionIoPreprocessing` 从配置装填（graph_l2avp.cfg L48\~67）。
 
+> **📘 概念｜标定（内外参/畸变/投影矩阵）**
+> **是什么**：传感器的「安装说明书」——内参（焦距/光心：把像素坐标换算成相机系光线方向）、外参（相机装在车的哪个位置朝哪个方向：相机系↔车体系）、畸变系数（镜头弯曲的矫正表）、lidar2img（点云投影到图像的 4x4 矩阵）。所有跨传感器/跨坐标系的换算都靠它；没它，模型输出的「相机系 3D 框」无法落到车体系，点云和图像也对不上。
+> **类比与角色映射**：标定像「房间的卷尺测量记录」——相机是钉在墙上的望远镜，记录上写着「钉在 (x,y,z)、朝向偏航 12°、镜头有点鱼眼、矫正表在此」。换算流程＝先查矫正表把弯的拉直（去畸变 undist_mapx/mapy），再用安装记录把「我看到的」翻译成「车的视角」（外参）。真实组件：四组 GPU 矩阵 side packet 初始化一次装填（graph_l2avp.cfg L48~67）；去畸变查找表在 ImagePreProcessor 成员 undist_mapx_/undist_mapy_（§2.2）；mono3d 深度换算用 intrinsic_(1,1)/cropped_height_（§4.1 证据）。
+> **🎯 为什么这样设计**：标定参数是「初始化一次、每帧复用」的静态几何事实，所以做成 side packet 而非每帧消息；常驻 GPU 显存让推理时零拷贝取用。
+> **🗂 代码在哪里**：装填 PerceptionIoPreprocessing（graph_l2avp.cfg L48~67）；使用 ImagePreProcessor（去畸变）与 mono3d ComputeBox（深度/坐标换算）；参数源为车型标定配置（随车型包注入）。
+>
+> **30 秒最小例子**：uni_model 输出「相机系下 (u,v,d) 的目标」——查内参焦距把像素 (u,v) 换算成相机系方向、乘深度 d 得相机系 3D 点；再乘外参矩阵把「相机看到的」转到「车体系 (X,Y,Z)」——tracker 拿到的 3D 框就是这么来的；而 lidar2img 反向把点云点投到图像上，供跨模态对齐。
+
 ### 5.2 中间结构
 
 - `NNInternalDataType`（`platform::base::NNInternalDataType`）：多节点 GPU 张量容器，`Node{name, buffer, shape}`；图像/投影矩阵/模型输出统一用它流转。
@@ -331,6 +382,8 @@ struct CameraFrame {
 
 ## 6. 代码证据与关键片段
 
+**一句话结论**：本篇 5 段证据覆盖「拆箱→合批→推理→解码→融合」全链，补充段证明 mono3d 节点输入输出的真容。
+
 （第 3、4 章已给出 5 段带完整路径/函数名的证据；此处补充 1 段说明 traffic 检测的 YOLOX 路径与 mono3d 并存）
 
 > 文件路径：/sandbox/perception/submodules/camera/camera/onboard/calculators/mono3d_det_task_calculator.cc  
@@ -341,7 +394,7 @@ struct CameraFrame {
 > NNInternalDataType nn_output =
 >     cc->Inputs().Get(kInputTag, 0).`Get<NNInternalDataType>`();
 > ...
-> std::`vector<void*>` nn_output_ptrs;
+> std::vector&lt;void*> nn_output_ptrs;
 > for (size_t i = 0; i < nn_output.nodes.size(); i++) {
 >   auto const& node = nn_output.nodes.at(i);
 >   if (node.data_ptr == nullptr) {
@@ -357,6 +410,30 @@ struct CameraFrame {
 > ```
 > 
 > 逻辑说明：节点输入 `ALGO:0` 即过滤后的 `mono_results`+`ego_velocity` GPU 指针，解码结果写入 `CameraFrame`，以 `MONO_TASK_POSTPROCESS_OUTPUT` 发布。`EnableTraffic2()`（同文件 L41\~52）通过检查 `mono_results` 节点 `fixed_shape(0)==2` 决定是否额外启用 traffic_2 原图单目推理。
+
+---
+
+## 7. FAQ 与自测
+
+**Q1（新手误解）：camera 子模块里是不是有个相机检测模型，各目标各跑一个？**
+C01 上不是。相机 3D 检测复用统一大模型 uni_model（§1.3 重要结论），camera 仓只做图像预处理与任务头后处理；camera_all 2D 检测、交通灯等周边任务有独立小推理节点，但那是「周边感知」，不是主检测。
+
+**Q2：某路相机缺图了，batch 会不会散架？**
+不会。同目标分辨率的相机合入一个 batch，缺图相机由 kernel 置零（output_zero_flag），batch 拓扑不变（§3.2）——牺牲单路精度换取批处理稳定性，下游拿到的是全零张量需自行判空。
+
+**Q3：traffic_2 和 traffic_2_crop 是两个相机吗？**
+只有一个物理相机。traffic_2_crop 是从 traffic_2 裁剪出的「虚拟相机」（T2C_CAMERA_NAME 常量，§2.2），额外参与 mono3d 推理；两路检测结果用「交集面积/较小框面积」软化 IoU 去重后融合（§4.2）。
+
+**Q4：时序 BEV 的「上一帧特征」是谁保管的？**
+ImageFeatureCacheAndSyncCalculator（§3.3）：把本帧图像预处理结果与上一帧 uni_model 回传的特征（NEED_CACHE 流）对齐后输出 synced 流——没有这个节点，时序 BEV 就退化成单帧检测。
+
+**自测**（答案在缩进行里）：
+1. camera 子模块在 C01 L2AVP 的四大职责是什么？
+    答：图像 GPU 预处理、BEV 几何输入准备、任务头后处理、周边感知任务（§1.3）。
+2. uni_model 的输出怎么分给不同任务？
+    答：NnInternalDataFilterUnifiedCalculator 按 name_filter 拆头，mono3d/车道线/交通灯各自领走自己的张量（§3.4）。
+3. 标定参数以什么形式注入？什么时候装填？
+    答：四组 GPU 矩阵 side packet（lidar2img/内参/外参/畸变），初始化时装填一次、每帧复用（§5.1）。
 
 ### 附：关键文件索引
 

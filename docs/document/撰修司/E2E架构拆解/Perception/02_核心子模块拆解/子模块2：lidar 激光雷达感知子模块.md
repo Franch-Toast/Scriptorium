@@ -1,7 +1,7 @@
 ---
 title: "子模块2：lidar 激光雷达感知子模块"
 date: 2026-09-20
-description: "分支说明：perception 及其 submodules 位于 Stable_Master_4.0_new（当前检出即该分支）；平台层 platform/ch"
+description: "激光雷达感知子模块：点云特征提取、heatmap 峰值解码与地面分割节点被注释的现状。"
 categories:
   - 撰修司
 tags:
@@ -9,13 +9,29 @@ tags:
   - E2E
 ---
 
-# 子模块2：lidar 激光雷达感知子模块
+> **30 秒导读**：激光雷达检测子模块：点云怎么一步步变成带方向的目标框。
+> **本篇回答**：点云特征怎么提取？目标怎么解码出来？传统地面分割为什么被注释掉了？
+> **先修阅读**：《00 入门》§3 步骤 3；《Perception 01 输入》。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **lidar 子模块**：点云的「粗加工车间」——主检测同样走 uni_model（激光分支），本仓专精点云工程：补偿→过滤→体素化→解码→静态物→融合（§1.3）。
+> - **点云**：数十万带距离/反射率的三维点（完整卡片见 [**Perception/01 §5.2**](../01%20输入数据接入与预处理.md)）。
+> - **运动补偿**：雷达扫描要转一圈（期间车在动），按定位位姿把「早扫的点」搬到「该在的位置」——快门从上到下扫完，人已经走了半步，照片要修齐（§3.2）。
+> - **体素化**：把散点装进规则小格子（voxel），模型只吃格子特征不直接吃散点（§3.3）。
+> - **heatmap 解码**：模型输出的是「哪里可能有目标」的热力图，解码 kernel 找峰值换算成 3D 框（§3.4）。
+> - **OCC 静态物**：占用栅格——结合 uni_model 的 BEV 语义头把「哪里有不动的东西」栅格化（§3.5）。
+> - **fake points**：车前 21 个固定假点，空点云兜底用（§3.2）。
+
 
 > 代码根目录：`/sandbox/perception/submodules/lidar`（约 309 个源文件）  
 > 分支说明：perception 及其 submodules 位于 `Stable_Master_4.0_new`（当前检出即该分支）；平台层 platform/church 位于 `dev_master`，本文不涉及平台层差异。  
 > 本文所有结论均给出代码证据；无法给出证据的推断处标"推断"。
 
 ## 1. 子模块定位与职责
+
+**一句话结论**：lidar 与 camera 同构——主检测上交 uni_model 激光分支，本仓专注点云工程链：预处理五件套（补偿/剔本车/ROI/采样/体素化）+ 解码回填 + 静态物 + 融合；传统地面分割已退役（节点被注释）。
+
+**为什么 lidar 与 camera 长得像**：两者是同一套架构思路的两次落地——主检测都上交 uni_model（一个吃图像一个吃点云），子模块仓都专注「把原料整理成模型爱吃的形状」（camera 洗图、lidar 整点云）和「把模型输出翻译成目标」（各自解码）。看懂其中一个，另一个的目录结构与数据流几乎是镜像的。
 
 ### 1.1 代码仓库结构
 
@@ -75,6 +91,8 @@ C01 L2AVP 中 lidar 主检测模型同样是 **uni_model 的激光分支**（`un
 
 ## 2. 核心类结构与成员变量
 
+**一句话结论**：三类容器一层节点——Wrapper（主图交接）/ AlgoProcessInput（算法输入，含 GPU 点云）/ Frame（帧级结果），节点全是薄壳，真算法在 modules/detection 的 Pre/Post Processor。
+
 ### 2.1 主要类清单
 
 | 类/Calculator | 文件 | 职责 |
@@ -124,6 +142,10 @@ struct alignas(16) LidarAlgoProcessInput {
 
 ## 3. 核心处理流程与函数调用链
 
+**一句话结论**：点云之旅＝搬砖（shm 零拷贝→PCL）→ 整队（补偿/剔本车/ROI）→ 体检（采样/体素化）→ 会诊（uni_model 激光分支）→ 解码（heatmap→3D 框）→ 组队（OCC 静态物+融合）。
+
+**点云整理的名词注解**：「整队」中的运动补偿用了位姿**插值**——在两帧定位之间按时间插出扫描时刻的位姿（插值原理见[**采样与插值**](../../../../正典阁/技术栈/AI/采样与插值.md)）；「体检」中的采样是**降采样**（点太多算不动，按距离比例稀疏化）；体素化把散点装进规则格子，是点云进[**神经网络**](../../../../正典阁/技术栈/AI/神经网络与推理引擎.md)前的标准整形。
+
 ### 3.1 从 shm 到 lidar 子图
 
 ```mermaid
@@ -159,6 +181,10 @@ LidarObjectFusion]
 LidarOutputsWrapper → tracker]
 ```
 
+**图 3-1 · 点云从 shm 到 lidar_process_output 的完整链路**（A→T 自上而下，L 是唯一一次 NN 推理）
+
+**读图提示**：① F/G/H 三连是「整队」——补偿（修齐扫描时差）、剔本车点（抹掉自车回波）、ROI 过滤（只留关注区）；② I→K 是 CPU→GPU 的交接点，体素化在 GPU 上完成；③ R 节点不只吃本链数据，还吃 uni_model 的 BEV 头（static_bev/ground_bev）——静态物与检测目标在这里合流。
+
 **点云进入点（已验证）**：`PerceptionInputProcessCalculator::PrepareLidarInputs()` 把 proto 点云转 PCL：
 
 > 文件路径：/sandbox/perception/perception/calculators/perception_input_process_calculator.cc  
@@ -176,8 +202,8 @@ LidarOutputsWrapper → tracker]
 >                   input->point_cloud->height() +
 >               kFakePointsHeadroom);
 > deeproute::common::ProtoToPCL(*(input->point_cloud), cloud);
-> boost::`shared_ptr<PointCloudXYZIBT>` cloud_ptr =
->     boost::`make_shared<PointCloudXYZIBT>`(std::move(cloud));
+> boost::shared_ptr&lt;PointCloudXYZIBT> cloud_ptr =
+>     boost::make_shared&lt;PointCloudXYZIBT>(std::move(cloud));
 > ...
 > lidar_inputs.pcd = cloud_ptr;
 > ```
@@ -210,7 +236,7 @@ LidarOutputsWrapper → tracker]
 >                         lidar_algo_input.tf->GetAffineTransform());
 > ```
 > 
-> 逻辑说明：输出 `base::LidarAlgoProcessInput*`。fake points 为 21 个车前固定点（Open() 中构造 `PointXYZIBT{x,0,0,0,0,0}`，L106~~110），用于空点云兜底。`SetData`（lidar_context.h L40~~58）在点数超限时按 1.5 倍扩容 `cloud_gpu` HAL Buffer。
+> 逻辑说明：输出 `base::LidarAlgoProcessInput*`。fake points 为 21 个车前固定点（Open() 中构造 `PointXYZIBT{x,0,0,0,0,0}`，L106\~110），用于空点云兜底。`SetData`（lidar_context.h L40\~58）在点数超限时按 1.5 倍扩容 `cloud_gpu` HAL Buffer。
 
 ### 3.3 检测预处理（H2D 拷贝 + 采样）
 
@@ -238,7 +264,7 @@ LidarOutputsWrapper → tracker]
 > else            { valid_num_point_ = InputDataProvider(); }
 > ```
 > 
-> 逻辑说明：随后 `LidarDetectionPreProcessCalculator::Process` 把三个 GPU buffer 组装为 NN 输入节点：`filter_pc{1,N,5}`、`idx_info{1,N,4}`、`cur_frame_mask_within_range{N}`（lidar_detection_preprocess_calculator.cc L114~~136），经 `lidar_backbone_network_input` 流入 `unimodel_lidar_preprocess`（graph_l2avp.cfg L622~~659）。
+> 逻辑说明：随后 `LidarDetectionPreProcessCalculator::Process` 把三个 GPU buffer 组装为 NN 输入节点：`filter_pc{1,N,5}`、`idx_info{1,N,4}`、`cur_frame_mask_within_range{N}`（lidar_detection_preprocess_calculator.cc L114\~136），经 `lidar_backbone_network_input` 流入 `unimodel_lidar_preprocess`（graph_l2avp.cfg L622\~659）。
 
 ### 3.4 检测后处理（解码 + 语义回填）
 
@@ -264,17 +290,19 @@ LidarOutputsWrapper → tracker]
 >     class_score_is_blind_.GetPtr(), ...);
 > ```
 > 
-> 逻辑说明：`LidarDetectionProcessCalculator::Process` 先从 `fusion_detection_network_output` 的 13+ 个节点按序取出 GPU 指针填入 `network_output_`（lidar_detection_process_calculator.cc L148~~194），再调 `DetectorPostProcessor::Process()`；解码后的目标经 `AssembleResultToLidarFrame(...)` 打包目标点云（L203~~206），遮挡属性过滤后输出 `SEMANTED_OBJECTS`。
+> 逻辑说明：`LidarDetectionProcessCalculator::Process` 先从 `fusion_detection_network_output` 的 13+ 个节点按序取出 GPU 指针填入 `network_output_`（lidar_detection_process_calculator.cc L148\~194），再调 `DetectorPostProcessor::Process()`；解码后的目标经 `AssembleResultToLidarFrame(...)` 打包目标点云（L203\~206），遮挡属性过滤后输出 `SEMANTED_OBJECTS`。
 
 ### 3.5 静态物/OCC 与融合输出
 
-`LidarOccupancyCalculator::Process` 从 uni_model 输出取 `static_bev_pred_`/`static_bev_sem_pred_`/`ground_bev_pred_`/`cstr_bev_longrange_pred_`（lidar_occupancy_calculator.cc L251~~256），调用 `occupancy_->Process(...)`（gridmap 实现，L327~~340）产出 `lidar_grid_map_static_objects`。`LidarFusionProcessCalculator::Process` 最终调 `lidar_fusion_->Process(process_input->cloud, *invisible_objects, *motion_probs, *static_objects, *segmented_objects, *semantic_flags)`（lidar_fusion_process_calculator.cc L248\~250），打包 `LidarOutputsWrapper` 发布 `ALGO:lidar_process_output`。
+`LidarOccupancyCalculator::Process` 从 uni_model 输出取 `static_bev_pred_`/`static_bev_sem_pred_`/`ground_bev_pred_`/`cstr_bev_longrange_pred_`（lidar_occupancy_calculator.cc L251\~256），调用 `occupancy_->Process(...)`（gridmap 实现，L327\~340）产出 `lidar_grid_map_static_objects`。`LidarFusionProcessCalculator::Process` 最终调 `lidar_fusion_->Process(process_input->cloud, *invisible_objects, *motion_probs, *static_objects, *segmented_objects, *semantic_flags)`（lidar_fusion_process_calculator.cc L248\~250），打包 `LidarOutputsWrapper` 发布 `ALGO:lidar_process_output`。
 
 ## 4. 核心算法入口与关键逻辑
 
+**一句话结论**：性能关键点全在 GPU——CUDA 采样/解码/回填一条龙，CPU 只负责调度与融合决策；表里「NMS 说明」一行是本篇少有的推断项（无显式 NMS 调用）。
+
 | 环节 | 入口 | 关键逻辑（证据见第 3/6 章） |
 |-|-|-|
-| 运动补偿 | `LidarPointCheckCalculator::Process` | `CompensateByPoseInterpolator` 按位姿插值补偿扫描期间自车运动；高优先级道路+特定车型（LP/DE）可跳过（L84~~99, L127~~145） |
+| 运动补偿 | `LidarPointCheckCalculator::Process` | `CompensateByPoseInterpolator` 按位姿插值补偿扫描期间自车运动；高优先级道路+特定车型（LP/DE）可跳过（L84\~99, L127\~145） |
 | 采样 | `DetectorPreProcessor::InputDataProvider/InputSweepDataProvider` | `PointSampler::PointsSampleGPU` 按 `distance_score_ratio_`/`max_distance_` 降采样，多帧 sweep 支持经 `LiDARCache` 缓存（detector_pre_processor.hpp L124\~132） |
 | NN 推理 | 主图 `uni_model`（NNInternalCalculator） | 激光输入 `voxel_inputs/unq_pillar_coords/unq_voxel_coords/voxel_overall_mask/cur_idx_info`（graph_l2avp.cfg L213\~217） |
 | 解码 | `DetectorPostProcessor::GetObjects` | CUDA `BoxesDecode`：heatmap→中心偏移/尺寸/朝向/速度，按类别分数阈值+盲区模式过滤 |
@@ -283,6 +311,8 @@ LidarOutputsWrapper → tracker]
 | 输出融合 | `LidarObjectFusion` | 检测目标 + 静态物 + 不可见目标按来源融合；连续 30 帧空目标告警（lidar_fusion_process_calculator.cc L237\~246） |
 
 ## 5. 输入输出数据结构
+
+**一句话结论**：一条点云的形态变迁：proto（shm 零拷贝）→ PCL CPU 点云 → GPU HAL Buffer → 13+ 个输出头张量 → LidarOutputsWrapper（目标+语义+运动流+地面参数）。
 
 ### 5.1 输入
 
@@ -319,6 +349,8 @@ struct LidarOutputsWrapper {
 
 ## 6. 代码证据与关键片段
 
+**一句话结论**：证据 A 证明「模型头顺序与拆头配置一一对应」（name_filter 即接口契约），证据 B 证明静态物来源已从「传统聚类」切换为「uni_model BEV 头+点云标志位」。
+
 （第 3 章已给 4 段证据；补充 2 段）
 
 **证据 A：检测后处理计算节点的输入装配（模型头与子图 name_filter 一一对应）**
@@ -345,7 +377,7 @@ struct LidarOutputsWrapper {
 >     pack_object_pointcloud_, min_points_);
 > ```
 > 
-> 逻辑说明：节点顺序与 lidar_sub_graph.cfg L118~~159 的 `uni_model_spliter_fusion_detection_network_output` name_filter 顺序（reg/height/dim/rot/vel/heading/heatmap/point_pred/...）一致；闸机（barrier_gate）头按 `enable_barrier_gate()` 开关挂接（L177~~192）。
+> 逻辑说明：节点顺序与 lidar_sub_graph.cfg L118\~159 的 `uni_model_spliter_fusion_detection_network_output` name_filter 顺序（reg/height/dim/rot/vel/heading/heatmap/point_pred/...）一致；闸机（barrier_gate）头按 `enable_barrier_gate()` 开关挂接（L177\~192）。
 
 **证据 B：OCC 静态物（替代传统地面分割/聚类的静态物来源）**
 
@@ -367,7 +399,31 @@ struct LidarOutputsWrapper {
 >                     traffic_sign_noise, false, barrier_gate_in_range, nullptr);
 > ```
 > 
-> 逻辑说明：输入即 lidar_sub_graph.cfg L83~~115 `occupancy_filter` 拆出的 `static_bev_output/static_bev_subtype_output/ground_bev_output/cstr_bev_output_longrange/...`；OCC/gridmap 结合 GPU BEV 语义与点云标志位（`point_flags`/`semantic_flags`）输出静态目标，闸机状态从全局单例 `BarrierGateStatusManager` 读取实现完全并行（L319~~323 注释）。
+> 逻辑说明：输入即 lidar_sub_graph.cfg L83\~115 `occupancy_filter` 拆出的 `static_bev_output/static_bev_subtype_output/ground_bev_output/cstr_bev_output_longrange/...`；OCC/gridmap 结合 GPU BEV 语义与点云标志位（`point_flags`/`semantic_flags`）输出静态目标，闸机状态从全局单例 `BarrierGateStatusManager` 读取实现完全并行（L319\~323 注释）。
+
+---
+
+## 7. FAQ 与自测
+
+**Q1（新手误解）：lidar 子模块里是不是跑着一个独立的雷达检测模型？**
+C01 上不是。主检测走 uni_model 激光分支（unimodel_lidar_preprocess 产 voxel 输入，§1.3），lidar 仓做预处理/解码/静态物/融合；仓内 detection 模块保留的是这套链路的工程实现（CUDA 采样与解码），不是独立模型。
+
+**Q2：为什么传统的地面分割/聚类被注释掉了？**
+lidar_sub_graph.cfg 中 LidarGroundDetectionCalculator 节点整段被注释（§1.3）——地面高度改由 uni_model 的 ground_bev_output 头 + GroundHeightLevel 状态承担：少一个级联环节、少一处失效点，且 NN 地面估计对坡道更鲁棒（配合 §3.3 的旋转自适应）。
+
+**Q3：lidar 侧怎么去重，没看到 NMS？**
+本篇推断：去重依赖 heatmap 峰值解码 + 类别分数阈值（§4 表「NMS 说明」行）——与 camera 侧显式 nms2d 不同，激光分支在解码 kernel 内就按峰值取目标（未验证 kernel 内部实现）。
+
+**Q4：fake points 是什么？为什么要插在点云开头？**
+21 个车前固定假点（Open() 时构造，§3.2），空点云时保底让 batch/后续算子不因零点崩溃；插在开头是历史实现（代码注释 "insert at front"），预留空间避免 vector 扩容拷贝（§3.1 证据的 reserve 注释）。
+
+**自测**（答案在缩进行里）：
+1. 点云进入 uni_model 前的三个 GPU 输入是什么？
+    答：filter_pc{1,N,5}、idx_info{1,N,4}、cur_frame_mask_within_range{N}（§3.3 逻辑说明）。
+2. 地面高度信息现在从哪里来？坡道异常时怎么处理？
+    答：uni_model 的 ground_bev_output 头 + GroundHeightLevel 状态；过高/过低时绕 y 轴旋转 ±rotate_angle_ 再上传（§1.3、§3.3）。
+3. lidar_process_output 里都装了什么？去向是谁？
+    答：融合后 3D 目标、点级语义、运动流、地面参数（LidarOutputsWrapper，§5.3）；流入 MultiModalityPreprocessCalculator 与 tracker。
 
 ### 附：关键文件索引
 

@@ -1,7 +1,7 @@
 ---
 title: "子模块1：planner 与 tasks 决策规划任务管线"
 date: 2026-09-20
-description: "分析对象：/sandbox/planning/planning/planner（8 文件）、/sandbox/planning/planning/tasks（3"
+description: "决策规划任务管线：EmPlanner 任务链、DpPath/DpSpeed/QpSpeed/iLQR 求解器与降级设置。"
 categories:
   - 撰修司
 tags:
@@ -9,12 +9,28 @@ tags:
   - E2E
 ---
 
-# 子模块1：planner 与 tasks 决策规划任务管线
+> **30 秒导读**：大脑核心：EmPlanner 任务链怎么先粗算（DP）再细调（QP）最后精修（iLQR）出一条轨迹。
+> **本篇回答**：任务链的顺序是什么？DP 和 QP 各自解决什么？iLQR 什么时候用？
+> **先修阅读**：《00 入门》§3 步骤 8；类比见本文 ST 图插段。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **EmPlanner 任务链**：规划的主考官——按固定顺序出一套题（DP_path→QP_path→…→trajectory_safety），逐题作答，答案都写在同一张答题卡（ReferenceLineInfo）上。
+> - **Task 即目录**：tasks 下 23 个子目录就是 23 道可装配的工序，没有注册表——顺序完全由 EmPlanner 构造函数 push_back 决定（§2.2）。
+> - **ST 图**：时间-路程图，速度规划的工作台（完整卡片见 §3）。
+> - **DP**：先打草稿——在格子上全局粗扫，解糙但稳（完整卡片见 §3）。
+> - **QP**：再誊工整——以 DP 为初值做光滑优化（完整卡片见 §3）。
+> - **iLQR**：试驾教练——把合成的轨迹用车辆动力学精修一遍，只对选中的参考线跑（完整卡片见 §4.5）。
+> - **数据传递**：Task 之间不自带 IO，全靠 Frame（帧级共享）与 ReferenceLineInfo（每条参考线一份）两个上下文对象（§5）。
+
 
 > 分析对象：/sandbox/planning/planning/planner（8 文件）、/sandbox/planning/planning/tasks（327 文件）  
 > 分支基线：perception/planning/driver 均处于 Stable_Master_4.0_new（当前检出即目标分支）
 
 ## 1. 子模块定位与职责
+
+**一句话结论**：planner 目录是「规划器的选型间」（3 种规划器任君切换），tasks 目录是「30 余道工序的题库」；行车场景由 EmPlanner 按配置把题串成一条链。
+
+**为什么任务链是理解规划的钥匙**：规划的全部智能不是一个大函数，而是 30 多个任务按序接力——每个任务只做一件事（粗算路径/精修路径/算速度/合成/安检），读懂任务链就读懂了「规划每一步在干什么、为什么这么排」。后续所有子模块篇（场景/交通规则/轨迹校验/参考线）都是往这条链上挂逻辑，本篇是它们共同的底座。
 
 ### 1.1 planner 目录（8 文件）
 
@@ -44,7 +60,7 @@ planner 目录只有 3 对 .h/.cpp 加 2 个构建文件，职责是**定义规�
 >                                         ReferenceLineInfo* reference_line_info);
 >   virtual bool GenerateAdcTrajectory(
 >       const Frame* frame,
->       const std::`shared_ptr<ReferenceLineInfo>`& selected_ref_line_info,
+>       const std::shared_ptr&lt;ReferenceLineInfo>& selected_ref_line_info,
 >       const bool flag_em_planner = true);
 >  protected:
 >   deeproute::planning::ADCTrajectory adc_trajectory_;   // 最终输出轨迹
@@ -68,7 +84,11 @@ tasks 目录按**规划阶段**组织为 23 个子目录（实测目录树），
 
 组织方式特点：**Task 即目录**，目录内 `xxx_optimizer.h/.cpp` 是 Task 外壳（继承 `Task`，实现 `Execute()`），复杂算法（DP 图搜索、QP/iLQR 求解器）拆在子目录中。Task 之间**无显式注册表**，执行顺序完全由 `EmPlanner` 构造函数装配（见第 2 章）。
 
+**分类清单里的 AI 名词**：决策类的「意图识别」是判断他车想变道还是直行的小型分类任务；路径/速度类里的 DP/QP/iLQR 是三大优化算法（粗解→精修→模型级打磨，分别见字典：[动态规划 DP](../../../../正典阁/技术栈/AI/动态规划%20DP.md)、[二次规划 QP](../../../../正典阁/技术栈/AI/二次规划%20QP.md)、[iLQR 与 LQR](../../../../正典阁/技术栈/AI/iLQR%20与%20LQR.md)）；model_trajectory 是模型输出的轨迹（模型产出轨迹的原理见 [**AI 字典·轨迹预测**](../../../../正典阁/技术栈/AI/轨迹预测.md)）——零基础读者建议先把这三个字典词条过一遍再往下读。
+
 ## 2. 核心类结构与成员变量
+
+**一句话结论**：Task 基类极简到只剩一个 Execute，没有注册宏——每个任务一个内联工厂函数，链的形态完全由 EmPlanner 构造函数按配置现场装配，改配置＝重建整条链。
 
 ### 2.1 Task 基类与派生体系
 
@@ -132,9 +152,9 @@ tasks 目录按**规划阶段**组织为 23 个子目录（实测目录树），
 >   deeproute::taskconfig::DpPathConfig config_;
 > };
 > // Creates a DP path optimization task.
-> inline std::`unique_ptr<Task>` CreateDpPathOptimizationTask(
+> inline std::unique_ptr&lt;Task> CreateDpPathOptimizationTask(
 >     const deeproute::taskconfig::DpPathConfig &config) {
->   return std::`make_unique<DpPathOptimizer>`(config);
+>   return std::make_unique&lt;DpPathOptimizer>(config);
 > }
 > ```
 > 
@@ -149,18 +169,18 @@ tasks 目录按**规划阶段**组织为 23 个子目录（实测目录树），
 > ```cpp
 > class PlannerManager {
 >  private:
->   std::unordered_map<deeproute::planning::PlannerType, std::`shared_ptr<Planner>`>
+>   std::unordered_map&lt;deeproute::planning::PlannerType, std::shared_ptr&lt;Planner>>
 >       planner_factory_;
->   std::`shared_ptr<Planner>` current_planner_;
+>   std::shared_ptr&lt;Planner> current_planner_;
 >   deeproute::planning::PlannerType default_planner_;
 > };
 > // Init：一次性构造三个规划器
 > planner_factory_.emplace(PlannerType::EM_PLANNER,
 >                          CreateEmPlannerShared(em_planner_config, thread_pool));
 > planner_factory_.emplace(PlannerType::OPEN_SPACE_PLANNER,
->                          std::`make_shared<OpenSpacePlanner>`(...));
+>                          std::make_shared&lt;OpenSpacePlanner>(...));
 > planner_factory_.emplace(PlannerType::REVERSE_TRACKING_PLANNER,
->                          std::`make_shared<ReverseTrackingPlanner>`(...));
+>                          std::make_shared&lt;ReverseTrackingPlanner>(...));
 > default_planner_ = PlannerType::EM_PLANNER;
 > // Update：按 HPI 请求切换 current_planner_；新配置时重建 EmPlanner
 > deeproute::planning::PlannerType planner_type = PlannerDispatch(hpi_input);
@@ -174,6 +194,32 @@ tasks 目录按**规划阶段**组织为 23 个子目录（实测目录树），
 > 逻辑说明：`PlannerManager` 持有 3 个常驻规划器实例的 map，按 `HPIPlanningInterface.planner_selection_`（SELECTION_EM / SELECTION_OPEN_SPACE / SELECTION_REVERSE_TRACKING）分派。**配置热更新 = 整体重建 EmPlanner（即重建整条任务链）**。`Update()` 的调用方是 PlanningHpiInterface（planning_hpi_interface.cpp:304），每帧在 HPI 数据处理阶段调用。
 
 ## 3. 核心处理流程与函数调用链
+
+**一句话结论**：单帧主链 = 建帧+决策 → 每条参考线跑任务链（可并行）→ 按代价选线 → 对选中线跑 iLQR+速度后处理 → 合成发布；速度规划的核心舞台是 ST 图，打法是先 DP 后 QP。
+
+> **📘 概念｜ST 图（时间-路程图）**
+> **是什么**：速度规划的工作台——横轴时间 t、纵轴走过的里程 s，把自车未来画成一条 s(t) 曲线，把每个障碍物按「它何时会占据我前方哪段路」画成一块块斜着的禁区（ST 边界）。速度规划就是在禁区之间找一条不撞、尽量快、又舒适的曲线。它与路径侧 SL 图的区别：SL 图横轴里程、纵轴横向偏移，回答「往哪走」；ST 图回答「多快走」。
+> **类比与角色映射**：ST 图像火车时刻表冲突图——横轴时刻、纵轴里程；障碍物＝别的车次（占着某段时间某段轨道）；禁区＝车次的时间×区间块；我们的 s(t) 曲线＝给自己排的运行图（既要快又不能追尾前车）；限速＝区间限速牌（图顶的天花板）。真实组件：禁区由 tasks/st_graph 的 st_boundary_mapper 把障碍物沿预测轨迹投影生成；天花板 speed_limit 由红绿灯/模型/收费站限速源叠加（dp_speed Execute 第 1 步）；产出存进 ReferenceLineInfo::st_graph_data_（§5.1）。
+> **🎯 为什么这样设计**：把「跟车/超车/让行」的三维时空问题降成二维平面几何，DP/QP 能在同一张图上接力；且决策（跟停还是绕行）与求解在同一张图内闭环（§4.3 的 GetSpeedDecision）。
+> **🗂 代码在哪里**：构建 tasks/st_graph/（st_boundary_mapper）；消费 tasks/dp_speed 与 tasks/qp_speed；载体 ReferenceLineInfo::st_graph_data_。
+>
+> **30 秒最小例子**：前方 50m 有辆慢车以 30kph 行驶，我方现速 60kph。画进 ST 图：慢车的预测轨迹是一块从 (t≈2s, s≈40m) 向右上延伸的斜禁区。DP 在禁区下方找一条先爬升后贴着禁区下缘的 s(t) 曲线——2 秒内松油门、然后稳在 30kph 跟车；QP 再把折线的加速度抖动磨平，得到最终速度剖面。
+
+> **📘 概念｜DP（动态规划粗解）**
+> **是什么**：在离散网格上「穷举+记忆化」的全局搜索——把解空间切成格子，逐格累加代价再回溯，得到全局近似最优的粗解。本仓库两处使用：路径侧在 SL 栅格（SlGrid）上搜横向偏移曲线（§4.1），速度侧在 ST 网格上搜 s(t) 曲线（§4.3）。它与 QP 的区别：DP 解是离散折线（糙但全局稳妥、不依赖初值、能处理绕行/跟停这类突变决策），QP 解是连续光滑曲线（精致但只能局部收敛、需要好初值）——所以先 DP 后 QP。
+> **类比与角色映射**：DP 像「先打草稿再誊写」的草稿——作文纸打满格子逐格试句，整篇连起来通顺（全局最优）但字迹潦草。真实角色：路径侧＝tasks/dp_path 的 SlGrid+path_graph（sampler 采样、path_cost 打分、path_graph_evaluator 求值）；速度侧＝tasks/dp_speed 的 st_grid.Search（L1139）；产出＝path_data_/speed_data_ 的初始曲线。
+> **🎯 为什么这样设计**：500ms 预算内无法对连续空间直接全局寻优；DP 用离散步长把指数级组合压成多项式级，且天然表达「绕行还是跟停」的不连续决策——这正是 QP 的盲区。
+> **🗂 代码在哪里**：tasks/dp_path/{sampler,path_cost,path_graph,path_graph_evaluator}；tasks/dp_speed/dp_speed_optimizer.cpp（ST 网格 DP 搜索）。
+>
+> **30 秒最小例子**：右前方有辆慢车。SL 栅格把横向偏移 0~3m 切成三列：贴右走（l≈2m）要减速跟车代价高、直行（l=0）近距离逼近风险大、借左道（l≈-3m）绕行顺畅但要确认左边没车。DP 沿里程方向逐行累加三列代价，回溯出「先直行缓出、再借左道绕行」的全局最省代价折线——这就是交给 QP_path 的草稿。
+
+> **📘 概念｜QP（二次规划精解）**
+> **是什么**：在连续变量上最小化二次代价、满足线性约束的凸优化——解出的曲线天然光滑（加速度/加加速度连续）。路径侧 QpSplinePathOptimizer 把 DP 折线拟合成样条（QP_path），速度侧 QpSpeedOptimizer 用 OptimalStSolver 在 ST 图约束内把 DP 粗解磨平（§4.4）。它与 DP 是接力关系：初值来自 DP；没有 DP 兜底的 QP 容易掉进局部最优，所以 QP_path 失败仅告警沿用 DP 结果而不触发 fallback（§6.4）。
+> **类比与角色映射**：QP 像「誊写员」——把草稿每个字写端正、行距调匀（平滑），但不改内容大意（初值锚定）；个别字写不好就保留草稿原样（沿用 DP）；泊车/倒车等特殊场景换「MPC 誊写员」并注入上一帧笔迹保证连贯（MpcStSolver 帧间缝合，§4.4）。
+> **🎯 为什么这样设计**：乘坐舒适性的本质是加速度/加加速度有界，QP 的二次代价恰好直接惩罚这些量的平方；凸性保证每次求解耗时稳定，适配 500ms 实时预算。
+> **🗂 代码在哪里**：tasks/qp_spline_path/（路径样条 QP）；tasks/qp_speed/qp_speed_optimizer.cpp L63（OptimalStSolver / MpcStSolver 分派）。
+>
+> **30 秒最小例子**：DP 给出的速度折线在 3 秒内从 60kph 砍到 30kph，中间有个明显拐点（乘客会「点头」）。QP_speed 以这条折线为初值，在「加速度∈[-6,3] m/s²、跟车距离≥安全值、不越限速天花板」等约束下重新分配每 0.1s 的速度点——同样的终点，但减速力道是逐渐加再逐渐松的光滑曲线。
 
 ### 3.1 单帧主流程（planning_core 层）
 
@@ -203,6 +249,10 @@ planning_planner_management.cpp]
     O --> P[ExecuteTrajectoryValidation
 → TrajectoryChecker::RunChecker]
 ```
+
+**图 3-1 · 单帧主流程（planning_core 层）**（A→P 自上而下，K/L 两步只对选中参考线执行）
+
+**读图提示**：① D 节点里「traffic_rules/场景决策属其他子 Agent 边界」——决策前置在任务链之前，不在 EmPlanner 内；② H 节点「最多 3 条 refline」对应左侧/中间/右侧三条参考线各自独立跑链（§6.3 多线程）；③ K→L 是选线后的「精修双件套」，它们不在 tasks_stage_ 链里。
 
 > 文件路径：/sandbox/planning/planning/planning_core.cpp  
 > 函数名：Planning::InternalRun（L1684）/ Planning::ProcessPlanStuff（L138）  
@@ -304,6 +354,8 @@ planning_planner_management.cpp]
 | 9 | OptimalJerk（speed_postprocess） | 速度后处理 | EmPlanner::PlanOnReferenceLine(Frame\*) 必建 |
 
 model 链（model_em_planner_config，L2_NCA/ICA 且 model_path_enabled 时）额外插入 DecisionMaking（enable_decision_making=true，share 基础配置 L5620）与 ModelTrajectoryGenerator（enable_model_path/model_speed=true），此时 DP_path 因 `use_dp_path=true` 仍保留。**DecisionMaking 在基础链不装配**（enable_model_path=false 时 `decision_making_active` 仍为 true 会装配，但 share 基础链未叠加 model_config 前该值取 share/em_planner_config.jsonnet 内嵌的 `enable_decision_making: true`——注意此字段位于 share 基础配置 L5620，故**基础链也含 DecisionMaking**；两条链差异仅在 Model_trajectory 与 iLQR 相关 cost 开关。此处以装配代码条件 `decision_making_active = enable_decision_making()` 与配置原值为准）。
+
+**人话版：任务链怎么装配与执行**（对照 §3.3 表）——把 C01 基础链的 9 步想成一条汽车总装线：①DP_path 先打草稿（全局粗扫横向路线）；②QP_path 把草稿誊成光滑样条（失败就沿用草稿，不算事故）；③Static_lat_decider 横向拍板（靠左靠右/绕行决策）；④DP_speed 在 ST 图上粗算「多快走」；⑤QP_speed 把速度曲线磨顺；⑥combine 按时间戳把路径与速度缝合成完整轨迹；⑦trajectory_safety 安检（代价复核）；⑧选线后 iLQR 只给**中标的那条线**做动力学精修；⑨speed_postprocess 最后调舒适度。装配规则：哪些工位上岗看配置开关（如 use_qp_path_obtimizer），顺序写死在构造函数里，配置热更新＝整条流水线拆了重装（§2.3）。失败升级规则：①④⑤任一失败触发 path/speed fallback，②⑥⑦⑧失败各有各的兜底，详见 §3.4 与《06 异常与降级》。
 
 ### 3.4 逐 refline 执行与 fallback
 
@@ -435,7 +487,7 @@ model 链（model_em_planner_config，L2_NCA/ICA 且 model_path_enabled 时）�
 > 
 > ```cpp
 > const auto& st_graph_data = reference_line_info->st_graph_data();
-> const std::`pair<double,double>` accel_bound = {config_.max_deceleration(), config_.max_acceleration()};
+> const std::pair&lt;double,double> accel_bound = {config_.max_deceleration(), config_.max_acceleration()};
 > // Choose solver: MPC or Spline QP
 > bool use_mpc = reference_line_info->use_open_space_planner() ||
 >                reference_line_info->use_reverse_tracking_planner() || is_e2e_out_parking;
@@ -451,13 +503,21 @@ model 链（model_em_planner_config，L2_NCA/ICA 且 model_path_enabled 时）�
 
 ### 4.5 轨迹优化：IlqrOptimizer（iLQR，选线后执行）
 
+> **📘 概念｜iLQR（迭代线性二次调节，轨迹精修）**
+> **是什么**：把「路径+速度」合成后的整条轨迹当作一个最优控制问题，用车辆动力学模型迭代线性化求解——DP/QP 是把路径与速度**分开**解，iLQR 则**联合优化**横纵向，让轨迹在动力学上最可行（方向盘转角、油门刹车都贴合车辆能力）。它不在 tasks_stage_ 任务链里，而是选线后对**选中的**参考线单独创建执行（§3.4），失败有兜底：把 DP+combine 的初值轨迹写回 refline。
+> **类比与角色映射**：iLQR 像「试驾教练」——前两步是在图纸上画的路线，教练真开一遍：哪里转向过猛（动力学不可行）、哪里油门突兀，逐轮微调到「图纸最优+车辆做得到」；只试驾最终中标路线（不浪费时间试落选的）；试驾失败就按图纸开（初值兜底）。真实组件：CreateIlqrOptimizationTask → IlqrOptimizer::Execute（L415）→ DrivingIlqrSolverV2::GenerateTrajectory 迭代求解；产出经碰撞处理后写回 discretized_trajectory_；tasks/ilqr 全目录 7757 行，是 tasks 目录最大单文件。
+> **🎯 为什么这样设计**：分维度优化（先路径后速度）各自最优的拼接未必是动力学下整体最优；iLQR 用自行车模型+迭代线性二次求解收敛快，且只在选中线上跑一次，成本可控——多线程 fan-out 到 plan_worker 线程池（见 [**公共 05 §2**](../../00_公共基础文档/05%20端到端全链路时序与异常机制（C01%20-%20orinx）.md) 调用栈第 12 步）。
+> **🗂 代码在哪里**：tasks/ilqr/{solver,problem,driving}；入口 em_planner.cpp 选线后 CreateIlqrOptimizationTask。
+>
+> **30 秒最小例子**：combine 合成的轨迹在 8m/s 过弯处横向加速度贴着上限（乘客侧倾明显）。iLQR 以自行车模型前向仿真这条轨迹，算出第 4 秒方向盘增量对横向加速度的敏感度（雅可比），迭代三轮回调该处速度 0.5m/s、顺带前移刹车点——最终轨迹过弯侧倾明显减小，且整条轨迹的代价（跟踪误差+控制量+舒适项）比原来更低。
+
 > 文件路径：/sandbox/planning/planning/tasks/ilqr/ilqr_optimizer.cpp  
 > 函数名：IlqrOptimizer::Execute（L415）/ 求解段（L976-1080）  
 > 核心逻辑：
 > 
 > ```cpp
-> std::`unique_ptr<ilqr::DrivingIlqrSolverV2>` driving_ilqr_solver =
->     std::`make_unique<ilqr::DrivingIlqrSolverV2>`(thread_pool_);
+> std::unique_ptr&lt;ilqr::DrivingIlqrSolverV2> driving_ilqr_solver =
+>     std::make_unique&lt;ilqr::DrivingIlqrSolverV2>(thread_pool_);
 > ilqr::DrivingIlqrSolverInput input;
 > if (!BuildIlqrSolverInput(*frame, *reference_line_info, &input)) { ... }
 > if (!driving_ilqr_solver->Init(time_horizons_, driving_config_, input,
@@ -475,6 +535,8 @@ model 链（model_em_planner_config，L2_NCA/ICA 且 model_path_enabled 时）�
 > 逻辑说明：iLQR 把路径-速度联合优化为一个 **iLQR 最优控制问题**：输入由 `BuildIlqrSolverInput` 从 Frame/refline 组装（自行车模型、静态/动态障碍物、参考线），`DrivingIlqrSolverV2::GenerateTrajectory` 迭代求解（solver 实现在 tasks/ilqr/{solver,problem,driving} 子目录），失败时把初值轨迹（DP+combine 结果）写回 refline 作为兜底，成功则经碰撞处理后 `ApplyIlqrSolverOutputToRefLineInfo` 写回 `ReferenceLineInfo::trajectory_`。本仓 7757 行为 tasks 目录最大单文件。
 
 ## 5. 输入输出数据结构（Task 间传递什么）
+
+**一句话结论**：Task 无自有 IO 成员——Frame 是「全厂公告栏」（帧级共享），ReferenceLineInfo 是「每条产线的工单」（路径/速度/轨迹全在这张单上流转）。
 
 **核心约定：Task 无自有 IO 成员，全部通过 `Frame`（帧级，跨 refline 共享）与 `ReferenceLineInfo`（每条参考线一份）传递**（task.h 注释："Data IO is through Execute() interface"，实参即这两个上下文）。
 
@@ -509,6 +571,8 @@ model 链（model_em_planner_config，L2_NCA/ICA 且 model_path_enabled 时）�
 - **下游输出**：`Planner::GenerateAdcTrajectory` 把 `selected_reference_line_info->trajectory()` 填入 `deeproute::planning::ADCTrajectory`（含 trajectory_point、gear、turn_signal、trajectory_type），经 `SelectPlanner`（planning_planner_management.cpp L92-100：`*trajectory_pb = planner_->adc_trajectory(); *turn_signal = planner_->turn_signal();`）后由 planning_post_process_calculator 发布到 /planner/trajectory。
 
 ## 6. 代码证据与关键片段
+
+**一句话结论**：本节是前文结论的源码落点——顺序是设计意图（6.1 注释原文）、QP 失败不算事故（6.4）、fallback 也有完整合成+安检（6.5）。
 
 ### 6.1 任务链装配顺序（见 3.2 节，em_planner.cpp L202-339）
 
@@ -619,6 +683,30 @@ model 链（model_em_planner_config，L2_NCA/ICA 且 model_path_enabled 时）�
 ### 6.7 与 trajectory_checker 的交互边界
 
 Planner 输出的 `adc_trajectory_` 在 RunOnce 尾部进入 `Planning::RunTrajectoryChecker`（planning_trajectory_process.cpp L2529，仅 EM_PLANNER 启用）→ `TrajectoryChecker::RunChecker`。校验细节见《子模块4：trajectory_checker 轨迹校验子模块》。
+
+---
+
+## 7. FAQ 与自测
+
+**Q1（新手误解）：iLQR 是任务链里的固定一环、每条参考线都跑吗？**
+不是。iLQR **不在** `tasks_stage_` 任务链内（§3.2 装配代码里没有它），而是在选线（Postprocess）之后，只对**选中的**那条参考线单独 CreateIlqrOptimizationTask 并执行（§3.4、§4.5）；其余落选参考线不跑 iLQR，失败时还有初值轨迹兜底。
+
+**Q2：QP_path 失败了为什么不算故障？**
+因为它是 DP_path 的平滑增强：失败仅打 WARN 并沿用 DP 结果（continue，§6.4），不触发 fallback。真正升级为 path/speed fallback 的是 DP_path / DP_speed / QP_speed 三者失败（§3.4）。
+
+**Q3：DP 和 QP 为什么不一步到位？**
+算力与实时性的折中：DP 粗但全局稳、能表达突变决策（绕行/跟停），QP 精但只能局部收敛、需要好初值（§3 两张卡片）；两段式在 500ms 预算内兼顾解质量与耗时，且 QP 失败还能退回 DP 结果。
+
+**Q4：新增一个 Task 要注册到哪张表？**
+没有注册表。本仓库 tasks 体系没有 Apollo 式 REGISTER 宏（§2.2 已验证）——写一个内联工厂函数 `CreateXxxTask`，然后在 EmPlanner 构造函数里按配置条件 push_back；想改链的形态只能改配置或改装配代码，配置热更新的实现是重建整个 EmPlanner（§2.3）。
+
+**自测**（答案在缩进行里）：
+1. C01 L2_driving 基础链的任务顺序是什么？哪两步恒加入？
+    答：DP_path→QP_path→Static_lat_decider→DP_speed→QP_speed→combine_path_speed→trajectory_safety，选线后 iLQR→speed_postprocess；combine 与 trajectory_safety 恒加入（§3.3 表）。
+2. Task 之间怎么传数据？为什么没有成员变量传递？
+    答：全靠 Frame（帧级共享）与 ReferenceLineInfo（每条参考线一份）两个上下文对象；Execute 签名即证据（§2.1、§5）——无成员传递才能支持多 refline 并行与任务链重组。
+3. fallback 时轨迹从哪来？还要过安检吗？
+    答：用 idx_combine_task_ 直取 combine 任务按 fallback 路径/速度补合轨迹，并让 TrajectorySafety 复检；合成彻底失败则该 refline 记 FAIL 代价剔除（§6.5）。
 
 ---
 

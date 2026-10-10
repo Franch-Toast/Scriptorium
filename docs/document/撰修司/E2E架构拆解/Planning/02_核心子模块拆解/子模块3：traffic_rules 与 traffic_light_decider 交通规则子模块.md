@@ -1,7 +1,7 @@
 ---
 title: "子模块3：traffic_rules 与 traffic_light_decider 交通规则子模块"
 date: 2026-09-20
-description: "分支基线：perception/planning/driver @ Stable_Master_4.0_new（当前检出）。所有结论附代码证据；推断/未验证均显"
+description: "交通规则子模块：规则集、红绿灯决策与虚拟墙生成。"
 categories:
   - 撰修司
 tags:
@@ -9,11 +9,27 @@ tags:
   - E2E
 ---
 
-# 子模块3：traffic_rules 与 traffic_light_decider 交通规则子模块
+> **30 秒导读**："交规课代表"：把交通规则翻译成决策约束，红绿灯读秒直接决定虚拟墙位置。
+> **本篇回答**：有哪些规则在起作用？红绿灯怎么影响规划？虚拟墙是什么？
+> **先修阅读**：《00 入门》§3 步骤 8~9。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **交通规则决策**：把法律条文翻译成虚拟墙/限速——求解器只认这两种通用语言（完整卡片见 §1 末）。
+> - **架构迁移**：红绿灯判定真身在 TrafficLightDecider（Frame 持有、跨帧记忆），signal_light.cpp 只是壳——别被文件名误导。
+> - **两阶段挂接**：traffic_rules 每帧每条参考线执行；红绿灯在 Frame 初始化 ReflineInfoProcess 内执行——都早于 planner。
+> - **虚拟墙**：参考线上挂"虚拟障碍物+纵向 Stop 决策"，ST/速度优化天然响应，无需特判。
+> - **规则状态机**：StopSign 停满 10s 再走、收费站停 3s→杆抬→蠕行 3s，跨帧状态存活于规则对象内。
+> - **豁免链**：待转区分支优先；收费站附近/高速停止线失配/MP 忽略三类短路可撤销停车。
+> - **C01 关闭项**：Crosswalk/Yield/KeepClear 配置 enabled=false（Yield 主体还被注释），引用需注意。
+
 
 > 分支基线：perception/planning/driver @ Stable_Master_4.0_new（当前检出）。所有结论附代码证据；推断/未验证均显式标注。
 
 ## 1. 子模块定位与职责
+
+**一句话结论**：交通规则决策=「条文→约束」——traffic_rules（9 类规则统一产虚拟墙/限速）+TrafficLightDecider（红绿灯专项判定，架构已迁移至此）双件套，均不做轨迹。
+
+**为什么规则要翻译成虚拟墙**：求解器（DP/QP）只认「障碍物+限速」两种语言，让它们单独学一套「红灯」「停止标志」的专用逻辑，每加一条规则就要动一次求解代码。把条文翻译成虚拟障碍物后，规则层与求解层彻底解耦：红灯和一辆真的停着的车在求解器眼里是同一堵墙，新增/启停/调参规则不碰求解器。代价是要维护一层「条文→约束」的翻译器——本篇讲的就是这层翻译器怎么工作。
 
 交通规则子模块由两部分组成，**分工在当前版本已经发生架构迁移**：
 
@@ -58,7 +74,17 @@ tags:
 
 \* C01 启用状态依据：/sandbox/planning/planning/config/share/traffic_rule_config.jsonnet；C01T/C01 的 planning_internal_C01T_config.jsonnet 直接 `import "traffic_rule_config.jsonnet"` 无车型级覆盖（grep 证据），故 C01 = share 配置。
 
+> **📘 概念｜交通规则决策（traffic_rules 与 TrafficLightDecider）**
+> **是什么**：把「法律条文」翻译成规划约束的一层——红绿灯、停车标志、收费站、无保护转向等 9 类规则逐条检查当前帧，产出**虚拟停车墙或限速**挂到参考线上，让 DP/QP 天然"守法"。它不做轨迹、不做绕行，只说"这里必须停/这里限速"。它与 [**场景决策**（子模块2 §1）](子模块2：scene_decider%20与%20scene_sets%20场景决策子模块.md) 的区别：场景是"当前局面的软画像"（窄道悠着点开），规则是"必须遵守的硬约束"（红灯不能闯）——画像影响偏好，约束直接封死解空间。特别注意：红绿灯停车的真正判定在 TrafficLightDecider（Frame 持有），signal_light.cpp 只是壳——读代码别被文件名误导。
+> **类比与角色映射**：交通规则决策是「考场纪律」——考生（DP/QP 求解器）再急也不能越线：监考老师（9 类规则）不讲道理，只竖牌子（虚拟墙）"此处停笔"、划横线（限速）"这段慢写"；牌子和横线都写进答题卡（PathDecision），考生自然遵守。角色映射：TrafficRule 基类＝监考守则（ApplyRule 一个纯虚契约）；TrafficDecider＝监考组长（每帧每条参考线派 9 个老师进场）；TrafficLightDecider＝首席监考（红绿灯专项判定，cpp 3494 行，带跨帧记忆）；虚拟墙＝牌子（Renderer::AddVirtualStopObstacle，STOP_REASON_*）。真实数字：C01 启用 6 类规则（红绿灯/停车标志/收费站/无保护转向/汇流/终点），Crosswalk/Yield/KeepClear 配置关闭；红灯倒计时<3s 且灯形允许才豁免起步；黄灯舒适刹停减速度 2.25 m/s²。
+> **🎯 为什么这样设计**：把规则与求解解耦——求解器只认"障碍物+限速"两种通用语言，规则变化（新增/启停/调参）不动求解代码；虚拟墙复用障碍物通道，ST/速度优化无需特判"这是红绿灯还是真的墙"；规则状态机（StopSign 停满 10s/收费站三阶段）跨帧存活，配置热更新不重建对象，保证记忆不丢。
+> **🗂 代码在哪里**：traffic_rules/（traffic_rule.h 基类、traffic_decider.h/.cpp 注册调度、signal_light/stop_sign/toll_station/unprotected_turn/merge/destination.cpp 各规则）；traffic_light_decider/traffic_light_decider.cpp（红绿灯主判定）；挂接点 planning_frame_management.cpp ProcessFrameInitStuff、frame_traffic_light.cpp TrafficLightProcess。
+>
+> **30 秒最小例子**：红灯带倒计时 4s、自车 50km/h 接近：StopForCountdowns 按舒适减速度 2.25 m/s² 反算刹车距离约 85m，剩余窗口 6s（4s 红+2s 黄）内能舒适刹停→build_stop_decision=true，STOP_REASON_SIGNAL 虚拟墙立在停止线后 1m；若绿灯亮起，墙自动消失，速度优化直接响应"墙没了"。
+
 ## 2. 核心类结构与成员变量
+
+**一句话结论**：TrafficDecider 一次性注册 9 类规则、每帧只热更配置不重建对象（保住规则状态机）；TrafficLightDecider 是带跨帧记忆的大状态对象（灯色缓存/静止帧计数/停止线缓存全落 FrameContext）。
 
 ### 2.1 TrafficDecider：规则注册与调度
 
@@ -75,8 +101,8 @@ tags:
 >  private:
 >   void RegisterRules();
 >   deeproute::planning::TrafficRuleConfigs rule_configs_;
->   std::unordered_map<deeproute::planning::TrafficRuleConfig_RuleId,
->                      std::`unique_ptr<TrafficRule>`, std::`hash<int>`> traffic_rules_;
+>   std::unordered_map&lt;deeproute::planning::TrafficRuleConfig_RuleId,
+>                      std::unique_ptr&lt;TrafficRule>, std::hash&lt;int>> traffic_rules_;
 > };
 > ```
 > 
@@ -105,7 +131,7 @@ tags:
 >   bool StopForCountdowns(...);                 // 倒计时能否舒适刹停
 >   bool GreenBlinkProcess();                    // 绿灯闪烁处理
 >   bool BuildStopDecision();                    // 生成虚拟墙
->   std::`shared_ptr<ReferenceLineInfo>` reference_line_info_;
+>   std::shared_ptr&lt;ReferenceLineInfo> reference_line_info_;
 >   deeproute::perception::TrafficLight valid_tl_result_, tl_result_;
 >   CachedTrafficLight last_cached_traffic_light_;   // 上一帧缓存(跨帧记忆)
 >   WaitingAreaInfo waiting_area_info_;              // 待转区信息
@@ -122,6 +148,8 @@ tags:
 - `Frame::traffic_light_decider_`（frame.h:5048，shared_ptr）——traffic_light_decider 的宿主，`Frame::GetTrafficLightDecider()` 供各模块读取灯色结果（如 signal_light_tla.cpp:25）。
 
 ## 3. 核心处理流程与函数调用链（规则的挂接点）
+
+**一句话结论**：两个挂接点都在 planner 运行前——TrafficDecider 在 ProcessFrameInitStuff 逐参考线执行（失败置 set_normal(false)），红绿灯在 ReflineInfoProcess 里执行并把虚拟墙加到所有参考线。
 
 ### 3.1 TrafficDecider：配置初始化 + 帧初始化阶段逐参考线执行
 
@@ -170,7 +198,7 @@ tags:
 >   for (const auto &cfg : rule_configs_.config()) {
 >     if (cfg.enabled()) {  // ← 顶层 enabled 才注册
 >       switch (cfg.rule_id()) {
->         case ..._TRAFFIC_LIGHT: traffic_rules_[cfg.rule_id()] = std::`make_unique<SignalLight>`(cfg); break;
+>         case ..._TRAFFIC_LIGHT: traffic_rules_[cfg.rule_id()] = std::make_unique&lt;SignalLight>(cfg); break;
 >         case ..._CROSSWALK:     ... `make_unique<Crosswalk>`(cfg); ...
 >         case ..._STOP_SIGN / YIELD / TOLL_STATION / KEEP_CLEAR /
 >              UNPROTECTED_TURN / MERGE / DESTINATION: ...
@@ -187,7 +215,7 @@ tags:
 > 函数名：Frame::InitCoreInfrastructure()（185 行附近）
 > 
 > ```cpp
-> traffic_light_decider_ = std::`make_shared<TrafficLightDecider>`(traffic_rule_configs);
+> traffic_light_decider_ = std::make_shared&lt;TrafficLightDecider>(traffic_rule_configs);
 > ```
 
 > 文件路径：/sandbox/planning/planning/frame/frame_traffic_light.cpp  
@@ -196,7 +224,7 @@ tags:
 > 
 > ```cpp
 > bool Frame::TrafficLightProcess() {
->   std::`vector<common::hdmap::RouteSegments>` segments;
+>   std::vector&lt;common::hdmap::RouteSegments> segments;
 >   reference_line_provider_->GetRouteSegmentsFromLocalRouting(&segments);
 >   traffic_light_decider_->TrafficLightPreProcess(tl_response_, GetConstContext().FrameContext(),
 >       segments, obstacles_list_, road_mask_decoder_, vehicle_state_,
@@ -214,7 +242,7 @@ tags:
 > }
 > ```
 > 
-> 逻辑说明：调用点在 `Frame::ReflineInfoProcess()`（frame_init_utils.cpp:125，场景检测之后）；判定结果以**虚拟停止墙**（STOP_REASON_SIGNAL，距离 1m buffer）加入**所有参考线**的 PathDecision，后续 ST/速度优化天然响应。
+> 逻辑说明：调用点在 `Frame::ReflineInfoProcess()`（frame_init_utils.cpp:125，[**场景决策**（子模块2 §3.1）](子模块2：scene_decider%20与%20scene_sets%20场景决策子模块.md) 之后）；判定结果以**虚拟停止墙**（STOP_REASON_SIGNAL，距离 1m buffer）加入**所有参考线**的 PathDecision，后续 ST/速度优化天然响应。
 
 ### 3.3 SignalLight 规则的实际职责（架构迁移痕迹）
 
@@ -270,7 +298,13 @@ graph TB
     X --> Y[ProcessPlanStuff: DpPath/DpSpeed tasks 响应虚拟墙]
 ```
 
+**图 3-1 · 交通规则决策全景流程（traffic_rules 逐规则 + TrafficLightDecider 红绿灯双路）**（S1~S7 是规则组，W1→W7 是红绿灯主判定链，产物都汇入 X 虚拟障碍物）
+
+**读图提示**：① 左路 R2 是 traffic_rules 每帧每条参考线逐规则执行（S7 三类 C01 未启用）；② 右路 W 是红绿灯判定链——W3 分流"有无停止线"，W5/W6 分流"普通灯色/待转区"；③ X 是唯一出口：所有规则产物都以虚拟障碍物形态进 PathDecision，Y 处 DP/速度优化无差别响应。
+
 ## 4. 核心算法入口与关键逻辑（核心规则深入）
+
+**一句话结论**：核心规则各有绝活——红绿灯是"灯色×倒计时×舒适减速度"判定树，停车标志是"停满 10s"状态机，收费站是"等杆抬"三阶段，终点规则还兼选泊车空档。
 
 ### 4.1 HandleNormalTrafficLight：红绿灯主判定（最核心）
 
@@ -350,7 +384,7 @@ graph TB
 > 核心逻辑：
 > 
 > ```cpp
->   const std::`vector<OverlapPtr>` &stop_sign_overlaps =
+>   const std::vector&lt;OverlapPtr> &stop_sign_overlaps =
 >       reference_line_info->GetOverlapArrayByType(OverlapType::OVERLAP_TYPE_STOP_LINE_STOP_SIGN);
 >   for (const auto &stop_sign_overlap : stop_sign_overlaps) {
 >     const double adc_to_stop_line_distance = stop_sign_overlap->s_begin - adc_front_edge_s;
@@ -439,15 +473,19 @@ graph TB
 
 ## 5. 输入输出数据结构
 
+**一句话结论**：输出统一为"改 ReferenceLineInfo"——虚拟墙进 PathDecision 供 ST/速度优化消费，灯色结果供 TLA/DP 切换读取，跨帧状态写回 FrameContext。
+
 | 组件 | 输入 | 输出 |
 |-|-|-|
 | TrafficDecider | `TrafficRuleConfigs`（protobuf，Init/UpdateConfig）；每帧 `Frame*` + `ReferenceLineInfo*` | 修改 ReferenceLineInfo：`PathDecision` 增加虚拟障碍物与纵向 Stop 决策（Renderer::AddVirtualStopObstacle）；`ReferenceLine` 增加速率限制（AddSpeedLimit）；规则对象内部状态机跨帧保持 |
 | TrafficLightDecider | `TrafficLightResponse`（感知灯色+倒计时+多灯组）、`FrameContext`（上一帧缓存/拓扑）、`RouteSegments`（local routing）、`obstacles_list`、`VehicleState`、`EMPlannerConfig`、`l2_type`、`is_highway` | `GetVirtualStopPoint()`（虚拟墙点位）→ Frame 加 `STOP_REASON_SIGNAL` 虚拟墙；`GetValidTrafficLightResult()` 等全套 Getter（供 TLA、DP 切换、文言信号）；`SerializeMsgToContext()` 写回 FrameContext 供下一帧 |
 | SignalLight（壳） | Frame + ReferenceLineInfo | LCC 停止线 id/距离/点（`SetLCCModeStopLine*`）；TLA 时更新 TrafficLightDecider 的灯色结果 |
 
-**关键下游**：虚拟墙进入 `PathDecision::AddLongitudinalDecision` 后，由 tasks 侧 ST 图（st_graph）与 DP/QP 速度优化消费（属其他子Agent范围）。TrafficLightDecider 另向模式切换输出 `IsGreenLightStartShouldSwitchDp / IsWaitingAreaShouldSwitchDp / IsStopShouldSwitchDp / SwitchDpForTrafficLight`（绿灯起步 1s 内未达 0.5m/s、待转区内、刹停场景 → 触发 DP 重规划，注释见 traffic_light_decider.h:92-100）。
+**关键下游**：虚拟墙进入 `PathDecision::AddLongitudinalDecision` 后，由 tasks 侧 [**ST 图**（子模块1 §3）](子模块1：planner%20与%20tasks%20决策规划任务管线.md)（st_graph）与 DP/QP 速度优化消费（属其他子Agent范围）。TrafficLightDecider 另向模式切换输出 `IsGreenLightStartShouldSwitchDp / IsWaitingAreaShouldSwitchDp / IsStopShouldSwitchDp / SwitchDpForTrafficLight`（绿灯起步 1s 内未达 0.5m/s、待转区内、刹停场景 → 触发 DP 重规划，注释见 traffic_light_decider.h:92-100）。
 
 ## 6. 代码证据与关键片段（补充）
+
+**一句话结论**：豁免短路链优先于灯色判定、绿灯起步 1s 未动触发 DP 切换、配置热更新不重建对象、TLA 缓存 3 帧防抖——四处片段拼出工程细节的完整图景。
 
 **片段1：ReadSignals 的例外短路链（停车豁免优先级）**
 
@@ -484,7 +522,7 @@ graph TB
 >   // 未提速到 0.5m/s，则返回 true
 > ```
 > 
-> 逻辑说明：与 `IsWaitingAreaShouldSwitchDp`、`IsStopShouldSwitchDp` 一起构成 `SwitchDpForTrafficLight`，用于交通灯相关场景触发 DP（动态规划）重新求解——红绿灯模块对规划器模式有反向控制（推断：经 planning_frame_management 的 DP/MP 切换流程消费）。
+> 逻辑说明：与 `IsWaitingAreaShouldSwitchDp`、`IsStopShouldSwitchDp` 一起构成 `SwitchDpForTrafficLight`，用于交通灯相关场景触发 DP（动态规划，把大决策拆成阶段递推逐步求最优的算法，见 [**AI 字典·动态规划 DP**](../../../../正典阁/技术栈/AI/动态规划%20DP.md)）重新求解——红绿灯模块对规划器模式有反向控制（推断：经 planning_frame_management 的 DP/MP 切换流程消费）。
 
 **片段3：虚拟墙落图统一出口**
 
@@ -558,4 +596,23 @@ graph TB
 >     }
 > ```
 > 
-> 逻辑说明：scene_decider 的窄道判定可覆盖"临近收费站"标志，限制加速度——两子模块在 DpSpeed 汇聚，是二者的主要交互点之一。
+> 逻辑说明：scene_decider 的窄道判定可覆盖"临近收费站"标志，限制加速度——两子模块在 DpSpeed 汇聚，是二者的主要交互点之一（[**场景决策**（子模块2）](子模块2：scene_decider%20与%20scene_sets%20场景决策子模块.md)）。
+
+## 7. FAQ 与自测
+
+**Q1（新手常见误解）**：想看红绿灯停车逻辑，应该读 traffic_rules/signal_light.cpp 吗？
+不要——那是最大的误导。SignalLight 已退化为"LCC 停止线信息更新 + TLA 灯色显示"的壳函数（ApplyRule 直接 return true 不建任何停车决策），红绿灯判定真身在 traffic_light_decider/traffic_light_decider.cpp（Frame 持有、带跨帧记忆）。
+
+**Q2**：虚拟墙和真障碍物对规划来说有区别吗？
+没有区别——这正是设计意图。虚拟墙以"虚拟障碍物+纵向 Stop 决策"双重写进 PathDecision，ST 图把它当普通障碍物算 ST 边界，DP/QP 速度优化直接响应 Stop 决策；求解器不需要知道"这是红灯还是一辆真的停着的车"。
+
+**Q3**：配置文件里把某规则 enabled 改了，规则内部的状态（如 StopSign 已停了 8s）会丢吗？
+不会。TrafficDecider 每帧 UpdateConfig 只原地更新已有规则对象的 config_，不重建对象（Init 时 traffic_rules_.empty() 才 RegisterRules）——StopSign/TollStation 的 stage 状态跨帧存活于规则对象内部，热更新不影响。
+
+**自测**：
+1. C01 实际启用的交通规则有哪几类？哪三类配置关闭？
+    启用 6 类：红绿灯/停车标志/收费站/无保护转向/汇流/终点；关闭 3 类：Crosswalk（实现完整但 enabled=false）、Yield（主体被注释+关闭）、KeepClearZone（关闭）。
+2. 红灯什么时候允许提前起步？
+    唯一豁免：感知红灯倒计时 <3s 且灯形允许（四方向箭头灯≥2 或箭头+圆盘混合时收紧为 1s，AllowRedCountdownStartByShape，阈值可在 traffic_rule_config.jsonnet 配置）。
+3. 多灯组路口"看哪盏灯"由谁决定？感知缺失怎么办？
+    TLA（Traffic Light Assignment）按 local routing 转向/车道标线（直行>左转>右转）确定灯组类型；目标灯组无结果或 UNKNOWN 时用上一帧缓存灯色，最多粘滞 3 帧防抖。

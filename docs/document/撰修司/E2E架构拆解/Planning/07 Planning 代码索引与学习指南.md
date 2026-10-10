@@ -1,7 +1,7 @@
 ---
 title: "07 Planning 代码索引与学习指南"
 date: 2026-09-20
-description: "适用范围：C01（orinx C01PT，L2_driving）E2E perception mainboard 中的 PlanningComponent。代码"
+description: "规划代码索引与学习指南：核心文件、bag 回放验证流程与常见误区。"
 categories:
   - 撰修司
 tags:
@@ -9,13 +9,26 @@ tags:
   - E2E
 ---
 
-# 07 Planning 代码索引与学习指南
+> **30 秒导读**：规划部分的随查手册：核心文件清单、bag 回放验证流程、常见误区。
+> **本篇回答**：想读规划代码从哪进？怎么用 bag 复现问题？单帧耗时看哪里？
+> **先修阅读**：无，随查随用。
+>
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **随查手册**：§1/§2 找文件与函数，§3 按路线学，§4 避坑，§5 调试。
+> - **任务链是运行时组装的**：顺序=EmPlanner 构造函数里的 push_back 顺序，不是 tasks/ 目录文件名（§4.2）。
+> - **数据流入口**：calculators/planning_input_preprocess_calculator.cc——从 adapter/ 入手会完全走偏（遗留代码未启用，§4.1）。
+> - **最大文件别通读**：reference_line_provider.cpp 8265 行全库最大，按函数索引查（§3 步骤 6）。
+> - **无固定周期**：IMMEDIATE 跟随 /perception/objects，expected_proc_duration_ms=500 只上报不杀帧（§4.5）。
+> - **上帧记忆**：/planner/context 既是输出又是图回边（back edge），拼接起点靠它（[**Context**（Planning/05 §6）](05%20Planning%20输出发布与控制指令生成.md)）。
+
 
 > 适用范围：C01（orinx C01PT，L2_driving）E2E perception mainboard 中的 PlanningComponent。代码根目录：`/sandbox/planning/planning/`。本篇是索引：给路径、职责、关键函数与阅读顺序，所有关键结论附证据。
 
 ---
 
 ## 1. 核心文件索引表
+
+**一句话结论**：索引按"根级→planner→各目录→图配置"组织——根级文件看单帧总控，planner/ 看规划器骨架，各目录看专项机制。
 
 ### 1.1 根级核心文件（按规模与重要性）
 
@@ -75,6 +88,8 @@ tags:
 
 ## 2. 核心函数索引（按数据流 8 段分类）
 
+**一句话结论**：8 段就是一条轨迹的一生：装配→帧管理→决策→任务管线→路径→速度→校验→输出——与 §3 学习路线的 8 步前后呼应。
+
 ### 2.1 输入装配
 
 | 函数 | 位置 | 职责 |
@@ -128,6 +143,8 @@ tags:
 | `ILQR task` | tasks/ilqr/ | iLQR 模型轨迹优化（plan_worker 池 fan-out） |
 | `ModelTrajectory` | tasks/model_trajectory/ | 模型输出轨迹解码 |
 
+**表里出现的 AI 名词**：本表是规划三大优化算法的「户口簿」——DP_path/DP_speed 是**动态规划**（粗解，见 [**AI 字典·动态规划 DP**](../../../正典阁/技术栈/AI/动态规划%20DP.md)），QP_path/QP_speed 是**二次规划**（精修，见 [**AI 字典·二次规划 QP**](../../../正典阁/技术栈/AI/二次规划%20QP.md)），ILQR 是 **iLQR**（模型轨迹优化，见 [**AI 字典·iLQR 与 LQR**](../../../正典阁/技术栈/AI/iLQR%20与%20LQR.md)）。查表顺序建议：先 §2.4 看链怎么串，再按 §2.5/§2.6 深入单个求解器。
+
 ### 2.6 速度规划
 
 | 函数 | 位置 | 职责 |
@@ -157,7 +174,11 @@ tags:
 
 ## 3. 推荐学习路径
 
-**前置知识**：C++（shared_ptr/atomic/std::list）、protobuf、church 图调度概念（calculator/stream/back_edge，见 04 文档）。
+**一句话结论**：8 步从图框架到专项：先把"触发与连线"搞懂，再背两个字段包，然后顺单帧主流程往下走——参考线大文件留给按需查。
+
+**零基础读者的补充建议**：Step5 的三个求解器名（DP/QP/iLQR）第一次见会觉得天书——先读 [**AI 字典导航**](../../../正典阁/技术栈/AI/00%20AI%20概念字典导航.md)把三个词条过一遍（每个都是 3 分钟的量），再回来读代码；规划篇的行文默认你已知这些名词的含义，字典就是给非算法背景工程师准备的预习材料。
+
+**前置知识**：C++（shared_ptr/atomic/std::list）、protobuf、church 图调度概念（calculator/stream/back_edge，见 [**04 文档**](04%20线程调度与规划周期.md)）。
 
 ```mermaid
 graph LR
@@ -178,6 +199,10 @@ trajectory_checker + planner.cpp fallback]
 open_space 泊车 + traffic_rules]
 ```
 
+**图 3-1 · 规划推荐学习路径（8 步进阶路线）**（Step1~3 是框架面，Step4~7 是主线，Step8 是专项）
+
+**读图提示**：① Step1~2 先建"图与数据结构"的底图，后面所有步骤都在这底图上展开；② Step6 明确"只查不通读"——8265 行的大文件是索引式阅读的典型；③ Step7 的校验与降级是规划安全性的落点，读不懂时回 [**Planning/06**](06%20异常处理与降级机制.md)。
+
 | 步骤 | 读什么 | 目标 |
 |-|-|-|
 | 1 | planning.jsonnet + planning_graph.cfg + planning_sub_graph.cfg | 弄清触发、输入输出通道、5 calculator 连线 |
@@ -193,12 +218,14 @@ open_space 泊车 + traffic_rules]
 
 ## 4. 重点难点与常见误区
 
+**一句话结论**：五大误区：adapter 是遗留代码、任务链是运行时组装、参考线不是车道线、Context 是回边不是输入、"neutral 轨迹"不存在。
+
 ### 4.1 adapter 体系未启用（遗留代码）
 
 **AdapterCenter** 是 ROS 式消息适配器（订阅/发布抽象），历史上 planning 独立进程用它接 ROS topic：
 
 > 文件路径：/sandbox/planning/planning/adapter/adapter_center.h  
-> 逻辑说明：adapter/ 共 4 文件（adapter.h、adapter_center.h/.cpp、factory_instance.h）。E2E 车载路径中消息由 church 图 calculator 直接传递（PlanningFrameData shared_ptr），**不经 adapter**。grep 全库仅 `visualizer/rviz_visualizer.cpp` 与仿真入口（sim_planning_interface）引用 AdapterCenter。**误区：新人从 adapter/ 入手读数据流会完全走偏**——数据流入口是 calculators/planning_input_preprocess_calculator.cc。
+> 逻辑说明：adapter/ 共 4 文件（adapter.h、adapter_center.h/.cpp、factory_instance.h）。E2E 车载路径中消息由 church 图 calculator 直接传递（PlanningFrameData shared_ptr），**不经 adapter**。grep 全库仅 `visualizer/rviz_visualizer.cpp` 与仿真入口（sim_planning_interface）引用 AdapterCenter。**误区：新人从 adapter/ 入手读数据流会完全走偏**——数据流入口是 calculators/planning_input_preprocess_calculator.cc（完整装配逻辑见 [**Planning/01**](01%20Planning%20输入数据接入与有效性校验.md)）。
 
 ### 4.2 任务管线是运行时组装的，不是写死的
 
@@ -227,8 +254,8 @@ open_space 泊车 + traffic_rules]
 ### 4.3 参考线机制与并发
 
 - **ReferenceLineProvider** 是"上游路由 → 帧内参考线"的中间层，持有 `thread_pool_`（即 plan_worker 池，见 04 文档 1.3），平滑任务 Enqueue 并行。
-- Frame 持有 `em_reference_line_info_`（std::list<std::`shared_ptr<ReferenceLineInfo>`>），每条参考线独立走一遍任务管线，最后按**代价**选 `selected_reference_line_info()`。
-- **误区**：ReferenceLineInfo 不是"车道线"，是"一条可行使走廊上的完整规划状态"；也**不要通读 reference_line_provider.cpp**（8265 行，全库最大），按函数索引查即可。
+- Frame 持有 `em_reference_line_info_`（std::list&lt;std::shared_ptr&lt;ReferenceLineInfo>>），每条参考线独立走一遍任务管线，最后按**代价**选 `selected_reference_line_info()`。
+- **误区**：ReferenceLineInfo 不是"车道线"，是"一条可行使走廊上的完整规划状态"（卡片见 [**ReferenceLineInfo**（Planning/00 §2）](00%20Planning%20模块架构总览.md)）；也**不要通读 reference_line_provider.cpp**（8265 行，全库最大），按函数索引查即可。
 - vpa_ground_lines/vpa_parking_spaces 等外部更新走互斥锁（`vpa_ground_lines_mtx_`，L437\~443），与主规划线程并发——改动必须考虑锁。
 
 ### 4.4 FrameContext 回边与"上一帧记忆"
@@ -240,7 +267,7 @@ open_space 泊车 + traffic_rules]
 > back_edge: true
 > ```
 > 
-> 逻辑说明：`/planner/context`（FrameContext proto）既是发布通道又是**图回边**（back_edge），下一帧输入节点从中取 `last_selected_trajectory` 等做拼接起点。**误区**：找"上一帧轨迹从哪来"时只查订阅者，漏掉同进程内的 back_edge 通道。
+> 逻辑说明：`/planner/context`（FrameContext proto）既是发布通道又是**图回边**（back_edge），下一帧输入节点从中取 `last_selected_trajectory` 等做拼接起点。**误区**：找"上一帧轨迹从哪来"时只查订阅者，漏掉同进程内的 back_edge 通道（完整卡片见 [**Context**（Planning/05 §6）](05%20Planning%20输出发布与控制指令生成.md)）。
 
 ### 4.5 其他易错点
 
@@ -255,6 +282,8 @@ open_space 泊车 + traffic_rules]
 ---
 
 ## 5. 调试与验证方法
+
+**一句话结论**：调试主线：订阅 /planner/trajectory 看 latency_stats，/planner/debug_info 看全过程，回放按 required 四件套备料——降级看 TrajectoryType，卡帧看看门狗。
 
 ### 5.1 输出通道速查（可订阅/回放）
 
@@ -306,4 +335,31 @@ open_space 泊车 + traffic_rules]
 
 ---
 
-> 索引篇完。配套阅读：03（数据结构/配置）、04（线程/周期）、06（异常/降级）。
+---
+
+## 6. FAQ 与自测
+
+**Q1：改了 tasks/ 里的任务类，为什么跑起来没生效？（新手最常见误解）**
+
+任务链是**运行时组装**的：只在 EmPlanner 构造函数里 push_back 注册的任务才会执行，且受 jsonnet 开关（enable_model_speed/enable_decision_making 等）裁剪——改类别忘了注册，改注册别忘了看开关（§4.2）。
+
+**Q2：planning 是固定 10Hz 周期吗？超时会被杀帧吗？**
+
+都不是。无定时器，IMMEDIATE 跟随 /perception/objects；expected_proc_duration_ms=500 只上报 CHURCH_PROC_TIMEOUT_EVENT，不杀帧不降级（§4.5）。
+
+**Q3：单帧耗时去哪里看？**
+
+`/planner/trajectory` 内 `latency_stats.total_time_ms`（planner.cpp L271~275 打点）与 "FRAME END" 日志（post_process calculator）；>1s 无帧另看 graph_watch_dog。
+
+**自测**（先自己想，再看缩进答案）：
+
+1. 想理解"上帧轨迹从哪来"，应该查什么？
+    /planner/context 的 back_edge 回边：它既是发布通道又是下一帧输入，从 last_selected_trajectory 取拼接起点（§4.4）。
+2. trajectory_bag 是回放 bag 的输入吗？
+    不是。它是算法轨迹副本：FLAGS_enable_algorithm_trajectory 开启时正式轨迹先剥离存副本，供校验与调试（§2.1 证据块）。
+3. 读 reference_line_provider.cpp 的正确姿势？
+    不通读（8265 行全库最大），按函数索引查 UpdateReferenceLine/Start 等关键函数（§3 步骤 6）。
+
+---
+
+> 索引篇完。配套阅读：[**03（数据结构/配置）**](03%20关键数据结构与参数配置.md)、[**04（线程/周期）**](04%20线程调度与规划周期.md)、[**06（异常/降级）**](06%20异常处理与降级机制.md)。

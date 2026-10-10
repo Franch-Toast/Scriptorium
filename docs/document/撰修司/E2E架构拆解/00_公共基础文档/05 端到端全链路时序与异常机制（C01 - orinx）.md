@@ -1,14 +1,25 @@
 ---
 title: "05 端到端全链路时序与异常机制（C01 / orinx）"
 date: 2026-09-20
-description: "读者对象：具备 C/C++ 基础、不熟悉本仓库的开发者。仓库基准：perception/planning/driver 为 Stable_Master_4.0_"
+description: "感知到规划到控制的端到端时序图、关键路径调用栈、帧同步与缓存机制、异常链路分析与性能耗时预算。"
 categories:
   - 撰修司
 tags:
   - E2E
 ---
 
-# 05 端到端全链路时序与异常机制（C01 / orinx）
+> **30 秒导读**：把 0.1 秒一帧的全流程拉成时间轴：每一步耗时预算、谁等谁、出问题时系统怎么层层自保。
+> **本篇回答**：一帧从采集到方向盘转动经过哪些环节？各环节时间预算是多少？异常时怎么兜底？
+> **先修阅读**：《00 入门》§3"一帧数据的一生"（本文是它的工程细节版）。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **三个节拍器**：感知 100ms 齐帧出图、规划 500ms 预算内被触发即算（IMMEDIATE）、控制 20ms 跟 pose——各打各的拍子，靠 FrameDone 发布顺序与 channel 队列咬合。
+> - **FrameSync**：拍合影的摄影师，12 路到齐才按快门（详见 [**Perception/01 §2**](../Perception/01%20输入数据接入与预处理.md)）。
+> - **FrameDone 契约**：交卷铃——先交 4 路料，最后交触发（详见 [**公共 02 §6.1**](02%20模块配置与%20Topic%20数据流拓扑（C01%20-%20orinx）.md) 卡片）。
+> - **背压**：柜台前最多排 2 人——在途帧 ≥2 就不放新帧，宁丢旧帧不积压（详见 [**Perception/01 §2.3**](../Perception/01%20输入数据接入与预处理.md)）。
+> - **降级 Fallback**：导航没路就下匝道靠边停——出带标记的刹停轨迹，绝不硬开（详见 [**Planning/06**](../Planning/06%20异常处理与降级机制.md)）。
+> - **轨迹回灌**：给自己报信——规划把轨迹发回感知帮预测盯梢（完整卡片见 §3）。
+
 
 > **读者对象**：具备 C/C++ 基础、不熟悉本仓库的开发者。**仓库基准**：perception/planning/driver 为 `Stable_Master_4.0_new`；`platform/church` 基于 dev_master（差异已确认）。C01（orinx C01PT，/task/task_type=L2_driving）E2E 主进程 = perception mainboard，同进程挂 PerceptionComponent→PlanningComponent→DataAgentRT→lom_infer，调度器 GRAPH（graphpipe/mediapipe）。  
 > **名词表**：**FrameSync**＝按时间分桶的多通道帧同步；**背压**＝下游处理慢时限制上游放行新帧；**TRIGGER/IMMEDIATE**＝消息到达即触发图执行；**回边（back_edge）＝图内反馈流，保证上一帧未完成前不装配下一帧；降级（fallback）**＝输出带标记的安全轨迹而非中止。
@@ -16,6 +27,38 @@ tags:
 ---
 
 ## 1. 正常工况全链路时序图
+
+**一句话结论**：一帧的生命周期 ＝ 感知 100ms 齐帧 → 图内流水线 → FrameDone 按契约发布 → 规划 500ms 预算内解题 → 控制 20ms 执行；每个预算数字都有配置出处。
+
+先用一张时序图建立整体节奏，再看各环节的配置依据：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SEN as 传感器驱动组件
+    participant FS as FrameSyncCalculator
+    participant PG as 感知图 预算100ms
+    participant PFD as 感知FrameDone
+    participant PLG as 规划图 预算500ms
+    participant PLD as 规划FrameDone
+    participant CTL as CbwControl 预算20ms
+    participant CH as 底盘
+    SEN->>FS: 12路图像+点云 上报
+    FS->>PG: 凑齐一帧才放行 在途帧数小于2
+    Note over PG: uni_model 检测 → tracker 跟踪 → farseer 预测 → aeb 过滤
+    PG->>PFD: 感知结果
+    PFD->>PLG: 先发 extra_objects 与 ras_map 等四路输入
+    PFD->>PLG: 最后发 /perception/objects 触发规划
+    Note over PLG: 输入装配 → 参考线 → EmPlanner 任务链 → 轨迹校验 → 降级兜底
+    PLG->>PLD: ADCTrajectory
+    PLD->>CTL: 发布 /planner/trajectory
+    CTL->>CH: /control/control_command
+    CH-->>FS: /canbus/car_state 状态回流闭环
+```
+
+**图 1-1 · 一帧约 0.1s 的端到端时序**（编号即执行顺序；参与者名中的 100ms/500ms/20ms 是各自的时间预算）
+
+**读图提示**：① PFD→PLG 有两条箭头：先发 4 路料、最后发触发——这就是 FrameDone 发布契约的图形化（§1 证据块）；② 两条 Note 行是各图内部的流水线（感知 4 步、规划 5 步），细节在各自模块系列文档；③ CH→FS 的回流边说明「车动了」会进入下一帧的感知输入，闭环由此形成。
 
 **各环节耗时预算/频率与数据依赖**：
 
@@ -30,6 +73,8 @@ tags:
 | 下一帧放行 | DRIVING 模式要求 `lidar_done && uni_model_done && ras_map_done`（trigger_next_frame 回边信用） | trigger_next_frame_calculator.cc L109-125（引自 Perception/05） |
 
 **数据依赖**：规划必需 `/perception/objects`(required,触发)、`/perception/traffic_lights_status`、`/map/ras_map_plus`、`/canbus/car_state`；控制必需 `/localization/pose`(触发)+`/planner/trajectory`(cache_size=1)；感知依赖 `/canbus/car_state`、`/map/ras_map_plus` 等与 `/planner/trajectory` 回灌（optional）。
+
+**为什么预算要这样分层**：感知 100ms 是「拍照节奏」——传感器最快也只能 10Hz 齐帧，再快没有意义；规划 500ms 是「解题时限」——比感知慢 5 倍，因为它要等感知结果才能开工，且 500ms 是监控阈值而非硬截止（超了先报警不杀帧，见 §6 Q1）；控制 20ms 最快，因为它不解题、只执行——把规划给的轨迹切成每秒 50 份实时微调，节奏必须比上游快一档，否则车会「一顿一顿」地走。三层节拍像三级传送带：上游慢而稳、下游快而准，咬合点就是 FrameDone 发布与 channel 队列。
 
 > 文件路径：/sandbox/driver/config/component/perception_graph_l2avp_orin.cfg  
 > 函数名：perception_frame_done（FrameDoneCalculator 节点）  
@@ -52,6 +97,10 @@ tags:
 ---
 
 ## 2. 关键路径调用栈
+
+**一句话结论**：16 步调用栈跨三个线程域——感知图池（优先级 6）→ 规划执行器（5）→ 控制线程（20ms）；看栈先认线程域，再对 §5.2 的线程表。
+
+**栈里出现的 AI 名词**：调用栈第 4 步的 uni_model 是神经网络推理（零基础解释见 [**AI 字典**](../../../正典阁/技术栈/AI/神经网络与推理引擎.md)），第 12 步 EmPlanner 任务链里的 DP_path/QP_path/iLQR 是三个递进的优化算法——DP 先粗解、QP 再精修、iLQR 最后打磨（见字典：[DP](../../../正典阁/技术栈/AI/动态规划%20DP.md)、[QP](../../../正典阁/技术栈/AI/二次规划%20QP.md)、[iLQR](../../../正典阁/技术栈/AI/iLQR%20与%20LQR.md)）。看不懂算法名不影响看懂调用栈——把每个任务当成流水线上的一个工位即可。
 
 端到端主路径（文字版，从传感器消息注入到控制指令下发，线程域标注）：
 
@@ -148,6 +197,16 @@ tags:
 
 ## 3. 数据一致性机制
 
+**一句话结论**：数据对齐三招——FrameSync 分桶管传感器、FindFirst/FindLast 管装配取数、最近邻 0.5s 容差管车况定位；缓存是容错的后备。
+
+**为什么需要专门讲数据对齐**：一帧内各路数据到达时间天然参差——12 路传感器各有各的时钟，规划需要的 4 路输入也可能前后脚。如果不对齐，就会出现「用 3 秒前的地图配 0.1 秒前的障碍物」的张冠李戴，规划基于错位数据解题，输出必然是错的。本节三招分别守住三道关：进图时分桶齐套（FrameSync）、装配时按语义取早/取晚（FindFirst/FindLast）、跨源匹配时卡时间容差（0.5s 最近邻）。
+
+> **📘 概念｜轨迹回灌（trajectory 回灌预测）**
+> **是什么**：规划每帧算出的 /planner/trajectory 除了发给控制，还回灌给感知（perception jsonnet 订阅 `type: optional`）：感知的预测模块把它当「自车未来轨迹」的先验——预测他车时把「我自己接下来怎么走」也算进去，判断交互冲突才更准。它是 optional 通道：断了不影响主链路，但预测会退化。
+> **类比与角色映射**：给自己报信——驾驶员告诉队友「我打算左转」：说话的人＝PlanningComponent（发 /planner/trajectory）；听的人＝感知预测（prediction，详见 [**Perception/子模块4**](../Perception/02_核心子模块拆解/子模块4：farseer%20子模块.md)）；听完干嘛＝盯梢「我变道时旁边那辆车会不会不让」；信断了＝队友瞎猜，照样开车只是心里没底。
+> **🎯 为什么这样设计**：交互式预测需要自车意图作条件输入——没有自车轨迹，预测只能按匀速外推他车，会漏掉「我让了他才不撞」的博弈场景；走 optional 而非 required，是因为这条信息锦上添花，不值得为它卡主链路。
+> **🗂 代码在哪里**：发布 planning_post_process_calculator.cc（[**公共 02 §3.2**](02%20模块配置与%20Topic%20数据流拓扑（C01%20-%20orinx）.md)）；订阅 perception_orin.jsonnet（type: optional，公共 02 §2.1 表）；消费感知预测子模块。
+
 ### 3.1 时间戳对齐：FrameSync 机制
 
 **FrameSyncCalculator** 对 12 路（1 lidar + 7 行车相机 + 4 环视）`framesync` 通道按 `frame_nano_base=100ms` 分桶；齐套立即出帧，超时（`frame_sync_timeout` 默认 100ms，tasks_config.proto default）由定时器注入 TIMEOUT 事件触发 `TimeoutAssemble` 残缺装配。放行受双闸门约束。
@@ -204,7 +263,7 @@ tags:
 
 ### 3.4 发布顺序契约：两个 FrameDoneCalculator
 
-感知图 `perception_frame_done`（OUTPUT:0~~4 契约见 §1 证据）与规划图 `planning_frame_done` 同用 FrameDoneCalculator::Process()：按 `topic_to_stream_id_` 把消息逐流发布（同 topic 多条时间戳 +i），末尾发自增帧号到 TRIGGER 回边。两者差异：\*\*感知的 OUTPUT 顺序是显式时序契约~~**~~（触发 topic 最后发）；~~**~~规划的 OUTPUT:0~~12 只是流编号\*\*，帧内实际发布顺序由输入 map 的遍历序决定（ Planning/05 标注为 topic 字典序，推断），规划触发是数据驱动的 IMMEDIATE 订阅，不依赖发布顺序。
+感知图 `perception_frame_done`（OUTPUT:0\~4 契约见 §1 证据）与规划图 `planning_frame_done` 同用 FrameDoneCalculator::Process()：按 `topic_to_stream_id_` 把消息逐流发布（同 topic 多条时间戳 +i），末尾发自增帧号到 TRIGGER 回边。两者差异：**感知的 OUTPUT 顺序是显式时序契约（触发 topic 最后发）；规划的 OUTPUT:0~12 只是流编号**，帧内实际发布顺序由输入 map 的遍历序决定（Planning/05 标注为 topic 字典序，推断），规划触发是数据驱动的 IMMEDIATE 订阅，不依赖发布顺序。
 
 > 文件路径：/sandbox/driver/config/component/planning_graph.cfg  
 > 函数名：planning_frame_done_node / planning_assemble_node  
@@ -225,6 +284,8 @@ tags:
 ---
 
 ## 4. 异常链路分析
+
+**一句话结论**：异常自保分三层——感知层超时残缺装配、规划层三级降级刹停、中间件层 FATAL 重启；AEB 独立成链是绕过规划的最后一道兜底。
 
 ### 4.1 感知异常：帧同步超时 / 无帧告警 / throttle FATAL
 
@@ -255,6 +316,8 @@ tags:
 > 逻辑说明：连续 10 次注入失败＝消费持续积压，宁可重启也不带病运行；成功注入即清零计数。FATAL 沿崩溃链路（刷日志→上报→退出）走，最终由 DrDEM 重启（§4.3）。
 
 ### 4.2 规划异常：输入缺失 → 任务失败降级 → 轨迹校验
+
+**为什么降级要分级而不是一刀切**：路径与速度是两个独立求解阶段——DP 定粗路径、QP 平滑、再解速度曲线，任何一环挂了只影响它负责的那一段：QP 挂了 DP 粗结果还能用，速度挂了路径还是对的只是要刹停。分级降级让系统「坏一部分只用一部分」，尽可能保住可执行性。
 
 - **必需输入缺失**：`traffic_lights_status`/`ras_map_plus` 缺失 → `InvalidArgumentError` 整帧失败，不产轨迹（planning_input_preprocess_calculator.cc L209-219/L629-639，见 Planning/06）；car_state NaN 跳过本帧（planning_core.cpp ValidateAndPreprocessInputs）。
 - **任务失败三级降级**（em_planner.cpp L685-719）：DP_path 失败①用 ACC 备份路径继续；②否则 `path_fallback=true` 且连带 `speed_fallback=true`；QP_path 失败沿用 DP 结果；速度任务失败 `speed_fallback=true`。
@@ -304,6 +367,8 @@ graph TB
     F[上游断流] --> G[WatchDog 1s WARN / ChannelSuspendAlarm 30s WARN] -->|人工/上层| E
 ```
 
+**图 4-1 · 崩溃自愈链**：任何 FATAL 都汇入「进程退出 → DEM 重启」的漏斗；断流告警（左侧支路）只 WARN 不重启，需人工或上层介入。
+
 ### 4.4 安全兜底：AEB 独立链路 / /safety/request
 
 - **AEB 独立于规划**：aeb.jsonnet 以 `/canbus/car_state` 为 trigger（IMMEDIATE），输入 `/perception_aeb/objects`（optional，感知 AEB 过滤链带状态码输出）与 `/planner/trajectory`（optional, cache 1，仅跟踪意图），输出 `/aeb/aeb_command`；`CbwCanbusComponent` 的 trigger_channels 同时含控制指令与 AEB 指令——**规划失效不清空 AEB 的触发路径**（cbw_canbus.jsonnet L10-18，本文验证）。
@@ -313,6 +378,8 @@ graph TB
 ---
 
 ## 5. 性能关键点
+
+**一句话结论**：CPU 1-5 是感知+规划的实时核（优先级 6>5>4），队列与背压参数全部有配置出处——性能排查先对本节四张表。
 
 ### 5.1 全链路耗时分布预算（配置值）
 
@@ -365,6 +432,8 @@ graph TB
 > 
 > 逻辑说明：图执行池 5 线程（线程名匹配 thread_config 的 pp/nn_pre/mediapipe 等），NN 内部专用执行器 `nn_internal_designated` 4 线程（前缀 nn\_）挂 `uni_model` 等推理节点（graph_l2avp_querytracker.cfg L1127 等处 `executor: "nn_internal_designated"`）；lom_infer 独立进程组件线程 t_lom_infer（SCHED_RR/4，CPU6-8）。
 
+**为什么 NN 要有专用线程池**：[**神经网络推理**](../../../正典阁/技术栈/AI/神经网络与推理引擎.md)是全链路最重的计算（图像点云进模型、出检测目标），主要跑在 GPU 上（喂料与预处理见 [**CUDA 与 GPU 预处理**](../../../正典阁/技术栈/AI/CUDA%20与%20GPU%20预处理.md)）——CPU 侧线程主要负责喂数据和收结果。给它单独划 4 个线程（nn_internal_designated），是为了让推理的调度不受其他 Calculator 争抢；`max_queue_size: 15` 的注释（camera syncer 曾阻塞故调大）则是真实踩过的坑：喂料队列太小，上游相机同步器被反压阻塞过。
+
 ### 5.4 背压与队列
 
 | 队列/闸门 | 值 | 效果 |
@@ -377,6 +446,29 @@ graph TB
 | planning fatal_on_stream_throttle | false | 积压只 WARN 不重启（感知默认 true） |
 
 ---
+
+## 6. FAQ 与自测
+
+**Q1（新手误解）：规划 500ms 预算超了会怎样？帧会被杀掉吗？**
+A：不会。`expected_proc_duration_ms: 500` 是超时监控阈值——超限仅上报 `CHURCH_PROC_TIMEOUT_EVENT`，不杀帧不重启（§1 预算表）。硬性自保是另一套：输入流积压 throttle 连续 10 帧达阈值才 FATAL 重启（§4.1），而 planning 显式关掉了 `fatal_on_stream_throttle`，积压只 WARN。
+
+**Q2：FrameSync 超时残缺装配，缺了数据的帧下游会不会算错？**
+A：会带着不完整数据算，但系统知道数据不齐——相机不全的帧被标注，输出时附加空 invisible_sector 告知规划（[**Perception/01 §4**](../Perception/01%20输入数据接入与预处理.md)）；点云缺失时 radar 的 NEAR 匹配退化为按帧号取最近（Perception/01 §2.3）。设计哲学是「残缺好过停摆」，且残缺对下游显式可见。
+
+**Q3：为什么规划失败不是「停车」，而是「发一条带标记的降级轨迹」？**
+A：控制层需要一个可执行轨迹才能闭环——彻底不发轨迹会让控制失去输入（§4.2「规划彻底失败」也只发空轨迹保档位）。降级轨迹 ＝ 刹停/保底速度曲线 + TrajectoryType 标记（PATH/SPEED_FALLBACK），控制照常执行刹停，安全层决定是否接管——宁可靠边停，不空中失联。
+
+**Q4：AEB 和规划都发制动指令，听谁的？**
+A：不是二选一：CbwCanbusComponent 的 trigger_channels 同时含 /control/control_command 与 /aeb/aeb_command（§4.4），两条指令都下发底盘；AEB 独立触发（车况 IMMEDIATE），规划失效不清空 AEB 的触发路径——它就是绕过规划的最后防线。
+
+**自测（能答上来才算读懂）**
+
+1. 一帧数据从传感器到方向盘，三个线程域的优先级分别多少？为什么感知最高？
+   （答：感知图池 SCHED_RR/6 > 规划 5 > lom_infer 4（§5.2）；感知是链路源头且 NN 推理最重，它的延迟会传导全链，所以优先级最高。）
+2. 规划的 FINISHED 回边（planning_done）起什么作用？
+   （答：帧级防重入——上一帧 prev_calc_finished_ 置位前 AnyCalculator 不装配下一帧，保证规划帧与帧严格串行（§3.4 证据块）。）
+3. 车况与定位的时间戳对不上怎么办？容差多少？
+   （答：最近邻匹配 + 0.5s 容差（kTimeDiffTolerance=500000 微秒，§3.2）：≤0.5s 用 Ins 位姿覆盖车况部分字段，超差打 WARN 保留底盘值。）
 
 ## 附：本文引用文件清单
 

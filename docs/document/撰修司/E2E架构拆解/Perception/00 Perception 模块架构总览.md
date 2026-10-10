@@ -1,7 +1,7 @@
 ---
 title: "00 Perception 模块架构总览"
 date: 2026-09-20
-description: "运行形态：C01（orinx 平台 C01PT，DEM 注入 /task/task_type=L2_driving）下，感知并非独立进程，而是 E2E 主进程 "
+description: "感知模块架构总览：单进程E2E下的图执行形态、子模块划分、数据流全景与初始化入口。"
 categories:
   - 撰修司
 tags:
@@ -9,7 +9,18 @@ tags:
   - E2E
 ---
 
-# 00 Perception 模块架构总览
+> **30 秒导读**：感知模块的地图：单进程 E2E 下感知怎么组织、子模块怎么分工、一帧数据从哪进从哪出。
+> **本篇回答**：感知内部有哪些"班底"？初始化从哪开始？数据流全景是什么样？
+> **先修阅读**：《00 入门》§2 与 §3。
+
+> **本篇概念速成块**（30 秒，读完再进正文不卡壳）：
+> - **church Component**：挂在 mainboard 里的业务插件——感知不是独立进程，是 E2E 主进程里和规划合租的一个组件（详见 [**公共 00 §1**](../00_公共基础文档/00%20架构总览与学习指南（C01%20-%20orinx）.md)）。
+> - **FRAMESYNC 触发**：拍合影的摄影师——12 路传感器同一帧（100ms）到齐才开工（完整卡片见 [**Perception/01 §2**](01%20输入数据接入与预处理.md)）。
+> - **两级图**：外层 church 图管「装配+发布」（跟框架打交道），内层算法子图管「检测+跟踪」（跟模型打交道）——工厂的收发部 + 生产线。
+> - **GraphManager**：感知图的总管——把图跑起来、每帧投料、等结果。
+> - **FrameDone**：交卷铃——每帧算完按 OUTPUT:0~18 固定顺序发布，OUTPUT:4 的 /perception/objects 最后发，是给规划的发令枪（完整卡片见 [**公共 02 §6.1**](../00_公共基础文档/02%20模块配置与%20Topic%20数据流拓扑（C01%20-%20orinx）.md)）。
+> - **trigger_next_frame 背压**：车间门口的闸机——上一帧没走完（lidar/uni_model/ras_map 三样没齐）不放下一帧进来。
+
 
 > 所属专项：C01 车型 E2E 架构拆解（子 Agent3-1：Perception 通用机制——总览/输入/输出）  
 > 基线分支：perception/driver 为 `Stable_Master_4.0_new`（当前检出即目标分支）；platform/church 仓库为 `dev_master`（该仓库无 `Stable_Master_4.0_new`，涉及 church 框架代码时以 dev_master 检出为准，下文不再重复标注）。  
@@ -19,7 +30,11 @@ tags:
 
 ## 1. 模块定位与职责
 
-感知模块负责把多传感器原始数据（点云、相机图像、雷达目标、超声波）与定位/地图/规划回灌信息，装配成一帧后送入深度学习推理与多模态融合，最终输出\*\*障碍物列表（PerceptionObstacles）**、**轻量栅格地图（RASMap）**、**红绿灯状态（TrafficLightResponse）\*\*等结构化结果，供下游规划（Planning）以 `/perception/objects` 作为触发源使用。
+**一句话结论**：感知＝「多传感器原始数据进、结构化障碍物/地图/红绿灯出」的加工厂——以 church 组件形态住在 mainboard 里，由两级图流水线驱动。
+
+**为什么说感知是「加工厂」**：传感器吐出来的原始数据是「生的」——图像只是一堆像素亮度值，点云只是一堆带距离的反射点，人眼能看懂但程序不能直接用。感知的职责就是把生料加工成「结构化的菜」：每个目标是什么（类别）、在哪里（3D 位置与框）、多大（尺寸）、往哪走（速度与预测轨迹），再打包成 proto 消息发给规划。规划拿到的是「语义清晰的清单」而不是原始素材——这就是「感知看、规划想」分工的物质基础。
+
+感知模块负责把多传感器原始数据（点云、相机图像、雷达目标、超声波）与定位/地图/规划回灌信息，装配成一帧后送入深度学习推理（「神经网络推理是怎么工作的」零基础解释见 [**AI 字典**](../../../正典阁/技术栈/AI/神经网络与推理引擎.md)）与多模态融合，最终输出**障碍物列表（PerceptionObstacles）**、**轻量栅格地图（RASMap）**、**红绿灯状态（TrafficLightResponse）**等结构化结果，供下游规划（Planning）以 `/perception/objects` 作为触发源使用。
 
 - 组件挂载证据：感知组件类继承自 `deeproute::church::Component`，并通过 `CHURCH_REGISTER_COMPONENT(PerceptionComponent)` 注册：
 
@@ -81,7 +96,13 @@ tags:
 
 ## 2. 子模块划分
 
+**一句话结论**：感知 ＝ 8 个算法子仓（专科工种）+ 一层顶层通用机制（公共设施）；哪些工种上岗由 L2AVP 配置的图节点说了算，不在图里就是「编外」。
+
 ### 2.1 submodules/ 下 8 个算法子仓
+
+**人话导览**：把 8 个子模块想成一支特种作业队——camera 是「眼睛」（看图像）、lidar 是「激光测绘员」（点云测距）、tracker 是「记账员」（给每个目标发工牌并一路跟踪）、farseer 是「外聘大模型专家」（本条产线暂未排班）、aeb 是「安全员」（独立算一套障碍物给紧急制动）、avp 是「泊车专员」（环视找车位）、perception_routing 是「地图接口员」（对接 map-engine 路由）、base 是「工具房」（大家都在这领数据结构和算子）。谁上没上岗，看 §3 流程图里有没有它的节点。
+
+**名词卡壳提示**：表里的 **BEV**（把多个相机的图像投影到车顶俯视图统一处理）是感知的通用表示方法，零基础解释见 [**AI 字典**](../../../正典阁/技术栈/AI/BEV%20鸟瞰图表示.md)；tracker「发工牌」背后是[**多目标跟踪 MOT**](../../../正典阁/技术栈/AI/多目标跟踪%20MOT.md)问题；「NN 推理」见[**神经网络与推理引擎**](../../../正典阁/技术栈/AI/神经网络与推理引擎.md)。各子模块的详细拆解见 02_核心子模块拆解 目录下的分册。
 
 | 子模块 | 一句话职责 | C01 L2AVP 链路是否启用 |
 |-|-|-|
@@ -146,6 +167,10 @@ aeb/camera/nn/vis 等]
     F -->|TRIGGER: perception_done 回环| B
 ```
 
+**图 3-1 · 感知一帧处理流水线**（A→F 为主链路，D 内部是内层算法子图，两条回环是帧间背压）
+
+**读图提示**：① 先看 F 节点的三条出边：OUTPUT:0~3 先行、OUTPUT:4 的 /perception/objects 最后发（规划触发源）、其余辅助输出——这就是 FrameDone 发布契约的图形化；② D 的两条回环（trigger_next_frame、perception_done）不是数据流，而是「上一帧没干完不放下一帧」的闸门信号；③ B→C 之间只隔一次「齐帧」，C 之后数据已解包成 PerceptionProcessInput，进 D 就完全是算法的事了。
+
 要点：
 
 - `trigger_next_frame`（`back_edge`）来自算法子图末端的 `TriggerNextFrameCalculator`——DRIVING 模式下需 lidar/uni_model/ras_map 三者完成才放行下一帧（/sandbox/perception/perception/calculators/trigger_next_frame_calculator.cc L109-115）；`perception_done` 来自 FrameDoneCalculator 的 TRIGGER 输出，两者共同构成外层图的帧间背压（perception_graph_l2avp_orin.cfg L82-92）。
@@ -154,6 +179,8 @@ aeb/camera/nn/vis 等]
 ---
 
 ## 4. 核心类图
+
+**一句话结论**：车端 church 模式走 Component→GraphManager 一条线（RosWrapper/PerceptionPipeline 是独立进程模式的对照组）；数据结构两端固定——PerceptionProcessInput 进、PerceptionProcessOutput 出。
 
 ```mermaid
 classDiagram
@@ -235,6 +262,8 @@ classDiagram
 
 ## 5. 与 Planning/中间件交互关系（Topic 表）
 
+**一句话结论**：感知对外的全部联系都写在 jsonnet 通道表里——订阅 30 余路（12 路 framesync 齐帧 + 一路 optional 回灌），发布以 /perception/objects 为发令枪；本节就是这张「通讯录」。
+
 church 模式下中间件发布路径：外层图输出流 → `GraphScheduler::RegisterPublishAsOutputStreamObserver` 注册的 Observer → `component->node()->PublishWithHeader(topic, msg)` 发往中间件（/sandbox/platform/church/graph/graph_scheduler.cc L277-320）。jsonnet 的 `output_channels` 定义 stream→topic 映射与 proto 类型。
 
 ### 5.1 感知输入（订阅）
@@ -242,7 +271,7 @@ church 模式下中间件发布路径：外层图输出流 → `GraphScheduler::
 | Topic | Proto | jsonnet 声明 type | 用途 |
 |-|-|-|-|
 | /sensors/lidar/combined_point_cloud_proto | deeproute.drivers.PointCloud2 | framesync（frame_nano_base=100000000） | 主点云，帧同步基准 |
-| /sensors/camera/camera_1~~6、traffic_2、panoramic_1~~4 \_raw_data_proto | deeproute.drivers.Image | framesync | 相机原始图 |
+| /sensors/camera/camera_1\~6、traffic_2、panoramic_1\~4 \_raw_data_proto | deeproute.drivers.Image | framesync | 相机原始图 |
 | /sensors/radar/combined_objects | deeproute.drivers.radar.Radar | near（near_topic=点云 topic） | 雷达目标，取时间戳最近 |
 | /localization/pose | deeproute.drivers.gnss.Ins | all_new | 定位姿态 |
 | /canbus/car_state | deeproute.common.VehicleState | all_new | 车辆状态 |
@@ -282,6 +311,10 @@ church 模式下中间件发布路径：外层图输出流 → `GraphScheduler::
 
 ## 6. 模块配置文件路径与初始化入口
 
+**一句话结论**：配置四层（组件声明→外层图→功能配置→内层子图），初始化四步（确定模式→解析配置→建图启动→注册订阅）；启动顺序固定为「先注册发布器、再 Init、最后挂订阅者」。
+
+**为什么要专门讲配置与初始化**：感知的初始化涉及四层配置，任何一层配错（图路径写错、发布器未注册、功能开关没开）都会在启动阶段爆发，而且报错信息往往不在感知代码里。记住这四层，遇到「进程起不来」「图起不来」就能按层排查：先查 jsonnet 声明，再查外层图 cfg，再查功能配置，最后查内层子图——而不是漫无目的地翻日志。
+
 ### 6.1 配置文件层级
 
 | 层级 | 文件 | 作用 |
@@ -308,10 +341,39 @@ church 模式下中间件发布路径：外层图输出流 → `GraphScheduler::
 
 ## 7. 与其他文档的阅读关系
 
+**一句话结论**：本篇是地图，01/05 是两条下钻隧道（输入侧/输出侧），公共篇是框架底座。
+
 - 《01_输入数据接入与预处理》（本文档系列）：外层图的装配与变换细节——FrameSync 机制、shm 解包、PerceptionProcessInput 组装、丢帧/乱序策略。建议作为本文档 §3/§6 的下钻。
 - 《05_输出发布与中间件交互》（本文档系列）：输出 Topic 全景、PerceptionObstacles/RASMap/TrafficLightResponse 的组装证据、FrameDoneCalculator 发布顺序契约、与 Planning 的触发协议。
+- 《[**08 一帧生命周期：感知与规划数据流全景**](../08%20一帧生命周期：感知与规划数据流全景.md)》（已迁至 E2E 根目录，感知+规划合篇）：把 01/05 两端与内层子图 34 节点串成一条线——感知 12 站流水线逐站输入/输出格式、uni_model 50 路输入分组、三道闸与两条回环、主干数据流速查表，并续写规划半场（触发→任务链→轨迹下发）与全帧乒乓闭环。想完整看懂一帧怎么流动优先读本篇。
 - 《00_公共基础文档》（专项公共篇）：church 组件生命周期、graphpipe/mediapipe 图模型、中间件 Topic 机制的通用说明。
 - Planning 侧文档（子 Agent3-2 交付）：planning_assemble_node 如何消费 /perception/objects，与本系列 §5.3 互为对照。
+
+---
+
+## 8. FAQ 与自测
+
+**Q1（新手误解）：感知模块是不是一个独立进程？要单独拉起一个 perception 进程吗？**
+不是。C01 上感知是 E2E 主进程 `perception mainboard` 里的一个 church 组件（PerceptionComponent），与 PlanningComponent、DataAgentRT 同进程共存（§1）；「感知独立进程」只存在于 ROS 模式（§6.3），C01 车端不使用，仅离线调试/rosbag 回放用。
+
+**Q2：外层图和内层算法子图为什么要分两级？**
+分工不同：外层图（perception_graph_l2avp_orin.cfg）负责跟框架打交道的「体力活」——帧同步、消息解包、输出发布；内层子图（PercepL2AvpSubgraph）负责纯算法编排——预处理、NN 推理、跟踪、预测（§1）。内层由构建系统 gen_subgraph 自动包装成一个普通 Calculator 嵌进外层，算法同学改算法图不用碰装配层。
+
+**Q3：farseer 子模块在 C01 L2AVP 链路里到底跑不跑？**
+配置证据层面未启用：graph_l2avp.cfg 的图节点里没有 farseer 节点（§2.1 标注「推断未直接启用」），它是 vision 模式方案的组成部分；确切结论需运行时验证，本篇只给证据边界。
+
+**Q4：t_perception 线程在逐帧处理数据吗？**
+不直接处理。graphpipe 模式下帧处理跑在图执行线程池里，t_perception 只是组件任务的登记线程（见 [**公共 00 §4 常见误区**](../00_公共基础文档/00%20架构总览与学习指南（C01%20-%20orinx）.md)、公共 05 §2 的线程域标注）。
+
+**自测**（答案在缩进行里）：
+1. 感知一帧的触发策略是什么？对应哪个配置字段？
+    答：FRAMESYNC——12 路传感器按 100ms 帧基齐帧后触发，字段是 perception_orin.jsonnet 的 `trigger_policy`（§1）。
+2. FrameDoneCalculator 的 OUTPUT:4 发的是什么？为什么它要最后发？
+    答：/perception/objects（规划触发源）；先发其余 4 路输入、最后发触发，保证规划被触发时输入已在队列里（§3、公共 02 §6.1）。
+3. kMaxFramesInFlight 是多少？它限制的是什么？
+    答：2——帧同步器最多允许 2 帧并行在途，是感知侧的背压上限（§3）。
+
+---
 
 ## 附：本文档引用文件清单
 
