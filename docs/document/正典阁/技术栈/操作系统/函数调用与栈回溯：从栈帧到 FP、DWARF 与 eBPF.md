@@ -130,7 +130,7 @@ target_compile_options(stack_demo PRIVATE
 | `-fno-optimize-sibling-calls` | 避免尾调用把一个调用帧“折叠掉” | 某个源码函数不形成物理栈帧 |
 | `-fno-inline` | 避免函数直接嵌入调用者 | 调用关系仍可在 DWARF inline 信息中出现，但栈上没有独立帧 |
 
-这里有一个工程取舍：帧指针会占用一个通用寄存器，关闭优化会严重影响性能，因此通常只在诊断构建、性能敏感度可接受的服务或特定模块启用。保留 `-g` 并不意味着必须把完整 debug info 装进最终镜像，可以按 Build ID 将 debug package 单独归档。
+这里有一个工程取舍：帧指针会占用一个通用寄存器，关闭优化会严重影响性能，因此通常只在诊断构建、性能敏感度可接受的服务或特定模块启用。保留 `-g` 并不意味着必须把完整 debug info 装进最终镜像，可以按 Build ID 将 debug package 单独归档（具体操作见 9.5 节）。
 
 ### 2.3 先观察三种视角下的同一条调用链
 
@@ -153,7 +153,49 @@ checksum, process, main
 
 以 Linux x86-64 System V ABI 为例。ABI 可以理解成编译器之间的合同：即使一个函数由 GCC 编译、另一个函数由 Clang 编译，只要都遵守合同，就能相互调用。
 
-### 3.1 调用前的约定
+### 3.1 先认识出场的寄存器
+
+在看“每条指令如何改变栈”之前，得先分清 CPU 手里有哪些状态。x86-64 有十几个通用寄存器，本文的故事只围绕其中一小部分。先记住一个总原则：**寄存器是 CPU 内部的存储格子，快但极少；栈是内存里的区域，大但慢。函数调用与返回，就是在寄存器和栈之间成对地“保存与恢复”。**
+
+| 寄存器 | 全称与常见用途 | 在本文中的角色 |
+| --- | --- | --- |
+| RIP（PC） | Instruction Pointer，指向下一条要执行的指令 | CPU 的进度条。程序无法直接给它赋值，只有 `call`/`ret`/`jmp` 等控制流指令能改写它 |
+| RSP | Stack Pointer，指向栈顶（当前最低的已占用地址） | 栈的游标。`push`/`pop`/`call`/`ret`/`leave` 都隐式移动它 |
+| RBP | Base Pointer，本例中被当作帧指针（FP） | 当前帧的“页眉”：`[RBP]` 永远是上一帧 FP，`[RBP+8]` 永远是返回地址 |
+| RAX | Accumulator，习惯存放函数返回值 | `checksum` 算完的结果 40 会放在这里，带回给 `process` |
+| RDI | 第 1 个整型参数寄存器 | `checksum(11)` 的参数 11 出发时就放在这里 |
+
+整型参数依次使用 `rdi, rsi, rdx, rcx, r8, r9`，第 7 个起才压栈；浮点参数走另一组 `xmm` 寄存器。本文只需要 `rdi` 和 `rax`。
+
+比名字更重要的是**保存责任**。ABI 把寄存器分成两派，这是理解“栈帧里为什么有保存区”的关键：
+
+| 派别 | 成员 | 合同条款 | 通俗理解 |
+| --- | --- | --- | --- |
+| caller-saved（易失） | `rax, rcx, rdx, rsi, rdi, r8-r11` | 调用者若在 `call` 之后还需要它，必须 `call` 前自己保存 | “借出去可能被弄脏，在乎就先抄一份” |
+| callee-saved（非易失） | `rbx, rbp, r12-r15` | 被调者想用就必须先压栈备份、返回前恢复 | “动用先押金，用完要赎回” |
+| 特殊 | `rsp` | 双方共同维护：进入与离开时必须复原 | “公共楼梯，谁走谁复原” |
+
+这张合同直接决定了栈帧的内容：`rbp` 属于 callee-saved，所以每个想用 FP 的函数序言都要 `push rbp`；需要跨调用存活的 caller-saved 值会出现在调用者的帧里。**后文每个时刻的示意图，请随时回来对照这张表，看清楚动的是哪个格子。**
+
+最后是栈本身。x86-64 的栈向低地址增长：
+
+```text
+高地址  ┌────────────────────────────┐
+        │ 旧数据 / 外层帧            │
+        ├────────────────────────────┤
+        │      ↓ 压栈方向 ↓          │   push：先 RSP = RSP - 8，再写入
+        ├────────────────────────────┤
+        │ 新数据 / 内层帧            │ <- RSP
+        └────────────────────────────┘
+低地址
+```
+
+两个原语贯穿全文：
+
+- `push src`：`RSP = RSP - 8`，然后把 `src` 写到 `[RSP]`。
+- `pop dst`：先把 `[RSP]` 读到 `dst`，然后 `RSP = RSP + 8`。
+
+### 3.2 调用前的约定
 
 当 `process(10)` 调用 `checksum(11)` 时，调用者 `process` 大致要完成：
 
@@ -170,9 +212,21 @@ checksum, process, main
 
 不是所有寄存器都需要保存。ABI 会区分 caller-saved（调用者若在意，调用前自己保存）和 callee-saved（被调者若要改，必须恢复）。这个合同使函数可以独立编译，也使异常处理器、调试器和回溯器有共同规则可依。
 
-### 3.2 `call` 做了什么
+把第 1 条约定落到寄存器上，就有了进入 `call` 之前的最后一个动作。从这里开始，本文用**编号时刻**逐帧跟踪一次完整调用，每个时刻都同时给出寄存器面板与栈图：
 
-在 x86-64 中，`call checksum` 的效果可以抽象为两步：
+#### 时刻 0：装载参数（示意 `mov edi, 11`）
+
+| 寄存器 | 执行前 | 执行后 | 说明 |
+| --- | --- | --- | --- |
+| RDI | 旧值 | 11 | 第 1 个整型参数就位（`x + 1` 的结果） |
+| RIP | 指向本条 `mov` | 指向 `call checksum` | 顺序推进 |
+| RSP / RBP | 不变 | 不变 | 装参数不需要动栈 |
+
+栈此刻没有任何变化，但出发前的行囊已经收拾完：`RDI` 带着参数，`RIP` 指向即将执行的 `call`。
+
+### 3.3 `call` 做了什么
+
+在 x86-64 中，`call checksum` 的效果可以抽象为三步：
 
 ```text
 1. RSP = RSP - 8
@@ -180,24 +234,48 @@ checksum, process, main
 3. RIP = checksum 的入口地址
 ```
 
-也就是说，`call` 自动把**返回地址**压入栈顶，再跳转。假设执行前：
+也就是说，`call` 自动把**返回地址**压入栈顶，再跳转。为了同时看到寄存器和栈的变化，先给出执行前的完整寄存器面板（此刻 `process` 已按 3.2 的约定把参数装好）：
 
 ```text
-RIP = 0x4011DB  （call checksum 所在位置）
-RSP = 0x7fff_ef90
+执行前寄存器面板：
+  RIP = 0x4011DB    （process 中 call checksum 这条指令本身）
+  RSP = 0x7fff_efc0 （process 栈帧的底部：局部空间分配完毕）
+  RBP = 0x7fff_efd0 （process 的锚点，指向保存的 main.RBP）
+  RDI = 11          （时刻 0 装好的第一个参数）
+  RAX = 旧值        （caller-saved，call 之后随时可能被覆盖）
 ```
 
-`call` 之后可能变为：
+#### 时刻 1：执行 `call checksum`
+
+寄存器面板逐项对照：
+
+| 寄存器 | 执行前 | 执行后 | 变化说明 |
+| --- | --- | --- | --- |
+| RIP | 0x4011DB | 0x401130 | 跳入 checksum 入口 |
+| RSP | 0x7fff_efc0 | 0x7fff_efb8 | 下移 8 字节：返回地址入栈 |
+| RBP | 0x7fff_efd0 | 0x7fff_efd0 | 不变：checksum 还没有自己的锚点 |
+| RDI | 11 | 11 | 不变：参数就位，等待被读取 |
+| RAX | 旧值 | 旧值 | 不变：返回值要等函数体算完 |
+
+此刻的栈，从 process 帧向下看：
 
 ```text
-RIP = 0x401130  （checksum 的入口）
-RSP = 0x7fff_ef88
-[0x7fff_ef88] = 0x4011E0  （process 中 call 之后继续执行的位置）
+高地址
+0x7fff_efd8  ┌─────────────────────────────────────┐
+              │ 返回到 main 的地址 0x401220         │
+0x7fff_efd0  ├─────────────────────────────────────┤ <- RBP = 0x7fff_efd0
+              │ 保存的 main.RBP = 0x7fff_f000       │
+0x7fff_efc8  ├─────────────────────────────────────┤
+              │ process 的局部变量 result            │
+0x7fff_efc0  ├─────────────────────────────────────┤
+              │ 0x4011E0：返回到 process 的地址     │ <- RSP（call 刚写入的返程票）
+              └─────────────────────────────────────┘
+低地址
 ```
 
-此时还没有“完整的新栈帧”；只有一张关键的返程票已经压入栈中。是否建立稳定的 FP 链，要看被调函数的序言（prologue）。
+注意两点。第一，`RBP` 仍指向 process 帧：此刻还没有“完整的新栈帧”，只有一张关键的返程票已经压入栈中；是否建立稳定的 FP 链，要看被调函数的序言（prologue）。第二，若异步采样恰好发生在这里，回溯器仍然可以从栈顶拿到返回地址，但没有 `checksum.RBP` 可用；FP 回溯需要知道当前 PC 正处于 prologue 的哪个阶段，这正是 DWARF CFI 的价值之一。
 
-### 3.3 典型函数序言如何建立栈帧
+### 3.4 典型函数序言如何建立栈帧
 
 为了讲解清晰，假设 `checksum()` 生成如下近似汇编：
 
@@ -211,98 +289,160 @@ checksum:
     ret                     ; pop RIP，跳回 process
 ```
 
-下面逐条画出变化。栈向低地址增长，因此图的下方是更新、更内层的栈内容。
+下面把序言拆成单步，每一步同时观察寄存器面板和栈。栈向低地址增长，因此图的下方是更新、更内层的栈内容。
 
-#### 时刻 A：`process` 即将调用 `checksum`
+#### 时刻 2：执行 `push rbp`
 
-```text
-高地址
-0x7fff_f000  ┌─────────────────────────────────────┐
-              │ process 的局部变量 result（未赋值）│
-0x7fff_efc8  ├─────────────────────────────────────┤
-              │ 返回到 main 的地址                 │
-0x7fff_efc0  ├─────────────────────────────────────┤ <- RBP = 0x7fff_efc0
-              │ 保存的 main.RBP = 0x7fff_f000      │
-0x7fff_efb8  ├─────────────────────────────────────┤
-              │ process 自己的局部空间/对齐填充    │
-              └─────────────────────────────────────┘ <- RSP（示意）
-低地址
-```
+CPU 动作：`RSP = RSP - 8`，再把旧 `RBP`（0x7fff_efd0）写入新栈顶。这就是 3.1 合同的落实动作：`rbp` 属于 callee-saved，`checksum` 想拿它当锚点，必须先替 `process` 保住它的值。
 
-#### 时刻 B：执行 `call checksum`
-
-`call` 把“回到 process 的下一条指令”压入栈：
+| 寄存器 | 执行前 | 执行后 | 说明 |
+| --- | --- | --- | --- |
+| RSP | 0x7fff_efb8 | 0x7fff_efb0 | 下移 8 字节，saved FP 入栈 |
+| RBP | 0x7fff_efd0 | 0x7fff_efd0 | 仍是 process 的；本步只是把它抄进栈 |
+| RIP | - | 指向下一条 `mov rbp, rsp` | 顺序推进 |
 
 ```text
-高地址
-              │ ... process 原有栈帧 ...           │
-0x7fff_ef90  ├─────────────────────────────────────┤
-              │ 0x4011E0：返回到 process 的地址    │ <- RSP
-              └─────────────────────────────────────┘
-低地址
-```
-
-此刻 `RIP` 已跳进 `checksum`。若异步采样恰好发生在这里，回溯器仍然可以从栈顶拿到 process 的返回地址，但没有 `checksum.RBP` 可用，FP 回溯需要知道当前 PC 正处于 prologue 的哪个阶段；这正是 DWARF CFI 的价值之一。
-
-#### 时刻 C：执行 `push rbp; mov rbp, rsp`
-
-```text
-高地址
-              │ ... process 的局部变量 ...         │
-0x7fff_efc8  ├─────────────────────────────────────┤
-              │ 返回到 main 的地址                 │
-0x7fff_efc0  ├─────────────────────────────────────┤
-              │ 保存的 main.RBP = 0x7fff_f000      │
-0x7fff_efb8  ├─────────────────────────────────────┤ <- process.RBP
+0x7fff_efb8  ┌─────────────────────────────────────┐
               │ 返回到 process 的地址 0x4011E0     │
-0x7fff_efb0  ├─────────────────────────────────────┤ <- checksum.RBP = checksum.RSP
-              │ 保存的 process.RBP = 0x7fff_efc0   │
+0x7fff_efb0  ├─────────────────────────────────────┤ <- RSP（新）
+              │ 保存的 process.RBP = 0x7fff_efd0   │ <- 本步新压入
               └─────────────────────────────────────┘
-低地址
 ```
 
-现在形成了经典 FP 链：`checksum.RBP` 指向一个单元，其中存有 `process.RBP`；而紧邻的 `checksum.RBP + 8` 是返回到 `process` 的地址。
+#### 时刻 3：执行 `mov rbp, rsp`
 
-#### 时刻 D：执行 `sub rsp, 0x20` 并运行函数体
+CPU 动作：`RBP = RSP`。只动一个寄存器，却是整个 FP 链的奠基一步：从这条指令起，`RBP = 0x7fff_efb0` 成为 `checksum` 栈帧的稳定锚点。此后无论 `RSP` 怎么移动，`[RBP]` 永远是上一帧 FP，`[RBP+8]` 永远是返回地址。
+
+| 寄存器 | 执行前 | 执行后 | 说明 |
+| --- | --- | --- | --- |
+| RBP | 0x7fff_efd0 | 0x7fff_efb0 | 锚点切换：checksum.RBP 正式就位 |
+| RSP | 0x7fff_efb0 | 0x7fff_efb0 | 不变 |
+| RIP | - | 指向下一条 `sub rsp, 0x20` | 顺序推进 |
+
+栈内容与时刻 2 完全相同，但 `RBP` 现在指向了栈中那行 saved FP：
+
+```text
+0x7fff_efb8  ┌─────────────────────────────────────┐
+              │ 返回到 process 的地址 0x4011E0     │ <- [RBP + 8]
+0x7fff_efb0  ├─────────────────────────────────────┤ <- RBP = RSP = 0x7fff_efb0
+              │ 保存的 process.RBP = 0x7fff_efd0   │ <- [RBP + 0]
+              └─────────────────────────────────────┘
+```
+
+经典 FP 链的两个格子就此就位。
+
+#### 时刻 4：执行 `sub rsp, 0x20`
+
+CPU 动作：`RSP = RSP - 0x20`。只为局部变量、溢出参数和后续调用预留空间，不写任何数据。`RBP` 纹丝不动。
+
+| 寄存器 | 执行前 | 执行后 | 说明 |
+| --- | --- | --- | --- |
+| RSP | 0x7fff_efb0 | 0x7fff_ef90 | 下移 0x20，预留区开张 |
+| RBP | 0x7fff_efb0 | 0x7fff_efb0 | 不变：锚点将贯穿整个函数 |
+| RIP | - | 指向函数体第一条指令 | 序言结束 |
 
 ```text
 高地址
-              │ ... process 的栈帧 ...             │
+0x7fff_efd8  ┌─────────────────────────────────────┐
+              │ 返回到 main 的地址 0x401220         │
+0x7fff_efd0  ├─────────────────────────────────────┤ <- process.RBP = 0x7fff_efd0
+              │ 保存的 main.RBP = 0x7fff_f000       │
+0x7fff_efc8  ├─────────────────────────────────────┤
+              │ process 的局部变量 result            │
+0x7fff_efc0  ├─────────────────────────────────────┤
+              │ （process 预留区的下沿）             │
 0x7fff_efb8  ├─────────────────────────────────────┤
               │ 返回到 process 的地址 0x4011E0     │
 0x7fff_efb0  ├─────────────────────────────────────┤ <- RBP，整个函数期间保持稳定
-              │ 保存的 process.RBP = 0x7fff_efc0   │
-0x7fff_efa8  ├─────────────────────────────────────┤
-              │ padding / 对齐                      │
-0x7fff_ef90  ├─────────────────────────────────────┤
-              │ local（或编译器给 local 分配的位置）│
+              │ 保存的 process.RBP = 0x7fff_efd0   │
               ├─────────────────────────────────────┤
-              │ 临时值、溢出参数、保存寄存器等     │
-0x7fff_ef90  └─────────────────────────────────────┘ <- RSP（示意）
+              │ checksum 新预留的 0x20 字节          │
+0x7fff_ef90  └─────────────────────────────────────┘ <- RSP
 低地址
 ```
 
-严格来说，局部变量是否真的在栈上、具体偏移是多少，完全由编译器决定；`volatile` 和 `-O0` 只是让本教程中的情形更容易观察。回溯并不需要理解每个局部变量，它首先只需要能找回“上一帧在哪里”和“应该返回到哪条指令”。
+严格来说，局部变量是否真的在栈上、具体偏移是多少，完全由编译器决定；`volatile` 和 `-O0` 只是让本教程中的情形更容易观察。
 
-### 3.4 返回过程：`leave; ret` 如何撤销这一帧
+#### 时刻 5：函数体运行：写入 `local`，产出返回值
 
-`leave` 等价于：
+函数体不是一条指令，但对寄存器和栈的改动只有两类：往预留区写数据，以及把最终结果放进 `RAX`。设参数 `x = 11`：
 
-```asm
-mov rsp, rbp   ; 丢弃 checksum 的局部空间
-pop rbp        ; 恢复 process 的 RBP
-```
-
-随后 `ret` 等价于：
+| 寄存器 | 变化 | 说明 |
+| --- | --- | --- |
+| RDI | 11（读完即可复用） | 参数已抄写进栈，使命完成 |
+| RSP | 0x7fff_ef90（不变） | 函数体内不再移动 |
+| RBP | 0x7fff_efb0（不变） | 锚点稳定，回溯随时可用 |
+| RAX | 旧值 → 40 | `local + 7` 的结果就位，等待返回 |
+| RIP | 在 checksum 内逐条推进 | 此刻停在 `return local + 7` 对应的指令上 |
 
 ```text
-RIP = [RSP]    ; 取出 0x4011E0
-RSP = RSP + 8
+0x7fff_efa8  ┌─────────────────────────────────────┐
+              │ local = 33                          │ <- 函数体写入的数据（示意偏移）
+              ├─────────────────────────────────────┤
+              │ 其余预留区：参数副本、临时值等      │
+0x7fff_ef90  └─────────────────────────────────────┘ <- RSP
 ```
 
-控制权回到 `process` 中 `call checksum` 之后的位置，`process` 才能把返回值乘以 2。换句话说，栈帧是严格后进先出（LIFO）的：最后调用的 `checksum` 必须最先撤销。
+此刻调用链 `main -> process -> checksum` 的每张便签都写好了。若采样发生在这里，寄存器面板是：`RIP = checksum + 0x18（示意）`、`RSP = 0x7fff_ef90`、`RBP = 0x7fff_efb0`、`RAX = 40`。第 5、6、7 节的三种回溯方法，都从这个面板出发。
 
-### 3.5 同样的概念在 AArch64 上有什么不同
+回溯并不需要理解每个局部变量，它首先只需要能找回“上一帧在哪里”和“应该返回到哪条指令”。
+
+### 3.5 返回过程：`leave; ret` 如何逐条撤销这一帧
+
+返回是调用的镜像：`leave` 由两条指令组成，`ret` 再补一步。继续逐时刻观察。
+
+#### 时刻 6：`leave` 第一步：`mov rsp, rbp`
+
+CPU 动作：`RSP = RBP = 0x7fff_efb0`。一步把 `RSP` 拉回锚点，`checksum` 的整个预留区被“整体作废”——数据其实还在内存里，只是已退出栈的有效范围，后续的新调用会覆盖它们。
+
+| 寄存器 | 执行前 | 执行后 | 说明 |
+| --- | --- | --- | --- |
+| RSP | 0x7fff_ef90 | 0x7fff_efb0 | 预留区坍缩，回到锚点 |
+| RBP | 0x7fff_efb0 | 0x7fff_efb0 | 不变 |
+
+```text
+0x7fff_efb8  ┌─────────────────────────────────────┐
+              │ 返回到 process 的地址 0x4011E0     │
+0x7fff_efb0  ├─────────────────────────────────────┤ <- RSP = RBP
+              │ 保存的 process.RBP = 0x7fff_efd0   │ <- 即将弹出
+              └─────────────────────────────────────┘
+```
+
+#### 时刻 7：`leave` 第二步：`pop rbp`
+
+CPU 动作：`RBP = [RSP]`（取回 `process` 的锚点），然后 `RSP = RSP + 8`。
+
+| 寄存器 | 执行前 | 执行后 | 说明 |
+| --- | --- | --- | --- |
+| RBP | 0x7fff_efb0 | 0x7fff_efd0 | 归还：恢复为 process 的锚点 |
+| RSP | 0x7fff_efb0 | 0x7fff_efb8 | 越过 saved FP，恰好停在返程票上 |
+
+```text
+0x7fff_efb8  ┌─────────────────────────────────────┐ <- RSP
+              │ 返回到 process 的地址 0x4011E0     │ <- ret 的目标
+              └─────────────────────────────────────┘
+```
+
+#### 时刻 8：`ret`
+
+CPU 动作：`RIP = [RSP] = 0x4011E0`，然后 `RSP = RSP + 8`。
+
+| 寄存器 | 执行前 | 执行后 | 说明 |
+| --- | --- | --- | --- |
+| RIP | `ret` 指令地址 | 0x4011E0 | 回到 process 中 call 之后 |
+| RSP | 0x7fff_efb8 | 0x7fff_efc0 | 返程票出栈，栈回到 call 前的形状 |
+| RAX | 40 | 40 | 返回值原地等待 process 读取 |
+
+```text
+0x7fff_efc0  ┌─────────────────────────────────────┐ <- RSP（与时刻 1 之后的 RSP 相同）
+              │ 0x7fff_efb8 起的旧内容已失效       │
+              └─────────────────────────────────────┘
+RIP -> 0x4011E0：process 继续执行 result * 2，从 RAX 取走 40，得到 80。
+```
+
+对照时刻 1 的面板：`RSP` 与 `RBP` 精确回到了调用前的值，`RAX` 携带着结果。这就是“栈帧是严格后进先出（LIFO）”的含义：最后调用的 `checksum` 必须最先撤销；任何一步少弹或多弹 8 字节，返回后一切立即错位。
+
+### 3.6 同样的概念在 AArch64 上有什么不同
 
 不要把 x86 的 `call` 压栈行为误当成普遍规律。在 AArch64 上：
 
@@ -369,13 +509,14 @@ FP 回溯是最容易在纸上执行的方法。它不需要理解每一条机�
 ```text
 地址              内容                              所属帧
 ────────────────────────────────────────────────────────────────────
-0x7fff_efb0       0x7fff_efc0  = process.RBP       checksum: saved FP
+0x7fff_efb0       0x7fff_efd0  = process.RBP       checksum: saved FP
 0x7fff_efb8       0x0000004011e0 = 返回到 process  checksum: return address
                   ↑
                   checksum.RBP = 0x7fff_efb0
 
-0x7fff_efc0       0x7fff_f000  = main.RBP          process: saved FP
-0x7fff_efc8       0x000000401220 = 返回到 main     process: return address
+0x7fff_efc8       （process 的局部变量，不参与 FP 链）
+0x7fff_efd0       0x7fff_f000  = main.RBP          process: saved FP
+0x7fff_efd8       0x000000401220 = 返回到 main     process: return address
 
 0x7fff_f000       0x00007fff_f120 = libc 的 FP      main: saved FP
 0x7fff_f008       0x00007f... = 返回到 libc/start  main: return address
@@ -398,7 +539,7 @@ RSP = 0x7fff_ef90
 1. **当前帧**：先把 `RIP=0x401148` 记录为第 0 帧。这个 PC 属于 `checksum`。
 2. **读当前 FP**：`fp = RBP = 0x7fff_efb0`。
 3. **读返回地址**：`ra = *(fp + 8) = *(0x7fff_efb8) = 0x4011e0`。这个地址属于 `process`。
-4. **读上一帧 FP**：`next_fp = *fp = *(0x7fff_efb0) = 0x7fff_efc0`。
+4. **读上一帧 FP**：`next_fp = *fp = *(0x7fff_efb0) = 0x7fff_efd0`。
 5. **推进**：把 `PC=ra`、`FP=next_fp`，重复第 2 到第 4 步。
 6. 最终得到地址栈：`0x401148, 0x4011e0, 0x401220, ...`，再交给符号化阶段显示 `checksum, process, main, ...`。
 
@@ -425,6 +566,48 @@ flowchart TD
     F -- 是 --> C
     F -- 否 --> G[得到 checksum <- process <- main]
 ```
+
+#### 逐步图示：游标如何沿链移动
+
+把回溯器想象成一只手，它每推进一帧只做“两次读、一次跳”。下图把每一步的读取对象直接标在链上：
+
+```text
+步骤 1  游标就位：fp = RBP = 0x7fff_efb0
+        读 [fp + 8]：得 0x4011e0            -> 记为下一帧的 PC（属于 process）
+
+        0x7fff_efb0 ┌────────────────┐
+                    │ 0x7fff_efd0    │ ----- 步骤 2 读它（next_fp）
+                    ├────────────────┤
+                    │ 0x0000004011e0 │ <--- 步骤 1 读它（ra）
+                    └────────────────┘
+                      fp = 0x7fff_efb0
+
+步骤 2  读 [fp]：得 0x7fff_efd0              -> 下一帧的 FP
+
+步骤 3  游标跳到 process 帧：fp = 0x7fff_efd0，PC = 0x4011e0
+        重复“两次读”：ra = [fp+8] = 0x401220（属于 main）
+                      next_fp = [fp] = 0x7fff_f000
+
+        0x7fff_efd0 ┌────────────────┐
+                    │ 0x7fff_f000    │ ----- main.RBP（下一个游标）
+                    ├────────────────┤
+                    │ 0x000000401220 │ <--- process 帧的 ra
+                    └────────────────┘
+                      fp = 0x7fff_efd0
+
+步骤 4  游标跳到 main 帧：fp = 0x7fff_f000，PC = 0x401220
+        继续同样两次读，直到某次读出的 FP 或返回地址无效为止。
+```
+
+三轮循环后，回溯器手里的地址序列是：
+
+```text
+0x401148（checksum+0x18，来自采样时的 RIP）
+0x4011e0（process+0x30，来自 [fp+8]）
+0x401220（main+0x20，来自 [fp'+8]）
+```
+
+整个过程没有读 `RSP`，没有读局部变量，也没有查任何表——FP 法的全部证据就是链上每个格子里并排存放的两个指针。这也是它“快”与“脆”同源的原因：读得少所以快；格子一旦被写坏，就没有第二份证据可校验。
 
 ### 5.3 FP 回溯为什么快
 
@@ -524,23 +707,67 @@ RSP = 0x7fff_ef90
 RBP = 某个普通工作寄存器，不可信
 ```
 
-解析器查到 `checksum+0x18` 的 CFI 规则：
+与 FP 法最大的不同从这里就能看出来：DWARF 方法**不使用 `RBP`**。它只信两样东西——PC（用来查规则表）和 RSP（用来定位栈）。`RBP` 哪怕正被拿去存中间计算结果，也丝毫不影响回溯。下面把一次完整回溯拆成三个步骤。
+
+#### 步骤 1：用 PC 查规则表
+
+CFI 在二进制里是一张按 PC 区间组织的规则表。真实的 `.eh_frame` 是压缩编码，这里展开成概念形态：
 
 ```text
-CFA = RSP + 0x30 = 0x7fff_efc0
+.eh_frame 规则表（节选）
+┌────────────────────────┬──────────────────┬───────────────┐
+│ PC 区间                │ CFA 规则         │ 返回地址位置  │
+├────────────────────────┼──────────────────┼───────────────┤
+│ checksum+0x00 .. +0x04 │ CFA = rsp + 0x08 │ [CFA - 8]     │
+│ checksum+0x04 .. +0x30 │ CFA = rsp + 0x30 │ [CFA - 8]     │ <- 命中
+│ process+0x00 .. +0x04  │ CFA = rsp + 0x08 │ [CFA - 8]     │
+│ process+0x04 .. +0x38  │ CFA = rsp + 0x28 │ [CFA - 8]     │
+└────────────────────────┴──────────────────┴───────────────┘
+```
+
+`PC = checksum + 0x18` 落在第二行：此刻函数已完成栈调整，`CFA` 要按调整后的 `rsp` 反推。第一行对应“刚进入函数、栈还没动”的窗口期。**同一个函数在不同指令位置允许有不同规则**——这是 FP 法做不到的：FP 法只有一个静态假设，CFI 有逐指令的动态规则。
+
+顺带一提，两个 `checksum` 区间的系数不同（+0x08 与 +0x30），对应 6.1 里 `sub rsp, 0x28` 前后的 `rsp` 位移；`rsp + 0x30` 恰好等于 CFA，是编译器逐条指令记录的结果，不是巧合。
+
+#### 步骤 2：计算 CFA，在栈上定位返程票
+
+把命中规则代入当前 `RSP`：
+
+```text
+CFA = RSP + 0x30 = 0x7fff_ef90 + 0x30 = 0x7fff_efc0
 RA  = memory[CFA - 8] = memory[0x7fff_efb8] = 0x4011e0
-caller.RSP = CFA = 0x7fff_efc0
 ```
 
-于是可以恢复：
+把 CFA 画在栈上看得更清楚——它就是“调用发生前，调用者的栈顶”：
 
 ```text
-当前：checksum + 0x18
-调用者 PC：0x4011e0（process）
-调用者 SP：0x7fff_efc0
+高地址
+0x7fff_efd8  ┌─────────────────────────────────────┐
+              │ 返回到 main 的地址 0x401220         │
+0x7fff_efd0  ├─────────────────────────────────────┤ <- process.RBP
+              │ 保存的 main.RBP = 0x7fff_f000       │
+0x7fff_efc8  ├─────────────────────────────────────┤
+              │ process 的局部变量 result            │
+0x7fff_efc0  ┝━━━━━━━━ CFA = 0x7fff_efc0 ━━━━━━━━━━┥ <- call 前 process 的 RSP
+              │ 返回到 process 的地址 0x4011E0     │ <- [CFA - 8]，即 RA
+0x7fff_efb8  ├─────────────────────────────────────┤
+              │                                      │
+              │ checksum 预留区（无 saved FP）      │
+0x7fff_ef90  └─────────────────────────────────────┘ <- RSP = 0x7fff_ef90
+低地址
 ```
 
-接着用 `process` 的返回地址范围再查它自己的 CFI，反复执行。你会发现它从不依赖 `rbp` 是不是 FP；只要 CFI 正确，就能跨越不同函数各异的栈布局。
+于是恢复出上一帧的两个关键量：
+
+```text
+当前帧：checksum + 0x18
+调用者 PC：0x4011e0（process）
+调用者 RSP：CFA - 8 = 0x7fff_efb8（x86-64 的返回地址占 8 字节，弹出后才是 caller 视角的栈顶）
+```
+
+#### 步骤 3：以上一帧的输出为下一帧的输入，循环推进
+
+`RA = 0x4011e0` 落在 `process` 的 PC 区间，于是改查 `process` 的规则行，用刚恢复的 `process.RSP` 重复步骤 1、2，得到 `main` 的返回地址，如此往复，直到某一帧没有 CFI 或到达栈底为止。
 
 ```mermaid
 flowchart TD
@@ -552,6 +779,8 @@ flowchart TD
     F -- 是 --> B
     F -- 否 --> G[停止并输出已恢复帧]
 ```
+
+你会发现它从不依赖 `rbp` 是不是 FP；只要 CFI 正确，就能跨越不同函数各异的栈布局——甚至能自由穿过“一半函数保留 FP、另一半省略 FP”的混合栈。这个循环里每推进一帧，输入都换成上一帧的输出（新 PC 与新 RSP），规则表按帧所属函数轮换；“查表 → 计算 → 换输入”，就是 DWARF 回溯的全部。
 
 ### 6.3 `.eh_frame`、`.debug_frame` 与“DWARF 能做什么”
 
@@ -646,6 +875,43 @@ sequenceDiagram
     Sym-->>Agent: 函数名或保留 binary+offset
     Agent-->>Agent: 写 folded 栈/发送 profile
 ```
+
+#### 逐步图示：数据形态的三次变化
+
+与时序图对应，一次采样里的数据一共变形三次：从活内存变成地址数组，从地址数组变成 map 条目，再从 map 条目变成符号化的输入。
+
+**第 1 变：内核展开——活栈凝固成地址数组。** 采样发生时，CPU 正在 `checksum` 里执行，栈和寄存器都是“活”的。内核 helper 在 perf event 上下文中把当前栈从栈顶向外层逐帧展开，只保留地址，丢弃其余一切：
+
+```text
+采样瞬间的栈（活内存）            展开后的地址数组（概念）
+┌────────────────────┐
+│  ... 内核栈帧 ...  │            [k] entry_SYSCALL_64+0x70
+├────────────────────┤  ──内核展开──>  [u] 0x555555555148（checksum+0x18）
+│  RA: 0x...5551e0   │               [u] 0x5555555551e0（process+0x30）
+│  saved FP/局部值   │               [u] 0x555555555220（main+0x20）
+│  （其余现场数据）  │               （以 0 终止，或按深度上限截断）
+└────────────────────┘
+```
+
+**第 2 变：写入 BPF map——数组获得一个数字身份。** BPF 程序把数组交给 `BPF_MAP_TYPE_STACK_TRACE`，换回一个 stack ID；再在计数 map 里给这次的组合键 +1。注意 map 里没有任何函数名，也没有 `/proc` 路径：
+
+```text
+stack_traces:
+  391 -> [0x555555555148, 0x5555555551e0, 0x555555555220, 0, ...]
+
+stack_counts:
+  key = (tgid=4242, comm="stack_demo", user_stack_id=391, kstack_id=...)  -> count++
+```
+
+**第 3 变：用户态解读——数字变回模块与符号。** 采集器稍后按 ID 取回数组，对每个地址查 `/proc/4242/maps` 做归属，再进入第 9 节的符号化流程：
+
+```text
+0x555555555148 --maps--> stack_demo 的 r-xp 区间 --ELF--> checksum+0x18
+0x5555555551e0 --maps--> stack_demo 的 r-xp 区间 --ELF--> process+0x30
+0x555555555220 --maps--> stack_demo 的 r-xp 区间 --ELF--> main+0x20
+```
+
+三次变形各丢一部分信息：第 1 变丢掉寄存器与非地址数据，第 2 变把形状相同的栈折叠成同一个 ID 以省空间，第 3 变受制于 maps 与 ELF 是否还在、是否 strip。当 profile 出现“变浅、变乱、只剩 binary+offset”的现象时，应回到这三次变化里定位信息丢在哪一步。
 
 ### 7.4 深度限制和数据质量
 
@@ -752,21 +1018,89 @@ flowchart LR
 
 ### 9.2 为什么还要区分 PIE、共享库和 ELF 的 load segment
 
-`file_offset` 已经足以解释很多 profile 文本中的 `binary+0x...`。但符号表 `st_value` 使用的是 ELF 虚拟地址坐标，而不是永远等于文件偏移。因此通用符号化器还必须考虑 ELF 类型和 `PT_LOAD` 段：
+`file_offset` 已经能解释很多 profile 文本里的 `binary+0x...`，那为什么符号化器还要多走一步，关心 ELF 类型和 `PT_LOAD` 段？要回答“为什么”，得先接受一个事实：**回溯器给出的地址，和符号表里登记的地址，本来就是两套坐标系，平时并不相等。**
 
-| ELF 类型 | 常见对象 | 特点 | 地址归一化要点 |
-| --- | --- | --- |
-| `ET_EXEC` | 非 PIE 主程序 | 链接时已有固定虚拟地址布局 | 需要考虑最小 load virtual address |
-| `ET_DYN` | `.so`，以及多数 PIE 主程序 | 运行时加载基址随机化 | 从 runtime address 扣除实际映射基址并对齐段偏移 |
-| `ET_REL` | `.o` 目标文件 | 尚未完成运行时装载 | 通常不直接作为进程映射符号化对象 |
+#### 前因：两套坐标系是怎么脱节的
 
-FlameCraft 的查询侧 `NormalizeAddress()` 会依据 mapping 的 start/limit/offset 与 ELF program header 计算 base，再执行：
+回溯器拿到的是**运行时虚拟地址**——进程地址空间里此刻真实生效的地址，包含动态装载造成的偏移。而符号表 `.symtab`/`.dynsym` 中每个函数的 `st_value` 是**链接时虚拟地址**——链接器当年摆放函数时使用的坐标。同一个 `checksum`，两种坐标可能完全不同：
 
 ```text
-symbol_address = runtime_address - base
+链接器视角（ELF 文件内）：        运行时视角（进程地址空间内）：
+
+ET_EXEC 非 PIE 主程序：            内核固定装到链接地址，无重定位
+  st_value = 0x401148                runtime = 0x401148          恰好相等
+
+ET_DYN（.so 与 PIE 主程序）：      链接时一切从 0 计，装载时才定基址
+  st_value = 0x1148                  runtime = 0x555555555148    差一个加载基址
 ```
 
-这个看起来不起眼的步骤决定了“拿到了正确 ELF 却查不到符号”的问题能否被避免。ASLR 只改变运行时装载位置，不会改变函数在 ELF 内的相对位置；归一化正是在剥离 ASLR。
+对 `ET_DYN`，链接器把整个文件当作“从地址 0 开始”来布局；真实基址由内核和动态链接器装载时才决定，ASLR 还会让它每次运行都不同。两套坐标之间隔着一个**加载基址**（load bias）。直接拿运行时地址去符号表二分查找，对 `.so` 几乎必然查空。
+
+那么“改用 `file_offset` 查符号表行不行”？——这正是最容易掉进去的坑。`file_offset` 回答“这个字节在**文件**里的哪里”，符号表的 `st_value` 回答“函数被链接到**虚拟地址**的哪里”。两套答案之间没有恒等关系，只有一条由 `PT_LOAD` 段定义的换算规则：
+
+```text
+虚拟地址 = file_offset - p_offset + p_vaddr
+（p_offset、p_vaddr 是覆盖该 file_offset 的那个 PT_LOAD 段声明的属性）
+```
+
+`PT_LOAD` 是 ELF 程序头里的“装载图纸”：每个可装载段声明“把我文件偏移 `p_offset` 起的内容，装到虚拟地址 `p_vaddr` 处”。**这份图纸在不同二进制上形状不同**，这才是必须区分三种情形的根本原因：
+
+| 情形 | 典型对象 | 图纸的形状 | 直接拿 `file_offset` 查符号表的下场 |
+| --- | --- | --- | --- |
+| `ET_EXEC` | 非 PIE 主程序 | `p_vaddr` 常比 `p_offset` 大出一个固定基址（如 `0x400000`） | 系统性查空或命中错误符号：拿着 `0x1148` 找 `0x401148`，差 `0x400000` |
+| `ET_DYN`（x86-64 常见布局） | `.so` 与多数 PIE 主程序 | 首段 `p_vaddr == p_offset == 0`，此后逐段页对齐 | **碰巧查对**——最危险，因为长期掩盖模型错误，直到换一种二进制才爆发 |
+| `ET_DYN`（大页/特殊布局） | aarch64 64K 页构建、自定义 linker script | 段间 padding 使 `p_vaddr ≠ p_offset` | 系统性偏移一个 padding 量，每次都错、且错得“稳定” |
+
+第三行值得多看一眼。aarch64 上按 64K 大页对齐构建时，第二个 `PT_LOAD` 的文件偏移可能是 `0x1000`，虚拟地址却是 `0x10000`：`file_offset = 0x1abc` 的符号地址应为 `0x10abc`，直接拿 `0x1abc` 查表就会滑进错误符号的范围。**`vaddr == offset` 只是 x86-64 小页布局的常见巧合，不是协议保证；`PT_LOAD` 才是权威依据。**
+
+#### 为什么 PIE 和共享库被归成一类
+
+PIE 主程序和 `.so` 在 ELF 层面都是 `ET_DYN`：链接基址为 0、装载时才确定基址、都可被 ASLR 随机摆放。对地址换算而言二者**没有区别**，区别只在运行时角色（一个被 `execve` 为主程序，一个被动态链接器或 `dlopen` 装载）。真正影响算法的分界线只有两条：
+
+1. `ET_EXEC` 还是 `ET_DYN`：前者 load bias 恒为 0（`p_vaddr` 即运行时地址），后者必须从当前映射反推基址。
+2. 地址落在**哪一个** `PT_LOAD` 段：一个 ELF 通常有多个段（只读、可执行、可读写），每段有自己独立的 `p_offset -> p_vaddr` 映射；必须先确定段，再套公式。
+
+（`ET_REL` 的 `.o` 文件从未被装载，不参与这套运行时换算，本文不展开。）
+
+#### 后果：归一化的统一算法
+
+把规则收拢成符号化器的实际动作（FlameCraft 查询侧的 `NormalizeAddress()` 即此逻辑）：
+
+```text
+1. 用 mapping 的 [start, end) 与 file_offset 找到覆盖它的 PT_LOAD 段
+2. base = map_start - p_vaddr - (mapping.file_offset - p_offset)
+   ET_DYN 上这一步剥离 ASLR 基址；ET_EXEC 上算出的 base 自然为 0
+3. symbol_address = runtime_address - base
+4. 用 symbol_address 在 .symtab/.dynsym 中做二分查找
+```
+
+两个算例验证。先看非 PIE 版本的 `stack_demo`（假设用 `-no-pie` 链接，`maps` 里可执行映射为 `0x401000-0x402000 r-xp 00001000`，对应 `PT_LOAD: p_offset=0x1000, p_vaddr=0x401000`）：
+
+```text
+file_offset    = 0x401148 - 0x401000 + 0x1000 = 0x1148
+base           = 0x401000 - 0x401000 - (0x1000 - 0x1000) = 0
+symbol_address = 0x401148 - 0 = 0x401148        <- 与 file_offset 差了 0x400000！
+```
+
+再看 9.3 的共享库（映射 `0x7f20a0000000` 起的 r-xp 区间，`file_offset=0xa3000`，对应 `PT_LOAD: p_offset=0xa3000, p_vaddr=0xa3000`）：
+
+```text
+file_offset    = 0x7f20a0004567 - 0x7f20a0000000 + 0xa3000 = 0xa7567
+base           = 0x7f20a0000000 - 0xa3000 - (0xa3000 - 0xa3000) = 0x7f209ff5d000
+symbol_address = 0x7f20a0004567 - 0x7f209ff5d000 = 0xa7567
+```
+
+第二个算例里 `symbol_address` 恰好与 `file_offset` 同值——因为这个库的图纸恰好 `p_vaddr == p_offset`。这正是许多自制符号化器“一直没出事”的原因：把巧合当成了规律，直到遇到 `ET_EXEC` 或大页布局才集体查空。
+
+```mermaid
+flowchart LR
+    A["运行时虚拟地址<br/>(含 ASLR/加载基址)"] -->|"查 /proc/pid/maps"| B["所属映射<br/>start / file_offset"]
+    B -->|"file_offset = addr - start + mapping.file_offset"| C["文件偏移<br/>(字节在文件里的位置)"]
+    C -->|"PT_LOAD: vaddr = file_offset - p_offset + p_vaddr"| D["ELF 链接虚拟地址<br/>(符号表坐标系)"]
+    D --> E[".symtab/.dynsym 二分查找<br/>函数名 + 偏移"]
+```
+
+一句话总结前因后果：**ASLR 和动态装载把“符号表坐标”搬离了“运行时坐标”，搬移规则写在 `PT_LOAD` 图纸里；区分 PIE/共享库/`ET_EXEC`、区分各个 load segment，不是三条独立规则，而是“先认出图纸类型、再按图纸换算”这同一个动作的两个组成部分。跳过任何一半，都会在某类二进制上得到查空或查错的结果。** ASLR 只改变运行时装载位置，不改变函数在 ELF 内的相对位置；归一化正是在剥离这层“搬家”，把地址送回符号表认识的坐标系。
 
 ### 9.3 一个共享库的算例
 
@@ -786,7 +1120,7 @@ file_offset = 0x7f20a0004567 - 0x7f20a0000000 + 0xa3000
             = 0xa7567
 ```
 
-然后以该库自己的 ELF load segment 规则转换到符号表地址，才能在 `.symtab` 或 `.dynsym` 中做二分查询。若命中某个符号范围：
+再按 9.2 的 PT_LOAD 公式换算到符号表坐标系。这个库的图纸恰好 `p_vaddr == p_offset`，所以 `symbol_address = 0xa7567 - 0xa3000 + 0xa3000 = 0xa7567`，与文件偏移同值；随后用它才能在 `.symtab` 或 `.dynsym` 中做二分查询。若命中某个符号范围：
 
 ```text
 symbol.start = 0xa7400
@@ -814,7 +1148,121 @@ target       = 0xa7567
 
 因此 release 二进制被 strip 后只显示 `libfoo.so+0xa7567` 不等于采集失败；它常表示地址回溯与模块归属成功，只缺少函数名称材料。若必须做源码级根因定位，应该保留与运行版本 Build ID 匹配的 debuginfo，而不是用另一版本的未 strip 二进制“猜测”。
 
-### 9.5 `addr2line` 是验证工具，不是地址公式
+### 9.5 `.symtab`、`.dynsym`、strip 与单独的 debuginfo 包
+
+9.4 节说过“被 strip 的二进制仍可回溯，只是缺函数名”。这一节把“名字材料”彻底拆开：`file` 输出在说什么、两个符号表分别装了什么、strip 到底剥掉了什么，以及为什么 debug info 可以——也应该——单独摘出来。
+
+#### 先读懂 `file` 命令的输出
+
+对本文的示例程序执行 `file`：
+
+```bash
+$ file /opt/demo/stack_demo
+/opt/demo/stack_demo: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
+dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
+BuildID[sha1]=8f2a3b..., for GNU/Linux 3.2.0, not stripped
+```
+
+每个字段都能对应到本文前面的某一节：
+
+| 字段 | 含义 | 对应本文 |
+| --- | --- | --- |
+| `ELF 64-bit LSB pie executable` | 64 位小端 ELF；`e_type=ET_DYN` 的主程序（PIE） | 9.2：链接基址为 0，装载时才定基址 |
+| `dynamically linked, interpreter ...` | 存在 `PT_INTERP`，运行前先加载动态链接器 | 动态装载决定 load bias（9.2） |
+| `BuildID[sha1]=...` | `.note.gnu.build-id` 节的内容 | 符号化与 debuginfo 的匹配凭据（9.4） |
+| `not stripped` | 文件里还保留着 `.symtab` | 本节主题 |
+
+“not stripped”的判断标准很朴素：`file` 检查 ELF 里是否还有 `.symtab` 这个节。在就显示 `not stripped`，不在就显示 `stripped`。
+
+#### 两个符号表：`.symtab` 与 `.dynsym`
+
+ELF 通常同时携带两个符号表，职责完全不同：
+
+| 属性 | `.symtab`（完整符号表） | `.dynsym`（动态符号表） |
+| --- | --- | --- |
+| 给谁用 | 调试器、符号化器、`addr2line`、静态链接器 | 运行时的动态链接器 |
+| 收录范围 | 所有符号：导出、导入、以及 `static` 本地符号 | 只收动态链接需要的：`.so` 的导出符号 + 未定义导入 |
+| strip 之后 | 通常被整体删除 | **必须保留**，运行时要用 |
+| 何时可删 | 运行时完全用不到它 | 删了程序跑不起来 |
+
+每个符号条目（`Elf64_Sym`）至少有四个字段，正好对应前文用到的量：
+
+| 字段 | 含义 | 前文哪里用过 |
+| --- | --- | --- |
+| `st_name` | 指向字符串表（`.strtab`/`.dynstr`）的偏移 | 函数名来自这里 |
+| `st_value` | 符号的链接时虚拟地址 | 9.2：符号表坐标系 |
+| `st_size` | 符号大小（函数长度） | 9.3 的 `symbol.size = 0x220`，二分命中的判断依据 |
+| `st_info` | 绑定（GLOBAL/LOCAL/WEAK）与类型（FUNC/OBJECT） | 区分函数与数据、导出与本地 |
+
+一个容易忽略的事实：本文示例里的 `checksum` 是 `static` 函数。它只会出现在 `.symtab` 里（LOCAL 绑定），永远进不了 `.dynsym`：
+
+```bash
+$ nm stack_demo | grep checksum        # nm 默认读 .symtab
+0000000000401130 t checksum            # 小写 t：本地（LOCAL）代码符号，仅存在于 .symtab
+$ nm -D stack_demo | grep checksum     # -D 读 .dynsym
+$                                      # 无输出：static 函数不参与动态链接
+```
+
+这解释了一个现象：主程序被 `strip --strip-all` 后，`.dynsym` 里那些导出符号（如动态链接器符号、库导出函数）仍能显示名字，而 `checksum` 这类 static 函数彻底只剩 `stack_demo+0x1148`——它的名字唯一存放地就是被删掉的 `.symtab`。
+
+#### stripped 到底意味着什么
+
+`strip`（等价 `objcopy --strip-all`）删除的是：`.symtab`、`.strtab` 与全部 `.debug_*` 节。它不动：
+
+| 保留的内容 | 为什么必须留 | 对本文的影响 |
+| --- | --- | --- |
+| ELF header 与 program header（`PT_LOAD`） | 内核装载与符号化换算的图纸 | 9.1/9.2 照常工作 |
+| `.dynsym`/`.dynstr`/`.gnu.version*` | 动态链接器运行时要用 | 导出函数仍可符号化 |
+| `.eh_frame` | C++ 异常展开与运行时回溯要用 | 第 5–7 节的回溯完全不受影响 |
+| `.note.gnu.build-id` | 调试与符号化的匹配凭据 | 仍可与独立 debug 文件配对 |
+
+所以 **stripped ≠ 不能回溯，也不等于完全不能符号化**。它只意味着：本地符号（static 函数等）的名字来源被切断，符号化降级为 `.dynsym` 能查到的导出符号，或退回 `binary+offset`。
+
+还有一个容易混淆的档位：`strip --strip-debug`（或 `objcopy --strip-debug`）只删 `.debug_*`，保留 `.symtab`。此时 `file` 仍显示 `not stripped`——因为 `file` 只看 `.symtab`，不看 DWARF。两个维度是独立的：
+
+```text
+not stripped  →  .symtab 在（函数名大概率可查）
+stripped      →  .symtab 不在（只剩 .dynsym 里的导出符号）
+有无 .debug_* →  另一个独立维度，决定能否还原源码行号，file 不直接反映
+```
+
+#### debug info 可以单独摘出来吗？可以，而且是标准做法
+
+DWARF 调试信息与运行毫无关系，生产镜像里通常不带它；但崩溃分析与源码级 profile 又需要它。标准做法是构建期把两类材料分家：
+
+**构建期三步（objcopy 流）：**
+
+```bash
+# 1. 把调试节完整抽到独立文件（.debug 文件里代码节被置零，只留元数据）
+objcopy --only-keep-debug stack_demo stack_demo.debug
+
+# 2. 主文件只去掉调试节，保留 .symtab
+objcopy --strip-debug stack_demo
+
+# 3. 在主文件里写一条配对凭据：.gnu_debuglink 节 = 独立文件名 + CRC32
+objcopy --add-gnu-debuglink=stack_demo.debug stack_demo
+```
+
+**调试器/`addr2line` 怎么把它们重新配对**：两条路任选其一。
+
+1. `.gnu_debuglink`：按固定顺序搜索——独立文件与主文件同目录 → 同目录的 `.debug/` 子目录 → 全局调试目录（如 `/usr/lib/debug` 加主文件绝对路径）。
+2. Build ID：独立文件按 Build ID 归档到 `/usr/lib/debug/.build-id/<前两位>/<其余>.debug`，工具拿主文件的 BuildID 直接查表——这也是 9.4 强调“按 Build ID 匹配”的原因。
+
+**包管理器与后处理工具**：Debian 的 `*-dbgsym` 包、Fedora 的 `debuginfo` RPM，都是构建流水线自动执行上述拆分的产物，常用 `eu-strip -f`（elfutils）一步完成“抽取 + 写 debuglink + strip”。LLVM 还提供编译期拆分（`-gsplit-dwarf` 生成 `.dwo` 文件），思路相同：把调试材料从最终产物中分离。
+
+**验证一次完整流程**：
+
+```bash
+$ file stack_demo                        # 本流程第 2 步用 --strip-debug，仍显示 not stripped
+$ readelf -S stack_demo | grep debug     # 主文件里已无 .debug_* 节
+$ addr2line -e stack_demo -f -C 0x1148   # 通过 .gnu_debuglink 自动找到 stack_demo.debug
+checksum
+/path/to/stack_demo.c:5
+```
+
+对本文的工作流意味着：生产环境只部署主程序，把 `stack_demo.debug`（或发行版的 debuginfo 包）归档在符号化服务旁；FlameCraft 拿到 `binary+offset` 后即可按 Build ID 补全函数名与源码行。第 5–7 节的回溯、第 9 节的符号化，从头到尾都不需要把 debug info 塞回生产镜像。
+
+### 9.6 `addr2line` 是验证工具，不是地址公式
 
 对一个已确认匹配的未 strip ELF，可以用：
 
@@ -846,7 +1294,7 @@ FP  = 0x7fff_efb0（仅 FP 未省略时有意义）
 ```text
 寄存器：FP = 0x7fff_efb0
 内存：
-  [0x7fff_efb0] = 0x7fff_efc0   -> 上一帧 FP
+  [0x7fff_efb0] = 0x7fff_efd0   -> 上一帧 FP
   [0x7fff_efb8] = 0x5555555551e0 -> process 的返回 PC
 
 输出地址序列：
@@ -965,6 +1413,8 @@ eBPF 方法：  “在内核观测点，请内核把当前地址栈捕获下来�
 
 - System V AMD64 ABI: x86-64 参数、寄存器保存与栈对齐约定。
 - DWARF Standard: Call Frame Information、CFA、`.eh_frame` 与调试信息语义。
+- GNU Binutils: `objcopy --only-keep-debug`/`--add-gnu-debuglink`、`strip` 的符号与调试节语义；elfutils `eu-strip` 与发行版 debuginfo 分包实践。
+- GNU Binutils: `objcopy --only-keep-debug`/`--add-gnu-debuglink`、`strip` 的符号与调试节语义；elfutils `eu-strip` 与发行版 debuginfo 分包实践。
 - `/sandbox/platform/perf_ebpf/bpf_common/profile.bpf.c`
 - `/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc`
 - `/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc`
