@@ -1,53 +1,50 @@
-# Deeproute Scriptorium
+# Scriptorium
 
-Deeproute 内部文档知识库（vitepress-carbon 主题）。本分支 `Deeproute-master` 拥有**独立的孤儿历史**，与个人站 `master` 分支无任何共同祖先与共享对象——公司仓库中不存在个人文档的任何 commit 与文件。
+个人知识库 Scriptorium 的公司内部站点，基于 VitePress 与 [vitepress-carbon](https://github.com/brenoepics/vitepress-carbon) 主题（GitHub 风格极简主题，内置本地搜索），承载在司产出的技术文档（E2E 架构拆解等），后续新文档按六库结构逐步归档。
 
-## 双分支工作流
+## 目录结构
 
 ```
-Deeproute-master（公司 GitLab，vitepress-carbon）
-      │  单向 cherry-pick（文档新增/修改同步到个人站）
-      ▼
-master（个人 GitHub，vitepress-theme-teek，完整内容）
+├── docs/
+│   ├── index.md                     # 首页（hero + 六库卡片）
+│   └── document/<库>/...            # 文档正文，六库分类
+├── .vitepress/
+│   ├── config.mts                   # 站点配置：六库定义、侧边栏生成、搜索、死链豁免
+│   └── theme/
+│       ├── index.ts                 # 主题接入（vitepress-carbon Layout）
+│       └── custom.css               # 布局与样式覆盖层
+└── package.json
 ```
 
-- **方向单一**：只有公司站 → 个人站；个人站内容永不进入公司站（孤儿历史从机制上保证）。
-- **路径纪律**：两侧文档路径完全一致（`docs/document/<库>/...`），这是 cherry-pick 零冲突的前提。
+六库：**撷简台**（碎片捕获）/ **撰修司**（在写专项）/ **正典阁**（长期沉淀）/ **纪事寮**（踩坑记录）/ **资简库**（工具与模板）/ **秘藏龛**（历史归档）。
 
-### 日常命令（本 worktree：/sandbox/Scriptorium-dr）
+## 常用命令
 
 ```bash
-# 公司站本地开发（dev 绑定 127.0.0.1:5173）
-pnpm dev
-# 公司站构建
-pnpm build
-BASE_PATH=/Scriptorium/ pnpm build   # 带 GitLab Pages 路径前缀时
+pnpm dev                              # 本地开发，http://127.0.0.1:5173
+pnpm build                            # 构建产物（默认根路径）
+BASE_PATH=/Scriptorium/ pnpm build    # 带 GitLab Pages 路径前缀构建
+pnpm preview                          # 本地预览构建产物
+pnpm docs:frontmatter --check         # frontmatter 规范校验（dev/build 前自动执行）
 ```
 
-### 新增/修改文档（在公司分支）
+## 新增文档
 
-```bash
-cd /sandbox/Scriptorium-dr
-# 编辑 docs/document/<库>/... 后
-git add . && git commit -m "docs(<库>): ..."    
-git push <公司remote> Deeproute-master
+在 `docs/document/<库>/` 下建目录与 `index.md`，frontmatter 基本字段：
+
+```yaml
+---
+title: 文档标题
+date: 2026-10-12
+categories: <库名>
+tags: [标签]
+---
 ```
 
-### 同步到个人站（master）
+侧边栏由 `vitepress-sidebar` 按库自动扫描生成，新文档保存后即出现在所属库的导航中；目录默认折叠到一级。图表直接写 ```` ```mermaid ```` 代码块即可渲染（深浅色跟随站点主题）。
 
-```bash
-cd /sandbox/Scriptorium
-git log Deeproute-master --oneline -5      # 找到要同步的提交
-git cherry-pick <hash>                     # 应用到 master（不依赖共同历史）
-git push origin master
-```
+## 样式与布局定制
 
-cherry-pick 按 patch 内容应用，不依赖提交哈希与共同祖先；两侧各自改写历史互不影响。
-
-## 工程说明
-
-- 主题：[vitepress-carbon](https://github.com/brenoepics/vitepress-carbon)（GitHub 风格极简主题，内置本地搜索）
-- mermaid：`vitepress-plugin-mermaid` + `mermaid 11`，```` ```mermaid ```` 代码块自动渲染，深浅色跟随
-- 侧边栏：`vitepress-sidebar` 按库扫描多段生成，新文档入库自动出现
-- frontmatter 校验：`pnpm docs:frontmatter --check`（dev/build 前自动执行，规范与个人站一致）
-- 工程布局与个人站同构：`srcDir: docs`、`document/` 六库、`BASE_PATH` 环境变量
+- 布局参数集中在 `.vitepress/theme/custom.css` 的 `:root` 变量：`--vp-sidebar-width`（左栏宽）、`--vp-doc-content-max-width`（正文列宽）、`--vp-doc-aside-width`（右侧"本页目录"栏宽）。
+- 覆盖 carbon 主题的规则须用 `body + 双写 class` 形式（如 `.VPSidebar.VPSidebar`）：carbon 组件样式为 scoped（`class + [data-v]` 属性），普通选择器特异性不足会静默失效。
+- 尚未迁移分区的链接在 `config.mts` 的 `ignoreDeadLinks` 中豁免，某库迁移完成后从列表移除即可收紧校验。
