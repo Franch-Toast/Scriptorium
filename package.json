@@ -1,0 +1,23 @@
+{
+  "name": "scriptorium-deeproute",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "docs:frontmatter": "node scripts/docs-frontmatter.mjs",
+    "dev": "pnpm docs:frontmatter --check && vitepress dev .",
+    "prebuild": "pnpm docs:frontmatter --check",
+    "build": "vitepress build .",
+    "preview": "vitepress preview ."
+  },
+  "devDependencies": {
+    "markdown-it-mathjax3": "^5.2.0",
+    "mermaid": "^11.17.2",
+    "vitepress": "^1.6.4",
+    "vitepress-carbon": "^1.7.0",
+    "vitepress-plugin-mermaid": "^2.0.17",
+    "vitepress-sidebar": "^1.40.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "@parcel/watcher"]
+  }
+}
