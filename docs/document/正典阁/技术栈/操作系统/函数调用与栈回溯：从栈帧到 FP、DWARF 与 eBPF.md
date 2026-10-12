@@ -130,7 +130,7 @@ target_compile_options(stack_demo PRIVATE
 | `-fno-optimize-sibling-calls` | 避免尾调用把一个调用帧“折叠掉” | 某个源码函数不形成物理栈帧 |
 | `-fno-inline` | 避免函数直接嵌入调用者 | 调用关系仍可在 DWARF inline 信息中出现，但栈上没有独立帧 |
 
-这里有一个工程取舍：帧指针会占用一个通用寄存器，关闭优化会严重影响性能，因此通常只在诊断构建、性能敏感度可接受的服务或特定模块启用。保留 `-g` 并不意味着必须把完整 debug info 装进最终镜像，可以按 Build ID 将 debug package 单独归档（具体操作见 9.5 节）。
+这里有一个工程取舍：帧指针会占用一个通用寄存器，关闭优化会严重影响性能，因此通常只在诊断构建、性能敏感度可接受的服务或特定模块启用。保留 `-g` 并不意味着必须把完整 debug info 装进最终镜像，可以按 Build ID 将 debug package 单独归档（具体操作见姊妹篇 [ELF 与符号化：从文件结构到运行时地址装载](./ELF与符号化：从文件结构到运行时地址装载.md) 第 6.3 节）。
 
 ### 2.3 先观察三种视角下的同一条调用链
 
@@ -903,7 +903,7 @@ stack_counts:
   key = (tgid=4242, comm="stack_demo", user_stack_id=391, kstack_id=...)  -> count++
 ```
 
-**第 3 变：用户态解读——数字变回模块与符号。** 采集器稍后按 ID 取回数组，对每个地址查 `/proc/4242/maps` 做归属，再进入第 9 节的符号化流程：
+**第 3 变：用户态解读——数字变回模块与符号。** 采集器稍后按 ID 取回数组，对每个地址查 `/proc/4242/maps` 做归属，再进入第 9 节的符号化流程（细节见姊妹篇 [ELF 与符号化：从文件结构到运行时地址装载](./ELF与符号化：从文件结构到运行时地址装载.md)）：
 
 ```text
 0x555555555148 --maps--> stack_demo 的 r-xp 区间 --ELF--> checksum+0x18
@@ -970,314 +970,28 @@ off-CPU 的一个特殊点是：必须在 `sched_switch` 时抓被切出线程�
 0x0000555555555220
 ```
 
-它们在本次运行中可能对应 `checksum`、`process`、`main`，但 CPU 并不附带这些名字。符号化至少分成两个不可省略的计算：**找到地址所属映射**，再**转换到 ELF 的符号坐标系**。
-
-### 9.1 先用 `/proc/<pid>/maps` 找模块
-
-假设进程 PID 为 4242，看到以下映射：
-
-```text
-555555554000-555555555000 r--p 00000000 ... /opt/demo/stack_demo
-555555555000-555555556000 r-xp 00001000 ... /opt/demo/stack_demo
-555555556000-555555557000 r--p 00002000 ... /opt/demo/stack_demo
-7f20a0000000-7f20a0020000 r-xp 000a3000 ... /lib/libstdc++.so.6
-```
-
-每行最重要的字段是：
-
-```text
-地址范围 [map_start, map_end)     文件内起始偏移 file_offset        映射到的文件
-555555555000-555555556000          00001000                       stack_demo
-```
-
-若回溯得到运行时地址：
-
-```text
-runtime_pc = 0x555555555148
-```
-
-它落在第二行，因此属于 `stack_demo` 的可执行映射。**文件偏移**应计算为：
-
-```text
-file_offset = runtime_pc - map_start + mapping.file_offset
-            = 0x555555555148 - 0x555555555000 + 0x1000
-            = 0x1148
-```
-
-`+ mapping.file_offset` 不能省略。一个 ELF 文件的可执行段常常不是从文件偏移 0 映射；把 `runtime_pc - map_start` 误当文件偏移，会在这种情形少算 `0x1000`，导致函数解析系统性偏移。
+它们在本次运行中可能对应 `checksum`、`process`、`main`，但 CPU 并不附带这些名字。符号化至少分成两个不可省略的计算：**找到地址所属映射**，再**转换到 ELF 的符号坐标系**。完整的过程要连闯五关：
 
 ```mermaid
 flowchart LR
-    A[运行时 PC<br/>0x555555555148] --> B{落入哪个 maps 区间?}
-    B --> C[stack_demo 的 r-xp 映射<br/>start=0x555555555000<br/>file_offset=0x1000]
-    C --> D[file offset = PC - start + file_offset<br/>0x1148]
-    D --> E[结合 ELF PT_LOAD 与类型归一化]
-    E --> F[查询符号表 / DWARF]
-    F --> G[checksum+0x18<br/>stack_demo.c:5]
+    A["运行时虚拟地址<br/>(进程世界)"] -->|"1. 查 /proc/pid/maps"| B["所属映射<br/>哪个文件? 哪一段?"]
+    B -->|"2. 算文件偏移"| C["文件偏移 file_offset<br/>(文件世界)"]
+    C -->|"3. 查 PT_LOAD 图纸"| D["链接虚拟地址<br/>(图纸世界)"]
+    D -->|"4. 符号表二分"| E["函数名 + 函数内偏移"]
+    E -->|"5. DWARF 行号表"| F["源码文件:行号"]
 ```
 
-### 9.2 为什么还要区分 PIE、共享库和 ELF 的 load segment
+这条解释链涉及四块背景知识：ELF 结构（节、`.symtab`/`.dynsym`、DWARF、程序头）、装载机制（`execve`、ASLR/load bias、`/proc/<pid>/maps`）、地址换算（三套坐标系与 `PT_LOAD` 归一化）与符号材料守护（strip、debuginfo 分包）。这些细节已拆分到独立的背景篇 **[ELF 与符号化：从文件结构到运行时地址装载](./ELF与符号化：从文件结构到运行时地址装载.md)**，那里按“先概念、再装载、再换算、再匹配”的顺序完整展开，并以 `stack_demo`/`libcalc.so`/`libstdc++.so.6` 三个贯穿始终的示例给出可复算的算例。
 
-`file_offset` 已经能解释很多 profile 文本里的 `binary+0x...`，那为什么符号化器还要多走一步，关心 ELF 类型和 `PT_LOAD` 段？要回答“为什么”，得先接受一个事实：**回溯器给出的地址，和符号表里登记的地址，本来就是两套坐标系，平时并不相等。**
+本文后续只用到背景篇的三个结论：
 
-#### 前因：两套坐标系是怎么脱节的
-
-回溯器拿到的是**运行时虚拟地址**——进程地址空间里此刻真实生效的地址，包含动态装载造成的偏移。而符号表 `.symtab`/`.dynsym` 中每个函数的 `st_value` 是**链接时虚拟地址**——链接器当年摆放函数时使用的坐标。同一个 `checksum`，两种坐标可能完全不同：
-
-```text
-链接器视角（ELF 文件内）：        运行时视角（进程地址空间内）：
-
-ET_EXEC 非 PIE 主程序：            内核固定装到链接地址，无重定位
-  st_value = 0x401148                runtime = 0x401148          恰好相等
-
-ET_DYN（.so 与 PIE 主程序）：      链接时一切从 0 计，装载时才定基址
-  st_value = 0x1148                  runtime = 0x555555555148    差一个加载基址
-```
-
-对 `ET_DYN`，链接器把整个文件当作“从地址 0 开始”来布局；真实基址由内核和动态链接器装载时才决定，ASLR 还会让它每次运行都不同。两套坐标之间隔着一个**加载基址**（load bias）。直接拿运行时地址去符号表二分查找，对 `.so` 几乎必然查空。
-
-那么“改用 `file_offset` 查符号表行不行”？——这正是最容易掉进去的坑。`file_offset` 回答“这个字节在**文件**里的哪里”，符号表的 `st_value` 回答“函数被链接到**虚拟地址**的哪里”。两套答案之间没有恒等关系，只有一条由 `PT_LOAD` 段定义的换算规则：
-
-```text
-虚拟地址 = file_offset - p_offset + p_vaddr
-（p_offset、p_vaddr 是覆盖该 file_offset 的那个 PT_LOAD 段声明的属性）
-```
-
-`PT_LOAD` 是 ELF 程序头里的“装载图纸”：每个可装载段声明“把我文件偏移 `p_offset` 起的内容，装到虚拟地址 `p_vaddr` 处”。**这份图纸在不同二进制上形状不同**，这才是必须区分三种情形的根本原因：
-
-| 情形 | 典型对象 | 图纸的形状 | 直接拿 `file_offset` 查符号表的下场 |
-| --- | --- | --- | --- |
-| `ET_EXEC` | 非 PIE 主程序 | `p_vaddr` 常比 `p_offset` 大出一个固定基址（如 `0x400000`） | 系统性查空或命中错误符号：拿着 `0x1148` 找 `0x401148`，差 `0x400000` |
-| `ET_DYN`（x86-64 常见布局） | `.so` 与多数 PIE 主程序 | 首段 `p_vaddr == p_offset == 0`，此后逐段页对齐 | **碰巧查对**——最危险，因为长期掩盖模型错误，直到换一种二进制才爆发 |
-| `ET_DYN`（大页/特殊布局） | aarch64 64K 页构建、自定义 linker script | 段间 padding 使 `p_vaddr ≠ p_offset` | 系统性偏移一个 padding 量，每次都错、且错得“稳定” |
-
-第三行值得多看一眼。aarch64 上按 64K 大页对齐构建时，第二个 `PT_LOAD` 的文件偏移可能是 `0x1000`，虚拟地址却是 `0x10000`：`file_offset = 0x1abc` 的符号地址应为 `0x10abc`，直接拿 `0x1abc` 查表就会滑进错误符号的范围。**`vaddr == offset` 只是 x86-64 小页布局的常见巧合，不是协议保证；`PT_LOAD` 才是权威依据。**
-
-#### 为什么 PIE 和共享库被归成一类
-
-PIE 主程序和 `.so` 在 ELF 层面都是 `ET_DYN`：链接基址为 0、装载时才确定基址、都可被 ASLR 随机摆放。对地址换算而言二者**没有区别**，区别只在运行时角色（一个被 `execve` 为主程序，一个被动态链接器或 `dlopen` 装载）。真正影响算法的分界线只有两条：
-
-1. `ET_EXEC` 还是 `ET_DYN`：前者 load bias 恒为 0（`p_vaddr` 即运行时地址），后者必须从当前映射反推基址。
-2. 地址落在**哪一个** `PT_LOAD` 段：一个 ELF 通常有多个段（只读、可执行、可读写），每段有自己独立的 `p_offset -> p_vaddr` 映射；必须先确定段，再套公式。
-
-（`ET_REL` 的 `.o` 文件从未被装载，不参与这套运行时换算，本文不展开。）
-
-#### 后果：归一化的统一算法
-
-把规则收拢成符号化器的实际动作（FlameCraft 查询侧的 `NormalizeAddress()` 即此逻辑）：
-
-```text
-1. 用 mapping 的 [start, end) 与 file_offset 找到覆盖它的 PT_LOAD 段
-2. base = map_start - p_vaddr - (mapping.file_offset - p_offset)
-   ET_DYN 上这一步剥离 ASLR 基址；ET_EXEC 上算出的 base 自然为 0
-3. symbol_address = runtime_address - base
-4. 用 symbol_address 在 .symtab/.dynsym 中做二分查找
-```
-
-两个算例验证。先看非 PIE 版本的 `stack_demo`（假设用 `-no-pie` 链接，`maps` 里可执行映射为 `0x401000-0x402000 r-xp 00001000`，对应 `PT_LOAD: p_offset=0x1000, p_vaddr=0x401000`）：
-
-```text
-file_offset    = 0x401148 - 0x401000 + 0x1000 = 0x1148
-base           = 0x401000 - 0x401000 - (0x1000 - 0x1000) = 0
-symbol_address = 0x401148 - 0 = 0x401148        <- 与 file_offset 差了 0x400000！
-```
-
-再看 9.3 的共享库（映射 `0x7f20a0000000` 起的 r-xp 区间，`file_offset=0xa3000`，对应 `PT_LOAD: p_offset=0xa3000, p_vaddr=0xa3000`）：
-
-```text
-file_offset    = 0x7f20a0004567 - 0x7f20a0000000 + 0xa3000 = 0xa7567
-base           = 0x7f20a0000000 - 0xa3000 - (0xa3000 - 0xa3000) = 0x7f209ff5d000
-symbol_address = 0x7f20a0004567 - 0x7f209ff5d000 = 0xa7567
-```
-
-第二个算例里 `symbol_address` 恰好与 `file_offset` 同值——因为这个库的图纸恰好 `p_vaddr == p_offset`。这正是许多自制符号化器“一直没出事”的原因：把巧合当成了规律，直到遇到 `ET_EXEC` 或大页布局才集体查空。
-
-```mermaid
-flowchart LR
-    A["运行时虚拟地址<br/>(含 ASLR/加载基址)"] -->|"查 /proc/pid/maps"| B["所属映射<br/>start / file_offset"]
-    B -->|"file_offset = addr - start + mapping.file_offset"| C["文件偏移<br/>(字节在文件里的位置)"]
-    C -->|"PT_LOAD: vaddr = file_offset - p_offset + p_vaddr"| D["ELF 链接虚拟地址<br/>(符号表坐标系)"]
-    D --> E[".symtab/.dynsym 二分查找<br/>函数名 + 偏移"]
-```
-
-一句话总结前因后果：**ASLR 和动态装载把“符号表坐标”搬离了“运行时坐标”，搬移规则写在 `PT_LOAD` 图纸里；区分 PIE/共享库/`ET_EXEC`、区分各个 load segment，不是三条独立规则，而是“先认出图纸类型、再按图纸换算”这同一个动作的两个组成部分。跳过任何一半，都会在某类二进制上得到查空或查错的结果。** ASLR 只改变运行时装载位置，不改变函数在 ELF 内的相对位置；归一化正是在剥离这层“搬家”，把地址送回符号表认识的坐标系。
-
-### 9.3 一个共享库的算例
-
-继续使用 maps 中 `libstdc++.so.6` 的映射：
-
-```text
-map_start   = 0x7f20a0000000
-map_end     = 0x7f20a0020000
-file_offset = 0x000a3000
-runtime_pc  = 0x7f20a0004567
-```
-
-先得到：
-
-```text
-file_offset = 0x7f20a0004567 - 0x7f20a0000000 + 0xa3000
-            = 0xa7567
-```
-
-再按 9.2 的 PT_LOAD 公式换算到符号表坐标系。这个库的图纸恰好 `p_vaddr == p_offset`，所以 `symbol_address = 0xa7567 - 0xa3000 + 0xa3000 = 0xa7567`，与文件偏移同值；随后用它才能在 `.symtab` 或 `.dynsym` 中做二分查询。若命中某个符号范围：
-
-```text
-symbol.start = 0xa7400
-symbol.size  = 0x220
-target       = 0xa7567
-```
-
-则：
-
-```text
-函数 = symbol.name
-函数内偏移 = target - symbol.start = 0x167
-显示 = symbol.name + 0x167
-```
-
-函数的完整名字可能被 C++ name mangling 编码，例如 `_ZN3foo3barEi`；demangle 后才显示为 `foo::bar(int)`。
-
-### 9.4 函数名和源码行号是两个层次
-
-| 目标 | 最少需要什么 | 典型来源 |
+| 结论 | 一句话版本 | 背景篇 |
 | --- | --- | --- |
-| 显示 `foo::bar+0x167` | 可匹配 ELF 的函数符号范围 | `.symtab`，回退 `.dynsym` |
-| 显示 `src/foo.cc:87` | 匹配 Build ID 的 DWARF line table | `.debug_info`、`.debug_line` 或独立 `.debug` 文件 |
-| 显示内联层级 | DWARF inline DIE / call-site 信息 | 完整 DWARF |
+| 文件偏移 | `file_offset = runtime_pc - map_start + mapping.file_offset`，`+ mapping.file_offset` 不能省 | 第 3.3 节 |
+| 地址归一化 | `base = map_start - p_vaddr - (mapping.file_offset - p_offset)`，`symbol_address = runtime_address - base`；`.so`/PIE 必须做，`-no-pie` 程序 `base` 恒为 0 | 第 4.4 节 |
+| 名字匹配 | 函数名来自 `.symtab`（回退 `.dynsym`）二分 + demangle；源码行需要 Build ID 匹配的 DWARF | 第 5 节 |
 
-因此 release 二进制被 strip 后只显示 `libfoo.so+0xa7567` 不等于采集失败；它常表示地址回溯与模块归属成功，只缺少函数名称材料。若必须做源码级根因定位，应该保留与运行版本 Build ID 匹配的 debuginfo，而不是用另一版本的未 strip 二进制“猜测”。
-
-### 9.5 `.symtab`、`.dynsym`、strip 与单独的 debuginfo 包
-
-9.4 节说过“被 strip 的二进制仍可回溯，只是缺函数名”。这一节把“名字材料”彻底拆开：`file` 输出在说什么、两个符号表分别装了什么、strip 到底剥掉了什么，以及为什么 debug info 可以——也应该——单独摘出来。
-
-#### 先读懂 `file` 命令的输出
-
-对本文的示例程序执行 `file`：
-
-```bash
-$ file /opt/demo/stack_demo
-/opt/demo/stack_demo: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV),
-dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
-BuildID[sha1]=8f2a3b..., for GNU/Linux 3.2.0, not stripped
-```
-
-每个字段都能对应到本文前面的某一节：
-
-| 字段 | 含义 | 对应本文 |
-| --- | --- | --- |
-| `ELF 64-bit LSB pie executable` | 64 位小端 ELF；`e_type=ET_DYN` 的主程序（PIE） | 9.2：链接基址为 0，装载时才定基址 |
-| `dynamically linked, interpreter ...` | 存在 `PT_INTERP`，运行前先加载动态链接器 | 动态装载决定 load bias（9.2） |
-| `BuildID[sha1]=...` | `.note.gnu.build-id` 节的内容 | 符号化与 debuginfo 的匹配凭据（9.4） |
-| `not stripped` | 文件里还保留着 `.symtab` | 本节主题 |
-
-“not stripped”的判断标准很朴素：`file` 检查 ELF 里是否还有 `.symtab` 这个节。在就显示 `not stripped`，不在就显示 `stripped`。
-
-#### 两个符号表：`.symtab` 与 `.dynsym`
-
-ELF 通常同时携带两个符号表，职责完全不同：
-
-| 属性 | `.symtab`（完整符号表） | `.dynsym`（动态符号表） |
-| --- | --- | --- |
-| 给谁用 | 调试器、符号化器、`addr2line`、静态链接器 | 运行时的动态链接器 |
-| 收录范围 | 所有符号：导出、导入、以及 `static` 本地符号 | 只收动态链接需要的：`.so` 的导出符号 + 未定义导入 |
-| strip 之后 | 通常被整体删除 | **必须保留**，运行时要用 |
-| 何时可删 | 运行时完全用不到它 | 删了程序跑不起来 |
-
-每个符号条目（`Elf64_Sym`）至少有四个字段，正好对应前文用到的量：
-
-| 字段 | 含义 | 前文哪里用过 |
-| --- | --- | --- |
-| `st_name` | 指向字符串表（`.strtab`/`.dynstr`）的偏移 | 函数名来自这里 |
-| `st_value` | 符号的链接时虚拟地址 | 9.2：符号表坐标系 |
-| `st_size` | 符号大小（函数长度） | 9.3 的 `symbol.size = 0x220`，二分命中的判断依据 |
-| `st_info` | 绑定（GLOBAL/LOCAL/WEAK）与类型（FUNC/OBJECT） | 区分函数与数据、导出与本地 |
-
-一个容易忽略的事实：本文示例里的 `checksum` 是 `static` 函数。它只会出现在 `.symtab` 里（LOCAL 绑定），永远进不了 `.dynsym`：
-
-```bash
-$ nm stack_demo | grep checksum        # nm 默认读 .symtab
-0000000000401130 t checksum            # 小写 t：本地（LOCAL）代码符号，仅存在于 .symtab
-$ nm -D stack_demo | grep checksum     # -D 读 .dynsym
-$                                      # 无输出：static 函数不参与动态链接
-```
-
-这解释了一个现象：主程序被 `strip --strip-all` 后，`.dynsym` 里那些导出符号（如动态链接器符号、库导出函数）仍能显示名字，而 `checksum` 这类 static 函数彻底只剩 `stack_demo+0x1148`——它的名字唯一存放地就是被删掉的 `.symtab`。
-
-#### stripped 到底意味着什么
-
-`strip`（等价 `objcopy --strip-all`）删除的是：`.symtab`、`.strtab` 与全部 `.debug_*` 节。它不动：
-
-| 保留的内容 | 为什么必须留 | 对本文的影响 |
-| --- | --- | --- |
-| ELF header 与 program header（`PT_LOAD`） | 内核装载与符号化换算的图纸 | 9.1/9.2 照常工作 |
-| `.dynsym`/`.dynstr`/`.gnu.version*` | 动态链接器运行时要用 | 导出函数仍可符号化 |
-| `.eh_frame` | C++ 异常展开与运行时回溯要用 | 第 5–7 节的回溯完全不受影响 |
-| `.note.gnu.build-id` | 调试与符号化的匹配凭据 | 仍可与独立 debug 文件配对 |
-
-所以 **stripped ≠ 不能回溯，也不等于完全不能符号化**。它只意味着：本地符号（static 函数等）的名字来源被切断，符号化降级为 `.dynsym` 能查到的导出符号，或退回 `binary+offset`。
-
-还有一个容易混淆的档位：`strip --strip-debug`（或 `objcopy --strip-debug`）只删 `.debug_*`，保留 `.symtab`。此时 `file` 仍显示 `not stripped`——因为 `file` 只看 `.symtab`，不看 DWARF。两个维度是独立的：
-
-```text
-not stripped  →  .symtab 在（函数名大概率可查）
-stripped      →  .symtab 不在（只剩 .dynsym 里的导出符号）
-有无 .debug_* →  另一个独立维度，决定能否还原源码行号，file 不直接反映
-```
-
-#### debug info 可以单独摘出来吗？可以，而且是标准做法
-
-DWARF 调试信息与运行毫无关系，生产镜像里通常不带它；但崩溃分析与源码级 profile 又需要它。标准做法是构建期把两类材料分家：
-
-**构建期三步（objcopy 流）：**
-
-```bash
-# 1. 把调试节完整抽到独立文件（.debug 文件里代码节被置零，只留元数据）
-objcopy --only-keep-debug stack_demo stack_demo.debug
-
-# 2. 主文件只去掉调试节，保留 .symtab
-objcopy --strip-debug stack_demo
-
-# 3. 在主文件里写一条配对凭据：.gnu_debuglink 节 = 独立文件名 + CRC32
-objcopy --add-gnu-debuglink=stack_demo.debug stack_demo
-```
-
-**调试器/`addr2line` 怎么把它们重新配对**：两条路任选其一。
-
-1. `.gnu_debuglink`：按固定顺序搜索——独立文件与主文件同目录 → 同目录的 `.debug/` 子目录 → 全局调试目录（如 `/usr/lib/debug` 加主文件绝对路径）。
-2. Build ID：独立文件按 Build ID 归档到 `/usr/lib/debug/.build-id/<前两位>/<其余>.debug`，工具拿主文件的 BuildID 直接查表——这也是 9.4 强调“按 Build ID 匹配”的原因。
-
-**包管理器与后处理工具**：Debian 的 `*-dbgsym` 包、Fedora 的 `debuginfo` RPM，都是构建流水线自动执行上述拆分的产物，常用 `eu-strip -f`（elfutils）一步完成“抽取 + 写 debuglink + strip”。LLVM 还提供编译期拆分（`-gsplit-dwarf` 生成 `.dwo` 文件），思路相同：把调试材料从最终产物中分离。
-
-**验证一次完整流程**：
-
-```bash
-$ file stack_demo                        # 本流程第 2 步用 --strip-debug，仍显示 not stripped
-$ readelf -S stack_demo | grep debug     # 主文件里已无 .debug_* 节
-$ addr2line -e stack_demo -f -C 0x1148   # 通过 .gnu_debuglink 自动找到 stack_demo.debug
-checksum
-/path/to/stack_demo.c:5
-```
-
-对本文的工作流意味着：生产环境只部署主程序，把 `stack_demo.debug`（或发行版的 debuginfo 包）归档在符号化服务旁；FlameCraft 拿到 `binary+offset` 后即可按 Build ID 补全函数名与源码行。第 5–7 节的回溯、第 9 节的符号化，从头到尾都不需要把 debug info 塞回生产镜像。
-
-### 9.6 `addr2line` 是验证工具，不是地址公式
-
-对一个已确认匹配的未 strip ELF，可以用：
-
-```bash
-addr2line -e /opt/demo/stack_demo -f -C 0x1148
-```
-
-预期会打印函数名与 `stack_demo.c:行号`。但以下前提缺任何一个，结果都可能误导：
-
-1. 地址必须已经是该 ELF 的正确文件/符号坐标，不是另一进程的 ASLR 运行时虚拟地址。
-2. ELF 必须与运行时 Build ID 相同。
-3. `addr2line` 不会凭空恢复已 strip 掉的本地函数名和 DWARF 行表。
-4. 即使工具显示“最近的前一符号”，地址若落在该符号 size 之外的巨大间隙，也不能把它当作确证。
-
-这也是 FlameCraft 导入时保留 `binary+offset` 的原因：解析失败时保留可复核的证据，比编造一个看似合理的函数名安全得多。
+还有两个高频疑问，直接给答案：**stripped 不等于不能符号化**——`.dynsym` 与 `PT_LOAD` 都被 strip 保留，缺的只是 static 函数名；**debug info 可以且应该单独摘出来**——`objcopy --only-keep-debug` 抽取、按 Build ID 归档，运行镜像里不需要它（背景篇第 6 节）。
 
 ## 10. 把同一个现场分别交给三种回溯法
 
@@ -1413,7 +1127,7 @@ eBPF 方法：  “在内核观测点，请内核把当前地址栈捕获下来�
 
 - System V AMD64 ABI: x86-64 参数、寄存器保存与栈对齐约定。
 - DWARF Standard: Call Frame Information、CFA、`.eh_frame` 与调试信息语义。
-- GNU Binutils: `objcopy --only-keep-debug`/`--add-gnu-debuglink`、`strip` 的符号与调试节语义；elfutils `eu-strip` 与发行版 debuginfo 分包实践。
+- 姊妹篇《ELF 与符号化：从文件结构到运行时地址装载》：第 9 节符号化细节的完整展开（ELF 结构、装载、地址换算、strip 与 debuginfo 分包）。
 - GNU Binutils: `objcopy --only-keep-debug`/`--add-gnu-debuglink`、`strip` 的符号与调试节语义；elfutils `eu-strip` 与发行版 debuginfo 分包实践。
 - `/sandbox/platform/perf_ebpf/bpf_common/profile.bpf.c`
 - `/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc`
