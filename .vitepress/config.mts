@@ -66,6 +66,17 @@ export default withMermaid(
     description: "Deeproute 内部文档知识库 —— 收集、整理、沉淀",
     base,
     lastUpdated: true,
+    // 部分迁移场景的死链豁免：VitePress 报告的 dead link 是 percent-encoded
+    // 的原始相对路径（如 ./../../../正典阁/...），故用 encodeURIComponent 动态
+    // 构造正则，匹配指向未迁移分区的链接；撰修司内部死链仍严格校验。
+    // 后续某库文档迁移完成后，从 pendingLibs 中移除该库即可收紧校验
+    ignoreDeadLinks: [
+      new RegExp(
+        ["撷简台", "正典阁", "纪事寮", "资简库", "秘藏龛"]
+          .map(l => encodeURIComponent(l))
+          .join("|"),
+      ),
+    ],
     themeConfig: {
       nav: [
         { text: "首页", link: "/" },
