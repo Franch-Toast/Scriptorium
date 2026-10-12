@@ -4,3 +4,6 @@ node_modules/
 docs/.vitepress/
 .DS_Store
 *.log
+
+# vite config 打包临时产物
+.vitepress/config.mts.timestamp-*.mjs

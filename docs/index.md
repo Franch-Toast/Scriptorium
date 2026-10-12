@@ -2,9 +2,9 @@
 layout: home
 
 hero:
-  name: Deeproute Scriptorium
-  text: 收集、整理、沉淀
-  tagline: Deeproute 内部文档知识库 —— 让知识在时间线上生长
+  name: Scriptorium
+  text: Yifei Zhang的藏经阁 —— 六大经卷堂
+  tagline: “施主，又来练玉女心经啦？”
 
 features:
   - icon: "📥"

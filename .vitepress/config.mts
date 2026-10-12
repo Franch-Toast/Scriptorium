@@ -65,8 +65,8 @@ export default withMermaid(
     srcDir: "docs",
     cacheDir: ".vitepress/cache",
     lang: "zh-CN",
-    title: "Deeproute Scriptorium",
-    description: "Deeproute 内部文档知识库 —— 收集、整理、沉淀",
+    title: "Scriptorium",
+    description: "Yifei Zhang的藏经阁 —— 六大经卷堂",
     base,
     lastUpdated: true,
     // 默认亮色主题（覆盖 carbon baseConfig 的 initialValue: 'dark'）

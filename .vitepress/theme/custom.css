@@ -13,10 +13,10 @@
  * 无论 CSS 注入顺序如何都获胜。
  */
 :root {
-  --vp-sidebar-width: 256px;
+  --vp-sidebar-width: 310px;
   --vp-doc-aside-width: 208px;
   --vp-doc-aside-gap: 32px;
-  --vp-doc-content-max-width: calc(100vw - 560px);
+  --vp-doc-content-max-width: calc(100vw - 800px);
 }
 
 @media (min-width: 1440px) {
