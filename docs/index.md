@@ -1,22 +1,34 @@
 ---
 layout: home
+
+hero:
+  name: Deeproute Scriptorium
+  text: 收集、整理、沉淀
+  tagline: Deeproute 内部文档知识库 —— 让知识在时间线上生长
+
+features:
+  - icon: "📥"
+    title: 撷简台（inbox）
+    details: 快速捕获的碎片信息与待整理素材，定期清空归位
+    link: /document/撷简台/
+  - icon: "🚀"
+    title: 撰修司（projects）
+    details: 正在进行的专项与项目文档，按主题组织
+    link: /document/撰修司/
+  - icon: "📚"
+    title: 正典阁（knowledge）
+    details: 长期沉淀的技术栈、业务领域与通用能力笔记
+    link: /document/正典阁/
+  - icon: "🔍"
+    title: 纪事寮（experience）
+    details: 踩坑记录、最佳实践与方法论，让教训不再重复
+    link: /document/纪事寮/
+  - icon: "🧰"
+    title: 资简库（assets）
+    details: 工具脚本、参考手册、文档模板与规范标准
+    link: /document/资简库/
+  - icon: "🗄️"
+    title: 秘藏龛（archive）
+    details: 完结项目与过时资料的最终归宿，历史可追溯
+    link: /document/秘藏龛/
 ---
-
-<div class="dr-home">
-
-## Deeproute Scriptorium
-
-Deeproute 内部文档知识库：收集、整理、沉淀，让知识在时间线上生长。
-
-当前收录六库框架，文档按专项逐步迁移：
-
-| 分区 | 定位 |
-| --- | --- |
-| [📥 撷简台](/document/撷简台/) | 快速捕获的碎片信息与待整理素材 |
-| [🚀 撰修司](/document/撰修司/) | 正在进行的专项与项目文档 |
-| [📚 正典阁](/document/正典阁/) | 长期沉淀的可复用知识 |
-| [🔍 纪事寮](/document/纪事寮/) | 踩坑记录与缺陷案例 |
-| [🧰 资简库](/document/资简库/) | 工具脚本、规范标准与模板 |
-| [🗄️ 秘藏龛](/document/秘藏龛/) | 完结项目与历史总结归档 |
-
-</div>

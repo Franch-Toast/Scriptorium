@@ -34,6 +34,9 @@ function libSidebar(dir: string, title: string) {
       scanStartPath: libPath,
       useTitleFromFrontmatter: true,
       useFolderTitleFromIndexFile: true,
+      // 各级目录组默认折叠（collapseDepth 默认 1）：侧边栏初始仅展开到一级目录，
+      // 点击组名前的箭头逐层展开，避免深层树一次性铺满
+      collapsed: true,
     },
   ]) as unknown;
   const raw = Array.isArray(scanned)
@@ -66,6 +69,8 @@ export default withMermaid(
     description: "Deeproute 内部文档知识库 —— 收集、整理、沉淀",
     base,
     lastUpdated: true,
+    // 默认亮色主题（覆盖 carbon baseConfig 的 initialValue: 'dark'）
+    appearance: { initialValue: "light" },
     // 部分迁移场景的死链豁免：VitePress 报告的 dead link 是 percent-encoded
     // 的原始相对路径（如 ./../../../正典阁/...），故用 encodeURIComponent 动态
     // 构造正则，匹配指向未迁移分区的链接；撰修司内部死链仍严格校验。

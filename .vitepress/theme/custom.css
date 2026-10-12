@@ -1,0 +1,58 @@
+/*
+ * carbon 主题布局重分配：
+ * - 加宽正文：100vw 减去两侧栏与间隔（sidebar 256 + padding 32×2 +
+ *   aside 208 + gap 32 = 560px），纯自适应不封顶，随窗口伸缩
+ * - 宽屏（≥1440px）取消 carbon 的居中收缩 gutter：carbon 在 VPSidebar 容器、
+ *   VPContent、顶部导航分隔线/标题上各注入 (100vw-1440px)/2 的 padding，
+ *   导致侧边栏内容缩进（左侧空白）、右侧目录不贴右缘——全部清零
+ * - aside 排到最右（1280+，flex 项 margin-left:auto 吃掉剩余空间）
+ *
+ * 重要：carbon 组件样式均为 scoped（class + [data-v-xxx] 属性，特异性 0,2,0 起步），
+ * 普通的 body .VPSidebar（0,1,1）会输掉级联。覆盖规则统一用
+ * body 前缀 + class 双写（如 .VPSidebar.VPSidebar，0,2,1+）抬高特异性，
+ * 无论 CSS 注入顺序如何都获胜。
+ */
+:root {
+  --vp-sidebar-width: 256px;
+  --vp-doc-aside-width: 208px;
+  --vp-doc-aside-gap: 32px;
+  --vp-doc-content-max-width: calc(100vw - 560px);
+}
+
+@media (min-width: 1440px) {
+  /* 左侧导航贴屏幕左缘（清掉容器上的居中收缩 gutter） */
+  body .VPSidebar.VPSidebar {
+    padding-left: 0;
+    width: var(--vp-sidebar-width);
+    max-width: var(--vp-sidebar-width);
+  }
+
+  /* 内容区贴边：左缘起于 sidebar 右侧，右侧无 gutter */
+  body .VPContent.has-sidebar.VPContent {
+    padding-left: var(--vp-sidebar-width);
+    padding-right: 0;
+  }
+
+  /* 顶部导航：分隔线与 logo 区对齐 sidebar 右缘（恢复 768 断点行为） */
+  body .VPNavBar.has-sidebar .divider.divider {
+    padding-left: var(--vp-sidebar-width);
+  }
+
+  body .VPNavBar.has-sidebar .title.title {
+    width: var(--vp-sidebar-width);
+  }
+}
+
+@media (min-width: 1280px) {
+  /* 右侧目录栏贴右缘 */
+  body .VPDoc .aside.aside {
+    margin-left: auto;
+  }
+}
+
+/* LocalNav 在 1280+ 已隐藏，此条防御性覆盖以防主题变更 */
+@media (min-width: 1440px) {
+  body .VPLocalNav.has-sidebar.VPLocalNav {
+    padding-left: var(--vp-sidebar-width);
+  }
+}

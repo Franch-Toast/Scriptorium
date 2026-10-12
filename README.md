@@ -29,7 +29,7 @@ BASE_PATH=/Scriptorium/ pnpm build   # 带 GitLab Pages 路径前缀时
 ```bash
 cd /sandbox/Scriptorium-dr
 # 编辑 docs/document/<库>/... 后
-git add . && git commit -m "docs(<库>): ..."
+git add . && git commit -m "docs(<库>): ..."    
 git push <公司remote> Deeproute-master
 ```
 
