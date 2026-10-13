@@ -55,8 +55,10 @@ const sidebar = Object.fromEntries(
   libs.map(l => [`/document/${l.dir}/`, libSidebar(l.dir, l.title)]),
 );
 
-// 公司 GitLab Pages 部署时由 CI 注入 BASE_PATH，本地开发默认 "/"
-const base = process.env.BASE_PATH || "/";
+// 站点固定部署在 https://webfile.deeproute.cn/yifeizhang/ ，产物内链必须带此前缀，
+// 否则站内跳转与静态资源全部 404；默认值即部署值（本地构建与 CI 天然一致，
+// 避免漏注入），CI 仍可通过 BASE_PATH 环境变量覆盖
+const base = process.env.BASE_PATH || "/yifeizhang/";
 
 export default withMermaid(
   defineConfigWithTheme<ThemeConfig>({

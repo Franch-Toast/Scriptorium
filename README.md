@@ -22,8 +22,8 @@
 
 ```bash
 pnpm dev                              # 本地开发，http://127.0.0.1:5173
-pnpm build                            # 构建产物（默认根路径）
-BASE_PATH=/Scriptorium/ pnpm build    # 带 GitLab Pages 路径前缀构建
+pnpm build                            # 构建产物，默认按部署路径 /yifeizhang/ 构建（产物在 .vitepress/dist/）
+BASE_PATH=/ pnpm build                # 如需以根路径构建（一般无需）
 pnpm preview                          # 本地预览构建产物
 pnpm docs:frontmatter --check         # frontmatter 规范校验（dev/build 前自动执行）
 ```

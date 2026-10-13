@@ -11,6 +11,7 @@ stages:
 variables:
   NAMESPACE: "yifeizhang"
   # 站点部署在 https://webfile.deeproute.cn/yifeizhang/ ，构建时注入路径前缀
+  BASE_PATH: "/yifeizhang/"
 
 # 每次推送都构建校验；产物仅存 artifacts 供排查，不上传 webfile
 build:
