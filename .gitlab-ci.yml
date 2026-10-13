@@ -1,0 +1,46 @@
+# Scriptorium 公司站 CI：推送仅构建校验，打 tag 构建通过后发布到 webfile
+# 站点地址：https://webfile.deeproute.cn/yifeizhang/
+#
+# 前置配置（一次性）：GitLab Settings → CI/CD → Variables 添加
+#   DR_ACCESS_TOKEN（类型 Variable，勾选 Masked）—— webfile 上传凭证
+
+stages:
+  - build
+  - deploy
+
+variables:
+  NAMESPACE: "yifeizhang"
+  # 站点部署在 https://webfile.deeproute.cn/yifeizhang/ ，构建时注入路径前缀
+
+# 每次推送都构建校验；产物仅存 artifacts 供排查，不上传 webfile
+build:
+  stage: build
+  image: node:20
+  script:
+    - npm i -g pnpm
+    - pnpm install --frozen-lockfile
+    # prebuild 自动执行 frontmatter 校验
+    - pnpm build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+# 仅打 tag 时发布：needs 直接复用 build 的产物，不重复编译
+deploy:
+  stage: deploy
+  image: reg.deeproute.ai/deeproute-public/golang:1.25.6_sudo
+  needs: [build]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - curl -fsSL https://webfile.deeproute.cn/webfile-cli/prod/latest/install.sh | bash
+    - |
+      if [ -z "${DR_ACCESS_TOKEN}" ]; then
+        echo "ERROR: DR_ACCESS_TOKEN 未配置，请在 GitLab Settings → CI/CD → Variables 中添加（勾选 Masked）"
+        exit 1
+      fi
+      export DR_ACCESS_TOKEN
+      webfile file upload "dist/" "${NAMESPACE}:/" --override
+      echo ""
+      echo "发布完成：https://webfile.deeproute.cn/${NAMESPACE}/  (tag: ${CI_COMMIT_TAG})"
