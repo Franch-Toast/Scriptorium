@@ -81,6 +81,8 @@ export default withMermaid(
           .map(l => encodeURIComponent(l))
           .join("|"),
       ),
+      // 文档中引用的源码仓库路径（如 /sandbox/platform/...）按站内链接校验会报死链，统一豁免
+      /^\/sandbox\//,
     ],
     themeConfig: {
       nav: [
