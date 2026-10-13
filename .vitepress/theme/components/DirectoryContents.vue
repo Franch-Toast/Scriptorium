@@ -12,84 +12,70 @@ const normalizePath = (value: string) => {
   return decoded.startsWith("/") ? decoded : `/${decoded}`;
 };
 
-const sortNodes = (nodes: TreeNode[]) =>
-  nodes.sort((a, b) => {
-    if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
-    return collator.compare(a.type === "folder" ? a.name : a.title || a.name, b.type === "folder" ? b.name : b.title || b.name);
-  });
-
-const tree = computed<TreeNode[]>(() => {
+// 构建期数据在模块加载时已就绪（createContentLoader 产物），此处仅做
+// 一级收录：root 下的散文档直接入列；子目录聚合为一个节点且不再下钻
+// （避免递归列表过长），若该目录存在 index.md 则节点可点击（标题/描述
+// 取自 index）。
+const entries = computed<TreeNode[]>(() => {
   const root = normalizePath(props.root);
   const nodes: TreeNode[] = [];
 
-  for (const document of documents as unknown as { url: string; title?: string; description?: string }[]) {
+  const folderOf = (name: string) => {
+    let folder = nodes.find(node => node.type === "folder" && node.name === name);
+    if (!folder) {
+      folder = { type: "folder", name };
+      nodes.push(folder);
+    }
+    return folder;
+  };
+
+  for (const document of documents as { url: string; title?: string; description?: string }[]) {
+    // 目录 index 的 url 是尾斜杠形态（/xxx/），散文档为 .html 形态
+    const isDirIndex = document.url.endsWith("/");
     const documentPath = normalizePath(document.url);
     if (!documentPath.startsWith(`${root}/`)) continue;
 
     const relativeParts = documentPath.slice(root.length + 1).split("/").filter(Boolean);
     if (!relativeParts.length) continue;
 
-    let level = nodes;
-    relativeParts.forEach((part, index) => {
-      const isDocument = index === relativeParts.length - 1;
-      if (isDocument) {
-        level.push({
-          type: "document",
-          name: part,
-          title: document.title || part,
-          description: document.description,
-          url: document.url,
-        });
-        return;
+    if (relativeParts.length === 1) {
+      if (isDirIndex) {
+        // 库自身 index 已被上方 startsWith(root/) 排除；能走到这里的
+        // 尾斜杠 url 都是一级子目录的 index.md → 目录节点可点击
+        const folder = folderOf(relativeParts[0]);
+        folder.url = document.url;
+        folder.title = document.title || folder.name;
+        folder.description = document.description;
+        continue;
       }
+      nodes.push({
+        type: "document",
+        name: relativeParts[0],
+        title: document.title || relativeParts[0],
+        description: document.description,
+        url: document.url,
+      });
+      continue;
+    }
 
-      let folder = level.find(node => node.type === "folder" && node.name === part);
-      if (!folder) {
-        folder = { type: "folder", name: part, children: [] };
-        level.push(folder);
-      }
-      level = folder.children || (folder.children = []);
-    });
+    // 更深层文档只用于聚合出一级子目录名，不再下钻
+    folderOf(relativeParts[0]);
   }
 
-  const sortRecursively = (items: TreeNode[]) => {
-    sortNodes(items);
-    for (const item of items) if (item.children) sortRecursively(item.children);
-  };
-  sortRecursively(nodes);
+  nodes.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
+    return collator.compare(a.title || a.name, b.title || b.name);
+  });
   return nodes;
 });
 </script>
 
 <template>
-  <DirectoryTreeNode v-if="tree.length" :nodes="tree" />
-  <p v-else class="directory-empty">暂无文档。</p>
+  <DirectoryTreeNode v-if="entries.length" :nodes="entries" />
+  <p v-else class="directory-empty">暂无内容，等待填充。</p>
 </template>
 
 <style scoped>
-.directory-tree {
-  margin: 8px 0 16px;
-  padding-left: 22px;
-}
-
-.directory-tree .directory-tree {
-  margin: 4px 0 8px;
-}
-
-.directory-folder {
-  font-weight: 600;
-}
-
-.directory-document {
-  text-decoration: none;
-}
-
-.directory-description {
-  margin-left: 8px;
-  color: var(--vp-c-text-2);
-  font-size: 0.9em;
-}
-
 .directory-empty {
   color: var(--vp-c-text-2);
 }

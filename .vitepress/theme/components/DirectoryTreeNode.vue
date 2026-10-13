@@ -7,7 +7,6 @@ export interface DirectoryTreeNode {
   title?: string;
   description?: string;
   url?: string;
-  children?: DirectoryTreeNode[];
 }
 
 defineOptions({ name: "DirectoryTreeNode" });
@@ -18,8 +17,9 @@ defineProps<{ nodes: DirectoryTreeNode[] }>();
   <ul class="directory-tree">
     <li v-for="node in nodes" :key="`${node.type}:${node.url || node.name}`">
       <template v-if="node.type === 'folder'">
-        <span class="directory-folder">{{ node.name }}</span>
-        <DirectoryTreeNode :nodes="node.children || []" />
+        <!-- 有 index.md 的子目录渲染为链接，否则仅显示目录名 -->
+        <a v-if="node.url" class="directory-folder" :href="withBase(node.url)">{{ node.title || node.name }}</a>
+        <span v-else class="directory-folder">{{ node.name }}</span>
       </template>
       <template v-else>
         <a class="directory-document" :href="withBase(node.url || '#')">{{ node.title || node.name }}</a>
@@ -28,3 +28,24 @@ defineProps<{ nodes: DirectoryTreeNode[] }>();
     </li>
   </ul>
 </template>
+
+<style scoped>
+.directory-tree {
+  margin: 8px 0 16px;
+  padding-left: 22px;
+}
+
+.directory-folder {
+  font-weight: 600;
+}
+
+.directory-document {
+  text-decoration: none;
+}
+
+.directory-description {
+  margin-left: 8px;
+  color: var(--vp-c-text-2);
+  font-size: 0.9em;
+}
+</style>
