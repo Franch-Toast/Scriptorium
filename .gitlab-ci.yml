@@ -17,7 +17,10 @@ build:
   stage: build
   image: node:20
   script:
-    - npm i -g pnpm
+    # 固定 pnpm 版本（与本地一致）：更早的 pnpm 新版默认启用
+    # minimumReleaseAge 供应链策略，会拒绝 lockfile 中发布未满冷却期的包
+    # （如 vitepress-carbon 依赖的 @iconify-json/simple-icons）
+    - npm i -g pnpm@10.32.1
     - pnpm install --frozen-lockfile
     # prebuild 自动执行 frontmatter 校验
     - pnpm build
