@@ -45,11 +45,15 @@ deploy:
         exit 1
       fi
       export DR_ACCESS_TOKEN
-      DIST_DIR=".vitepress/dist"
-      if [ ! -d "${DIST_DIR}" ]; then
-        echo "ERROR: 构建产物 ${DIST_DIR} 不存在，请检查 build 阶段 artifacts 是否正常上传"
-        exit 1
-      fi
-      webfile file upload "${DIST_DIR}/" "${NAMESPACE}:/" --override
+      # 整目录上传：页面与配置一次交付（advance.md 推荐写法）。
+      # 注：实测 CLI v0.5.4 目录上传会保留目录名（站点落 /dist/ 下），
+      # 若发布后根首页未更新，需检查 CLI 是否已对齐 advance.md 铺根语义
+      webfile file upload .vitepress/dist/ "${NAMESPACE}:/" --override
+      # 站点配置单独交付：整目录/通配符上传会漏掉点号开头的 .webfile/
+      # （advance.md 警告），显式补传保证 /.webfile/config.yaml 与
+      # 产物一致；目录名保留语义下恰好落在正确位置
+      webfile file upload .vitepress/dist/.webfile "${NAMESPACE}:/" --override
+      # 刷新配置缓存，本次上传的 config.yaml 立即生效
+      webfile server config refresh "${NAMESPACE}"
       echo ""
       echo "发布完成：https://webfile.deeproute.cn/${NAMESPACE}/  (tag: ${CI_COMMIT_TAG})"

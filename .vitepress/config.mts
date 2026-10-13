@@ -62,6 +62,9 @@ export default withMermaid(
   defineConfigWithTheme<ThemeConfig>({
     extends: baseConfig,
     // 内容目录与工程布局和个人站完全同构，cherry-pick 的文档无需任何调整即可构建
+    // 注意：.vitepress/public/.webfile/（站点配置）的拷入由 package.json 的
+    // build 脚本后置 cp 完成——VitePress 1.6.4 build 硬编码拷贝 srcDir/public，
+    // 不读 publicDir 配置
     srcDir: "docs",
     cacheDir: ".vitepress/cache",
     lang: "zh-CN",

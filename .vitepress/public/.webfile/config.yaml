@@ -1,0 +1,27 @@
+# Webfile 站点配置（纳入版本管理，随产物发布）
+# 文档：https://webfile.deeproute.cn/webfile/#/docs?doc=content/advance.md
+# 链路：本文件位于 .vitepress/public/.webfile/（仓库管理），pnpm build 末尾
+# 的 cp 将其拷入产物 dist/.webfile/config.yaml；deploy 阶段单独上传到远端
+# /.webfile/ 并 refresh 生效。修改后远端与仓库两端保持一致，可评审、可重建。
+name: "yifeizhang的空间"
+description: ""
+
+# 站点根目录：整个命名空间作为站点根
+root: /
+
+file:
+  # 目录下无 index.html 时返回 404，不暴露文件列表
+  allowListDirectory: false
+  # 禁止外部访问 /.webfile 配置目录
+  allowVisitConfig: false
+  responseHeaders:
+    # HTML 不缓存，每次 CI 发布即时生效
+    - name: Cache-Control
+      value: "no-cache, no-store, must-revalidate"
+      path: ".*\\.html"
+    # 带 hash 的静态资源长缓存（VitePress 产物文件名含内容 hash）
+    - name: Cache-Control
+      value: "public, max-age=31536000, immutable"
+      path: ".*\\.(js|css|woff2|png|jpg|jpeg|gif|svg|ico|webp)"
+
+proxy: []

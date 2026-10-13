@@ -6,7 +6,7 @@
     "docs:frontmatter": "node scripts/docs-frontmatter.mjs",
     "dev": "pnpm docs:frontmatter --check && vitepress dev .",
     "prebuild": "pnpm docs:frontmatter --check",
-    "build": "vitepress build .",
+    "build": "vitepress build . && cp -a .vitepress/public/. .vitepress/dist/",
     "preview": "vitepress preview ."
   },
   "devDependencies": {
