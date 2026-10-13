@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>iceoryx 零拷贝 IPC 架构详解</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e1a;
+  --surface: #111827;
+  --surface2: #1a2332;
+  --border: #2a3a4e;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --accent: #38bdf8;
+  --accent2: #818cf8;
+  --green: #4ade80;
+  --orange: #fb923c;
+  --red: #f87171;
+  --purple: #a78bfa;
+  --yellow: #fbbf24;
+  --cyan: #22d3ee;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'Noto Sans SC', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  overflow-x: hidden;
+}
+
+.hero {
+  position: relative;
+  padding: 60px 40px 40px;
+  text-align: center;
+  background: linear-gradient(180deg, #0f172a 0%, var(--bg) 100%);
+  overflow: hidden;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -50%; left: -50%;
+  width: 200%; height: 200%;
+  background: radial-gradient(ellipse at 50% 30%, rgba(56,189,248,0.08) 0%, transparent 60%),
+              radial-gradient(ellipse at 30% 70%, rgba(129,140,248,0.06) 0%, transparent 50%);
+  animation: drift 20s ease-in-out infinite;
+}
+
+@keyframes drift {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  50% { transform: translate(2%, -1%) rotate(1deg); }
+}
+
+.hero h1 {
+  position: relative;
+  font-size: 2.8rem;
+  font-weight: 900;
+  letter-spacing: -1px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2), var(--cyan));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin-bottom: 12px;
+}
+
+.hero .subtitle {
+  position: relative;
+  color: var(--text-dim);
+  font-size: 1.1rem;
+  font-weight: 300;
+}
+
+.hero .badge {
+  position: relative;
+  display: inline-block;
+  margin-top: 16px;
+  padding: 6px 18px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: rgba(56,189,248,0.08);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+.tabs {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  gap: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+
+.tab {
+  flex-shrink: 0;
+  padding: 14px 24px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-dim);
+  border-bottom: 2px solid transparent;
+  transition: all 0.25s;
+  white-space: nowrap;
+}
+.tab:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: rgba(56,189,248,0.05);
+}
+
+.content { max-width: 1100px; margin: 0 auto; padding: 40px 24px 80px; }
+
+.section { display: none; animation: fadeIn 0.4s ease; }
+.section.active { display: block; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+h2 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin-bottom: 20px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+}
+
+h3 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin: 28px 0 12px;
+  color: var(--purple);
+}
+
+p, li { color: var(--text); margin-bottom: 10px; font-size: 0.95rem; }
+ul { padding-left: 20px; }
+li { margin-bottom: 6px; }
+
+.highlight { color: var(--accent); font-weight: 500; }
+.code {
+  font-family: 'JetBrains Mono', monospace;
+  background: rgba(56,189,248,0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: var(--cyan);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  margin: 20px 0;
+}
+
+.card-accent { border-left: 3px solid var(--accent); }
+.card-green { border-left: 3px solid var(--green); }
+.card-orange { border-left: 3px solid var(--orange); }
+.card-red { border-left: 3px solid var(--red); }
+
+.diagram-container {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 30px;
+  margin: 24px 0;
+  overflow-x: auto;
+}
+
+svg text { font-family: 'Noto Sans SC', sans-serif; }
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin: 20px 0;
+}
+
+@media (max-width: 768px) {
+  .grid-2 { grid-template-columns: 1fr; }
+  .hero h1 { font-size: 2rem; }
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 0.9rem;
+}
+.compare-table th {
+  text-align: left;
+  padding: 10px 14px;
+  background: var(--surface2);
+  color: var(--accent);
+  font-weight: 600;
+  border-bottom: 2px solid var(--border);
+}
+.compare-table td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.compare-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+.tag {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-right: 6px;
+}
+.tag-blue { background: rgba(56,189,248,0.15); color: var(--accent); }
+.tag-green { background: rgba(74,222,128,0.15); color: var(--green); }
+.tag-orange { background: rgba(251,146,60,0.15); color: var(--orange); }
+.tag-purple { background: rgba(167,139,250,0.15); color: var(--purple); }
+
+pre.code-block {
+  background: var(--surface2);
+  padding: 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  color: var(--text);
+  line-height: 1.6;
+  margin-top: 12px;
+  border: 1px solid var(--border);
+}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Eclipse iceoryx</h1>
+  <div class="subtitle">真正的零拷贝进程间通信中间件</div>
+  <div class="badge">Zero-Copy · Shared Memory · Lock-Free · &lt;1μs Latency</div>
+</div>
+
+<div class="tabs" id="tabs">
+  <div class="tab active" data-tab="bg">背景与动机</div>
+  <div class="tab" data-tab="arch">整体架构</div>
+  <div class="tab" data-tab="shm">共享内存管理</div>
+  <div class="tab" data-tab="flow">零拷贝通信流程</div>
+  <div class="tab" data-tab="church">Church 集成</div>
+  <div class="tab" data-tab="compare">对比传统 IPC</div>
+</div>
+
+<div class="content">
+
+<!-- ===================== 背景与动机 ===================== -->
+<div class="section active" id="sec-bg">
+  <h2>背景与动机</h2>
+  
+  <div class="card card-accent">
+    <p>iceoryx 起源于<span class="highlight">汽车自动驾驶领域</span>。随着视觉感知、激光雷达、高精地图等模块的引入，车载系统需要每秒传输 <strong>数 GB</strong> 的传感器数据。传统 IPC 机制（socket、pipe、D-Bus）的多次内存拷贝成为了不可接受的性能瓶颈。</p>
+  </div>
+
+  <h3>为什么需要零拷贝？</h3>
+
+  <div class="diagram-container">
+    <svg viewBox="0 0 900 280" width="100%">
+      <text x="220" y="30" fill="#f87171" font-size="15" font-weight="700" text-anchor="middle">传统 IPC（如 Socket）</text>
+      <rect x="30" y="50" width="120" height="50" rx="8" fill="#1e293b" stroke="#475569" stroke-width="1.5"/>
+      <text x="90" y="80" fill="#e2e8f0" font-size="13" text-anchor="middle">Publisher</text>
+      <text x="90" y="94" fill="#94a3b8" font-size="10" text-anchor="middle">用户空间</text>
+      
+      <path d="M150,75 L185,75" stroke="#f87171" stroke-width="2" marker-end="url(#arrowRed)"/>
+      <rect x="185" y="55" width="70" height="40" rx="6" fill="#7f1d1d" stroke="#f87171" stroke-width="1"/>
+      <text x="220" y="78" fill="#fca5a5" font-size="10" text-anchor="middle">Copy①</text>
+      
+      <path d="M255,75 L290,75" stroke="#f87171" stroke-width="2" marker-end="url(#arrowRed)"/>
+      <rect x="290" y="50" width="100" height="50" rx="8" fill="#1e293b" stroke="#475569" stroke-width="1.5"/>
+      <text x="340" y="76" fill="#e2e8f0" font-size="12" text-anchor="middle">内核缓冲区</text>
+      <text x="340" y="90" fill="#94a3b8" font-size="10" text-anchor="middle">kernel space</text>
+      
+      <rect x="290" y="130" width="120" height="50" rx="8" fill="#1e293b" stroke="#475569" stroke-width="1.5"/>
+      <text x="350" y="160" fill="#e2e8f0" font-size="13" text-anchor="middle">Subscriber</text>
+      <text x="350" y="174" fill="#94a3b8" font-size="10" text-anchor="middle">用户空间</text>
+      <path d="M340,100 L340,130" stroke="#f87171" stroke-width="2" marker-end="url(#arrowRed)"/>
+      <text x="356" y="118" fill="#fca5a5" font-size="10">Copy②</text>
+
+      <rect x="60" y="210" width="340" height="44" rx="8" fill="rgba(248,113,113,0.1)" stroke="#f87171" stroke-width="1"/>
+      <text x="230" y="228" fill="#f87171" font-size="12" text-anchor="middle" font-weight="600">⚠ 延迟随数据大小线性增长</text>
+      <text x="230" y="244" fill="#fca5a5" font-size="11" text-anchor="middle">8MB 点云 → 多次 memcpy → ~ms 级延迟</text>
+
+      <!-- iceoryx Zero-Copy -->
+      <text x="680" y="30" fill="#4ade80" font-size="15" font-weight="700" text-anchor="middle">iceoryx 零拷贝</text>
+      <rect x="500" y="50" width="120" height="50" rx="8" fill="#1e293b" stroke="#475569" stroke-width="1.5"/>
+      <text x="560" y="80" fill="#e2e8f0" font-size="13" text-anchor="middle">Publisher</text>
+      
+      <rect x="540" y="130" width="280" height="60" rx="8" fill="rgba(74,222,128,0.08)" stroke="#4ade80" stroke-width="1.5" stroke-dasharray="6,3"/>
+      <text x="680" y="152" fill="#4ade80" font-size="12" text-anchor="middle" font-weight="600">共享内存 (Shared Memory)</text>
+      <text x="680" y="168" fill="#86efac" font-size="11" text-anchor="middle">Publisher 直接写入 → Subscriber 直接读取</text>
+      
+      <rect x="740" y="50" width="120" height="50" rx="8" fill="#1e293b" stroke="#475569" stroke-width="1.5"/>
+      <text x="800" y="80" fill="#e2e8f0" font-size="13" text-anchor="middle">Subscriber</text>
+
+      <path d="M560,100 L560,130" stroke="#4ade80" stroke-width="2" marker-end="url(#arrowGreen)"/>
+      <text x="542" y="118" fill="#4ade80" font-size="9" text-anchor="end">写入</text>
+      <path d="M800,130 L800,100" stroke="#4ade80" stroke-width="2" marker-end="url(#arrowGreenUp)"/>
+      <text x="818" y="118" fill="#4ade80" font-size="9">读取</text>
+      
+      <path d="M620,75 L640,75 L640,110 L760,110 L760,75 L740,75" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="4,3" fill="none" marker-end="url(#arrowBlue)"/>
+      <text x="700" y="107" fill="#38bdf8" font-size="10" text-anchor="middle">仅传递 offset</text>
+
+      <rect x="530" y="210" width="320" height="44" rx="8" fill="rgba(74,222,128,0.1)" stroke="#4ade80" stroke-width="1"/>
+      <text x="690" y="228" fill="#4ade80" font-size="12" text-anchor="middle" font-weight="600">✓ 延迟恒定 &lt;1μs，与数据大小无关</text>
+      <text x="690" y="244" fill="#86efac" font-size="11" text-anchor="middle">8MB 点云 → 零拷贝 → 亚微秒延迟</text>
+
+      <defs>
+        <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#f87171"/></marker>
+        <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#4ade80"/></marker>
+        <marker id="arrowGreenUp" viewBox="0 0 10 10" refX="5" refY="0" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,10 L5,0 L10,10 z" fill="#4ade80"/></marker>
+        <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#38bdf8"/></marker>
+      </defs>
+    </svg>
+  </div>
+
+  <h3>iceoryx 关键特性</h3>
+  <div class="grid-2">
+    <div class="card">
+      <p><span class="tag tag-blue">性能</span></p>
+      <p>端到端延迟 <strong>&lt;1μs</strong>，与数据大小无关。无 memcpy、无序列化（可选）、无内核切换。</p>
+    </div>
+    <div class="card">
+      <p><span class="tag tag-green">可靠性</span></p>
+      <p>源于汽车安全关键领域，前身已部署在<strong>数百万量产车辆</strong>中。避免 heap、exception 和 UB。</p>
+    </div>
+    <div class="card">
+      <p><span class="tag tag-orange">无锁设计</span></p>
+      <p>使用 lock-free MPMC 队列和静态内存池，避免死锁风险，保证实时确定性。</p>
+    </div>
+    <div class="card">
+      <p><span class="tag tag-purple">多平台</span></p>
+      <p>支持 <strong>Linux、QNX、macOS、Windows</strong>。C++ 和 C API，Rust 绑定（iceoryx2）。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== 整体架构 ===================== -->
+<div class="section" id="sec-arch">
+  <h2>整体架构</h2>
+
+  <div class="diagram-container">
+    <svg viewBox="0 0 900 520" width="100%">
+      <!-- RouDi 中央守护进程 -->
+      <rect x="300" y="10" width="300" height="70" rx="12" fill="rgba(251,191,36,0.1)" stroke="#fbbf24" stroke-width="2"/>
+      <text x="450" y="38" fill="#fbbf24" font-size="16" font-weight="700" text-anchor="middle">RouDi</text>
+      <text x="450" y="58" fill="#fde68a" font-size="11" text-anchor="middle">路由与发现守护进程 (Routing &amp; Discovery Daemon)</text>
+      
+      <rect x="180" y="30" width="95" height="28" rx="6" fill="#111827" stroke="#fbbf24" stroke-width="1"/>
+      <text x="227" y="48" fill="#fbbf24" font-size="10" text-anchor="middle">内存管理</text>
+      <rect x="625" y="30" width="95" height="28" rx="6" fill="#111827" stroke="#fbbf24" stroke-width="1"/>
+      <text x="672" y="48" fill="#fbbf24" font-size="10" text-anchor="middle">服务发现</text>
+      
+      <path d="M275,44 L300,44" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3"/>
+      <path d="M600,44 L625,44" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- 共享内存区 -->
+      <rect x="50" y="110" width="800" height="180" rx="12" fill="rgba(56,189,248,0.04)" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="8,4"/>
+      <text x="450" y="135" fill="#38bdf8" font-size="14" font-weight="700" text-anchor="middle">POSIX 共享内存区域 (/dev/shm)</text>
+
+      <!-- Management segment -->
+      <rect x="80" y="150" width="200" height="120" rx="8" fill="rgba(167,139,250,0.08)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="180" y="175" fill="#a78bfa" font-size="12" font-weight="600" text-anchor="middle">管理段 (Management)</text>
+      <text x="180" y="195" fill="#94a3b8" font-size="10" text-anchor="middle">• 服务注册表</text>
+      <text x="180" y="210" fill="#94a3b8" font-size="10" text-anchor="middle">• 订阅关系图</text>
+      <text x="180" y="225" fill="#94a3b8" font-size="10" text-anchor="middle">• 心跳 / 监控</text>
+      <text x="180" y="240" fill="#94a3b8" font-size="10" text-anchor="middle">• 条件变量通知</text>
+      <text x="180" y="256" fill="#c4b5fd" font-size="9" text-anchor="middle">RouDi 独占写入</text>
+
+      <!-- User segment -->
+      <rect x="310" y="150" width="520" height="120" rx="8" fill="rgba(74,222,128,0.06)" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="570" y="175" fill="#4ade80" font-size="12" font-weight="600" text-anchor="middle">数据段 (User Segment)</text>
+      
+      <!-- Mempools -->
+      <rect x="330" y="190" width="100" height="60" rx="6" fill="#111827" stroke="#4ade80" stroke-width="1"/>
+      <text x="380" y="210" fill="#4ade80" font-size="10" text-anchor="middle">Mempool</text>
+      <text x="380" y="224" fill="#86efac" font-size="9" text-anchor="middle">128B × 10000</text>
+      <rect x="338" y="234" width="14" height="10" rx="2" fill="#4ade80" opacity="0.4"/>
+      <rect x="356" y="234" width="14" height="10" rx="2" fill="#4ade80" opacity="0.4"/>
+      <rect x="374" y="234" width="14" height="10" rx="2" fill="#4ade80" opacity="0.6"/>
+      <rect x="392" y="234" width="14" height="10" rx="2" fill="#4ade80" opacity="0.3"/>
+      <rect x="410" y="234" width="14" height="10" rx="2" fill="#4ade80" opacity="0.5"/>
+
+      <rect x="450" y="190" width="100" height="60" rx="6" fill="#111827" stroke="#38bdf8" stroke-width="1"/>
+      <text x="500" y="210" fill="#38bdf8" font-size="10" text-anchor="middle">Mempool</text>
+      <text x="500" y="224" fill="#7dd3fc" font-size="9" text-anchor="middle">1KB × 5000</text>
+
+      <rect x="570" y="190" width="100" height="60" rx="6" fill="#111827" stroke="#fb923c" stroke-width="1"/>
+      <text x="620" y="210" fill="#fb923c" font-size="10" text-anchor="middle">Mempool</text>
+      <text x="620" y="224" fill="#fdba74" font-size="9" text-anchor="middle">64KB × 500</text>
+
+      <rect x="690" y="190" width="120" height="60" rx="6" fill="#111827" stroke="#f87171" stroke-width="1"/>
+      <text x="750" y="210" fill="#f87171" font-size="10" text-anchor="middle">Mempool</text>
+      <text x="750" y="224" fill="#fca5a5" font-size="9" text-anchor="middle">20MB × 5</text>
+      <text x="750" y="237" fill="#94a3b8" font-size="8" text-anchor="middle">(大型点云)</text>
+
+      <!-- Processes -->
+      <rect x="60" y="340" width="180" height="80" rx="10" fill="#111827" stroke="#38bdf8" stroke-width="1.5"/>
+      <text x="150" y="368" fill="#38bdf8" font-size="14" font-weight="600" text-anchor="middle">进程 A</text>
+      <text x="150" y="386" fill="#94a3b8" font-size="10" text-anchor="middle">PoshRuntime</text>
+      <text x="150" y="400" fill="#94a3b8" font-size="10" text-anchor="middle">Publisher × N</text>
+
+      <rect x="360" y="340" width="180" height="80" rx="10" fill="#111827" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="450" y="368" fill="#4ade80" font-size="14" font-weight="600" text-anchor="middle">进程 B</text>
+      <text x="450" y="386" fill="#94a3b8" font-size="10" text-anchor="middle">PoshRuntime</text>
+      <text x="450" y="400" fill="#94a3b8" font-size="10" text-anchor="middle">Subscriber × N</text>
+
+      <rect x="660" y="340" width="180" height="80" rx="10" fill="#111827" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="750" y="368" fill="#a78bfa" font-size="14" font-weight="600" text-anchor="middle">进程 C</text>
+      <text x="750" y="386" fill="#94a3b8" font-size="10" text-anchor="middle">PoshRuntime</text>
+      <text x="750" y="400" fill="#94a3b8" font-size="10" text-anchor="middle">Pub + Sub</text>
+
+      <path d="M150,340 L150,290" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowBlue)"/>
+      <path d="M450,340 L450,290" stroke="#4ade80" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowGreen)"/>
+      <path d="M750,340 L750,290" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,3"/>
+
+      <path d="M450,80 L450,110" stroke="#fbbf24" stroke-width="2" marker-end="url(#arrowYellow)"/>
+      <text x="470" y="98" fill="#fbbf24" font-size="9">创建 &amp; 管理</text>
+
+      <path d="M380,80 L150,340" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4,3" opacity="0.4"/>
+      <path d="M450,80 L450,340" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4,3" opacity="0.4"/>
+      <path d="M520,80 L750,340" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4,3" opacity="0.4"/>
+
+      <text x="450" y="480" fill="#94a3b8" font-size="11" text-anchor="middle">每个进程通过 mmap() 映射共享内存段到自己的虚拟地址空间</text>
+      <text x="450" y="498" fill="#94a3b8" font-size="11" text-anchor="middle">虚拟地址不同，但物理内存相同 → 使用 offset 而非 pointer</text>
+
+      <defs>
+        <marker id="arrowYellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#fbbf24"/></marker>
+      </defs>
+    </svg>
+  </div>
+
+  <div class="card card-accent">
+    <h3 style="margin-top:0">核心组件说明</h3>
+    <ul>
+      <li><strong>RouDi (Routing & Discovery Daemon)</strong>：中央守护进程，负责在系统启动时创建共享内存段、管理内存池、执行服务发现（匹配 Publisher 和 Subscriber）、监控进程心跳</li>
+      <li><strong>PoshRuntime</strong>：每个进程内的 iceoryx 运行时，负责与 RouDi 通信、映射共享内存、维护本进程的 Publisher/Subscriber 实例</li>
+      <li><strong>Mempool (内存池)</strong>：共享内存被划分为多个 Mempool，每个 Mempool 包含固定大小的 Chunk。分配时选择能容纳数据的最小 Chunk Size</li>
+      <li><strong>CAPRO (Canonical Protocol)</strong>：iceoryx 内部的服务发现协议，使用 Service/Instance/Event 三元组标识通信端点</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================== 共享内存管理 ===================== -->
+<div class="section" id="sec-shm">
+  <h2>共享内存管理</h2>
+
+  <h3>内存组织：Segment → Mempool → Chunk</h3>
+
+  <div class="diagram-container">
+    <svg viewBox="0 0 860 400" width="100%">
+      <rect x="20" y="20" width="820" height="360" rx="14" fill="rgba(56,189,248,0.04)" stroke="#38bdf8" stroke-width="2"/>
+      <text x="430" y="50" fill="#38bdf8" font-size="16" font-weight="700" text-anchor="middle">User Segment (POSIX shm_open → mmap)</text>
+
+      <!-- Mempool 1 -->
+      <rect x="50" y="70" width="240" height="130" rx="8" fill="#111827" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="170" y="95" fill="#4ade80" font-size="13" font-weight="600" text-anchor="middle">Mempool #1: 128 Bytes</text>
+      <text x="170" y="112" fill="#94a3b8" font-size="10" text-anchor="middle">count: 10000</text>
+      
+      <g transform="translate(65, 125)">
+        <rect width="22" height="22" rx="3" fill="#4ade80" opacity="0.8"/>
+        <rect x="26" width="22" height="22" rx="3" fill="#4ade80" opacity="0.3"/>
+        <rect x="52" width="22" height="22" rx="3" fill="#4ade80" opacity="0.6"/>
+        <rect x="78" width="22" height="22" rx="3" fill="#4ade80" opacity="0.3"/>
+        <rect x="104" width="22" height="22" rx="3" fill="#4ade80" opacity="0.5"/>
+        <rect x="130" width="22" height="22" rx="3" fill="#4ade80" opacity="0.3"/>
+        <rect x="156" width="22" height="22" rx="3" fill="#4ade80" opacity="0.7"/>
+        <rect x="182" width="22" height="22" rx="3" fill="#4ade80" opacity="0.3"/>
+      </g>
+      <g transform="translate(65, 155)">
+        <rect width="22" height="22" rx="3" fill="#4ade80" opacity="0.3"/>
+        <rect x="26" width="22" height="22" rx="3" fill="#4ade80" opacity="0.4"/>
+        <text x="60" y="16" fill="#94a3b8" font-size="10">... × 10000</text>
+      </g>
+
+      <rect x="65" y="125" width="22" height="22" rx="3" fill="none" stroke="#fbbf24" stroke-width="2"/>
+
+      <!-- Mempool 2 -->
+      <rect x="310" y="70" width="240" height="130" rx="8" fill="#111827" stroke="#38bdf8" stroke-width="1.5"/>
+      <text x="430" y="95" fill="#38bdf8" font-size="13" font-weight="600" text-anchor="middle">Mempool #2: 1 KB</text>
+      <text x="430" y="112" fill="#94a3b8" font-size="10" text-anchor="middle">count: 5000</text>
+      <g transform="translate(325, 125)">
+        <rect width="30" height="22" rx="3" fill="#38bdf8" opacity="0.5"/>
+        <rect x="34" width="30" height="22" rx="3" fill="#38bdf8" opacity="0.3"/>
+        <rect x="68" width="30" height="22" rx="3" fill="#38bdf8" opacity="0.6"/>
+        <rect x="102" width="30" height="22" rx="3" fill="#38bdf8" opacity="0.3"/>
+        <rect x="136" width="30" height="22" rx="3" fill="#38bdf8" opacity="0.5"/>
+        <rect x="170" width="30" height="22" rx="3" fill="#38bdf8" opacity="0.3"/>
+      </g>
+
+      <!-- Mempool 3 -->
+      <rect x="570" y="70" width="250" height="130" rx="8" fill="#111827" stroke="#fb923c" stroke-width="1.5"/>
+      <text x="695" y="95" fill="#fb923c" font-size="13" font-weight="600" text-anchor="middle">Mempool #3: 20 MB</text>
+      <text x="695" y="112" fill="#94a3b8" font-size="10" text-anchor="middle">count: 5 (大型消息)</text>
+      <g transform="translate(585, 125)">
+        <rect width="60" height="50" rx="4" fill="#fb923c" opacity="0.4"/>
+        <rect x="66" width="60" height="50" rx="4" fill="#fb923c" opacity="0.3"/>
+        <rect x="132" width="60" height="50" rx="4" fill="#fb923c" opacity="0.5"/>
+      </g>
+
+      <!-- Chunk 结构详解 -->
+      <text x="430" y="235" fill="#e2e8f0" font-size="14" font-weight="700" text-anchor="middle">Chunk 内部结构</text>
+
+      <rect x="100" y="255" width="660" height="100" rx="8" fill="#111827" stroke="#2a3a4e" stroke-width="1.5"/>
+      
+      <rect x="110" y="265" width="180" height="80" rx="6" fill="rgba(167,139,250,0.1)" stroke="#a78bfa" stroke-width="1"/>
+      <text x="200" y="290" fill="#a78bfa" font-size="12" font-weight="600" text-anchor="middle">ChunkHeader</text>
+      <text x="200" y="308" fill="#94a3b8" font-size="9" text-anchor="middle">chunk_size | origin_id</text>
+      <text x="200" y="322" fill="#94a3b8" font-size="9" text-anchor="middle">sequence_number</text>
+      <text x="200" y="336" fill="#94a3b8" font-size="9" text-anchor="middle">user_header_size | payload_size</text>
+      
+      <rect x="300" y="265" width="120" height="80" rx="6" fill="rgba(251,191,36,0.08)" stroke="#fbbf24" stroke-width="1"/>
+      <text x="360" y="295" fill="#fbbf24" font-size="12" font-weight="600" text-anchor="middle">User Header</text>
+      <text x="360" y="315" fill="#94a3b8" font-size="9" text-anchor="middle">(可选，自定义元数据)</text>
+      
+      <rect x="430" y="265" width="320" height="80" rx="6" fill="rgba(74,222,128,0.08)" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="590" y="295" fill="#4ade80" font-size="14" font-weight="700" text-anchor="middle">User Payload</text>
+      <text x="590" y="315" fill="#86efac" font-size="10" text-anchor="middle">实际的消息数据</text>
+      <text x="590" y="332" fill="#94a3b8" font-size="9" text-anchor="middle">Publisher 通过 loan() 获取这块内存并直接写入</text>
+    </svg>
+  </div>
+
+  <div class="card card-green">
+    <h3 style="margin-top:0">RouDi 配置示例 (roudi_config.toml)</h3>
+    <p>在 Deeproute 系统中的典型配置：</p>
+    <pre class="code-block">[general]
+version = 1
+
+[[segment]]
+reader = "root"
+policy = "NO_OP"
+
+[[segment.mempool]]
+size = 128          # Chunk 大小 (bytes)
+count = 10000       # 数量
+
+[[segment.mempool]]
+size = 1024
+count = 5000
+
+[[segment.mempool]]
+size = 16384
+count = 1000
+
+[[segment.mempool]]
+size = 131072       # 128 KB
+count = 200
+
+[[segment.mempool]]
+size = 1048576      # 1 MB
+count = 50
+
+[[segment.mempool]]
+size = 20971520     # 20 MB (大型点云等)
+count = 5</pre>
+    <p style="margin-top:12px;">iceoryx 分配时自动选择 <strong>≥ 数据大小的最小 chunk</strong>。例如发送 800B 消息 → 分配 1024B chunk。</p>
+  </div>
+
+  <h3>虚拟地址与 Offset 机制</h3>
+  <div class="card card-accent">
+    <p>不同进程通过 <span class="code">mmap()</span> 将同一个共享内存段映射到各自的虚拟地址空间。由于映射位置不同，<strong>直接传递指针是不可行的</strong>。</p>
+    <p>iceoryx 的解决方案：使用 <span class="highlight">相对于 SHM 基地址的 offset（偏移量）</span>代替绝对指针。</p>
+    <pre class="code-block">// 进程 A (Publisher)
+base_addr_A = 0x7f0000000000   // mmap 返回的基地址
+chunk_ptr_A = base_addr_A + offset
+
+// 进程 B (Subscriber)  
+base_addr_B = 0x7f8000000000   // 不同的映射地址
+chunk_ptr_B = base_addr_B + offset  // 同一个 offset → 同一个物理 chunk</pre>
+  </div>
+</div>
+
+<!-- ===================== 零拷贝通信流程 ===================== -->
+<div class="section" id="sec-flow">
+  <h2>零拷贝通信流程</h2>
+
+  <div class="diagram-container">
+    <svg viewBox="0 0 900 520" width="100%">
+      <!-- Publisher 进程 -->
+      <rect x="30" y="20" width="260" height="480" rx="12" fill="rgba(56,189,248,0.04)" stroke="#38bdf8" stroke-width="1.5"/>
+      <text x="160" y="50" fill="#38bdf8" font-size="15" font-weight="700" text-anchor="middle">Publisher 进程</text>
+
+      <!-- Shared Memory -->
+      <rect x="330" y="20" width="240" height="480" rx="12" fill="rgba(74,222,128,0.04)" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="450" y="50" fill="#4ade80" font-size="15" font-weight="700" text-anchor="middle">共享内存</text>
+
+      <!-- Subscriber 进程 -->
+      <rect x="610" y="20" width="260" height="480" rx="12" fill="rgba(167,139,250,0.04)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="740" y="50" fill="#a78bfa" font-size="15" font-weight="700" text-anchor="middle">Subscriber 进程</text>
+
+      <!-- Step 1: loan -->
+      <rect x="55" y="80" width="210" height="55" rx="8" fill="#111827" stroke="#38bdf8" stroke-width="1.5"/>
+      <circle cx="75" cy="107" r="14" fill="rgba(56,189,248,0.2)" stroke="#38bdf8" stroke-width="1.5"/>
+      <text x="75" y="112" fill="#38bdf8" font-size="12" font-weight="700" text-anchor="middle">1</text>
+      <text x="170" y="103" fill="#e2e8f0" font-size="12" font-weight="600" text-anchor="middle">loan(size)</text>
+      <text x="170" y="120" fill="#94a3b8" font-size="9" text-anchor="middle">向内存池申请一个 chunk</text>
+
+      <rect x="355" y="85" width="190" height="45" rx="6" fill="rgba(74,222,128,0.1)" stroke="#4ade80" stroke-width="1"/>
+      <text x="450" y="108" fill="#4ade80" font-size="11" text-anchor="middle">分配 chunk → 返回指针</text>
+      <text x="450" y="122" fill="#94a3b8" font-size="9" text-anchor="middle">lock-free 池分配器</text>
+
+      <path d="M265,107 L355,107" stroke="#38bdf8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+      <path d="M355,100 L265,100" stroke="#4ade80" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowBlueR)"/>
+
+      <!-- Step 2: write -->
+      <rect x="55" y="160" width="210" height="55" rx="8" fill="#111827" stroke="#38bdf8" stroke-width="1.5"/>
+      <circle cx="75" cy="187" r="14" fill="rgba(56,189,248,0.2)" stroke="#38bdf8" stroke-width="1.5"/>
+      <text x="75" y="192" fill="#38bdf8" font-size="12" font-weight="700" text-anchor="middle">2</text>
+      <text x="170" y="183" fill="#e2e8f0" font-size="12" font-weight="600" text-anchor="middle">直接写入数据</text>
+      <text x="170" y="200" fill="#94a3b8" font-size="9" text-anchor="middle">protobuf serialize 到 chunk</text>
+
+      <rect x="355" y="163" width="190" height="50" rx="6" fill="rgba(74,222,128,0.15)" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="450" y="185" fill="#4ade80" font-size="11" font-weight="600" text-anchor="middle">数据直接在 SHM 中</text>
+      <text x="450" y="200" fill="#86efac" font-size="9" text-anchor="middle">☆ 不经过任何用户缓冲区 ☆</text>
+
+      <path d="M265,187 L355,187" stroke="#fbbf24" stroke-width="2" marker-end="url(#arrowYellow)"/>
+      <text x="310" y="180" fill="#fbbf24" font-size="9" text-anchor="middle">写入</text>
+
+      <!-- Step 3: publish -->
+      <rect x="55" y="240" width="210" height="55" rx="8" fill="#111827" stroke="#38bdf8" stroke-width="1.5"/>
+      <circle cx="75" cy="267" r="14" fill="rgba(56,189,248,0.2)" stroke="#38bdf8" stroke-width="1.5"/>
+      <text x="75" y="272" fill="#38bdf8" font-size="12" font-weight="700" text-anchor="middle">3</text>
+      <text x="170" y="263" fill="#e2e8f0" font-size="12" font-weight="600" text-anchor="middle">publish()</text>
+      <text x="170" y="280" fill="#94a3b8" font-size="9" text-anchor="middle">通知订阅者有新数据</text>
+
+      <rect x="355" y="243" width="190" height="50" rx="6" fill="rgba(251,191,36,0.1)" stroke="#fbbf24" stroke-width="1"/>
+      <text x="450" y="263" fill="#fbbf24" font-size="11" font-weight="600" text-anchor="middle">offset 入队</text>
+      <text x="450" y="280" fill="#fde68a" font-size="9" text-anchor="middle">lock-free SPSC queue</text>
+
+      <path d="M265,267 L355,267" stroke="#38bdf8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+      <path d="M545,267 L610,267" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowYellow)" stroke-dasharray="4,3"/>
+
+      <!-- Step 4: take -->
+      <rect x="635" y="240" width="210" height="55" rx="8" fill="#111827" stroke="#a78bfa" stroke-width="1.5"/>
+      <circle cx="655" cy="267" r="14" fill="rgba(167,139,250,0.2)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="655" y="272" fill="#a78bfa" font-size="12" font-weight="700" text-anchor="middle">4</text>
+      <text x="750" y="263" fill="#e2e8f0" font-size="12" font-weight="600" text-anchor="middle">take()</text>
+      <text x="750" y="280" fill="#94a3b8" font-size="9" text-anchor="middle">从队列取出 offset</text>
+
+      <!-- Step 5: read -->
+      <rect x="635" y="320" width="210" height="55" rx="8" fill="#111827" stroke="#a78bfa" stroke-width="1.5"/>
+      <circle cx="655" cy="347" r="14" fill="rgba(167,139,250,0.2)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="655" y="352" fill="#a78bfa" font-size="12" font-weight="700" text-anchor="middle">5</text>
+      <text x="750" y="343" fill="#e2e8f0" font-size="12" font-weight="600" text-anchor="middle">offset → 本地指针</text>
+      <text x="750" y="360" fill="#94a3b8" font-size="9" text-anchor="middle">base_addr + offset = 数据地址</text>
+
+      <rect x="355" y="323" width="190" height="50" rx="6" fill="rgba(167,139,250,0.1)" stroke="#a78bfa" stroke-width="1"/>
+      <text x="450" y="345" fill="#a78bfa" font-size="11" font-weight="600" text-anchor="middle">直接访问数据 ✓</text>
+      <text x="450" y="360" fill="#c4b5fd" font-size="9" text-anchor="middle">☆ 零拷贝读取 ☆</text>
+
+      <path d="M635,347 L545,347" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowPurple)"/>
+
+      <!-- Step 6: release -->
+      <rect x="635" y="400" width="210" height="55" rx="8" fill="#111827" stroke="#a78bfa" stroke-width="1.5"/>
+      <circle cx="655" cy="427" r="14" fill="rgba(167,139,250,0.2)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="655" y="432" fill="#a78bfa" font-size="12" font-weight="700" text-anchor="middle">6</text>
+      <text x="750" y="423" fill="#e2e8f0" font-size="12" font-weight="600" text-anchor="middle">release()</text>
+      <text x="750" y="440" fill="#94a3b8" font-size="9" text-anchor="middle">引用计数 -1，归还 chunk</text>
+
+      <rect x="355" y="403" width="190" height="50" rx="6" fill="rgba(56,189,248,0.06)" stroke="#2a3a4e" stroke-width="1"/>
+      <text x="450" y="425" fill="#94a3b8" font-size="11" text-anchor="middle">chunk 回收到 mempool</text>
+      <text x="450" y="440" fill="#94a3b8" font-size="9" text-anchor="middle">所有 subscriber 释放后归还</text>
+
+      <path d="M635,427 L545,427" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrowGray)" stroke-dasharray="4,3"/>
+
+      <defs>
+        <marker id="arrowBlueR" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#4ade80"/></marker>
+        <marker id="arrowPurple" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#a78bfa"/></marker>
+        <marker id="arrowGray" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#94a3b8"/></marker>
+      </defs>
+    </svg>
+  </div>
+
+  <div class="card card-accent">
+    <h3 style="margin-top:0">关键点总结</h3>
+    <ul>
+      <li><strong>loan()</strong> — Publisher 向共享内存池借用一块 chunk，获得的指针直接指向共享内存中的位置</li>
+      <li><strong>直接写入</strong> — Publisher 将数据（如 protobuf SerializeToArray）直接写入 chunk，<span class="highlight">数据从未存在于进程私有内存中</span></li>
+      <li><strong>publish()</strong> — 不拷贝任何数据，仅将 chunk 的 <strong>offset</strong>（相对于 SHM 基地址的偏移量）放入 Subscriber 的接收队列</li>
+      <li><strong>take()</strong> — Subscriber 从队列取出 offset，通过 <span class="code">base_addr + offset</span> 得到本进程中的有效指针</li>
+      <li><strong>release()</strong> — 读取完成后引用计数归零，chunk 回收到 mempool 供下次使用</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================== Church 集成 ===================== -->
+<div class="section" id="sec-church">
+  <h2>Deeproute Church 框架集成</h2>
+
+  <div class="diagram-container">
+    <svg viewBox="0 0 900 480" width="100%">
+      <!-- 应用层 -->
+      <rect x="20" y="10" width="860" height="70" rx="10" fill="rgba(56,189,248,0.06)" stroke="#38bdf8" stroke-width="1.5"/>
+      <text x="450" y="35" fill="#38bdf8" font-size="14" font-weight="700" text-anchor="middle">应用层 (Component)</text>
+      <text x="200" y="60" fill="#e2e8f0" font-size="11" text-anchor="middle">sensor_ins_online_component.cc</text>
+      <text x="500" y="60" fill="#e2e8f0" font-size="11" text-anchor="middle">perception_component.cc</text>
+      <text x="750" y="60" fill="#e2e8f0" font-size="11" text-anchor="middle">map_engine_component.cc</text>
+
+      <path d="M200,80 L200,110" stroke="#38bdf8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+      <text x="220" y="100" fill="#38bdf8" font-size="9">node()->Publish()</text>
+
+      <!-- Church Node 层 -->
+      <rect x="20" y="110" width="860" height="80" rx="10" fill="rgba(167,139,250,0.06)" stroke="#a78bfa" stroke-width="1.5"/>
+      <text x="450" y="135" fill="#a78bfa" font-size="14" font-weight="700" text-anchor="middle">Church Node 层</text>
+      
+      <rect x="60" y="145" width="150" height="35" rx="6" fill="#111827" stroke="#a78bfa" stroke-width="1"/>
+      <text x="135" y="167" fill="#c4b5fd" font-size="11" text-anchor="middle">NodeImpl::Publish()</text>
+      
+      <rect x="240" y="145" width="150" height="35" rx="6" fill="#111827" stroke="#a78bfa" stroke-width="1"/>
+      <text x="315" y="167" fill="#c4b5fd" font-size="11" text-anchor="middle">GetPublisher(topic)</text>
+      
+      <path d="M210,162 L240,162" stroke="#a78bfa" stroke-width="1" marker-end="url(#arrowPurpleR)"/>
+
+      <!-- Publisher 层 -->
+      <rect x="20" y="210" width="860" height="80" rx="10" fill="rgba(251,191,36,0.06)" stroke="#fbbf24" stroke-width="1.5"/>
+      <text x="450" y="235" fill="#fbbf24" font-size="14" font-weight="700" text-anchor="middle">Publisher 层</text>
+      
+      <rect x="60" y="245" width="170" height="35" rx="6" fill="#111827" stroke="#fbbf24" stroke-width="1"/>
+      <text x="145" y="267" fill="#fde68a" font-size="11" text-anchor="middle">Publisher::Publish()</text>
+      
+      <rect x="270" y="245" width="120" height="35" rx="6" fill="#111827" stroke="#fbbf24" stroke-width="1"/>
+      <text x="330" y="267" fill="#fde68a" font-size="10" text-anchor="middle">mutex_ lock</text>
+      
+      <rect x="420" y="245" width="180" height="35" rx="6" fill="#111827" stroke="#fbbf24" stroke-width="1"/>
+      <text x="510" y="267" fill="#fde68a" font-size="11" text-anchor="middle">writer_->Write(header, msg)</text>
+      
+      <path d="M230,262 L270,262" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrowYellow)"/>
+      <path d="M390,262 L420,262" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrowYellow)"/>
+
+      <path d="M315,190 L145,245" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowPurpleR)"/>
+
+      <!-- Transport / Writer 层 -->
+      <rect x="20" y="310" width="860" height="150" rx="10" fill="rgba(74,222,128,0.06)" stroke="#4ade80" stroke-width="1.5"/>
+      <text x="450" y="335" fill="#4ade80" font-size="14" font-weight="700" text-anchor="middle">IceoryxWriter (Transport 层)</text>
+
+      <rect x="50" y="350" width="160" height="45" rx="6" fill="#111827" stroke="#4ade80" stroke-width="1"/>
+      <text x="130" y="370" fill="#4ade80" font-size="10" text-anchor="middle" font-weight="600">ByteSizeLong()</text>
+      <text x="130" y="385" fill="#94a3b8" font-size="9" text-anchor="middle">计算序列化大小</text>
+
+      <rect x="230" y="350" width="160" height="45" rx="6" fill="#111827" stroke="#38bdf8" stroke-width="1"/>
+      <text x="310" y="370" fill="#38bdf8" font-size="10" text-anchor="middle" font-weight="600">loan(msg_size)</text>
+      <text x="310" y="385" fill="#94a3b8" font-size="9" text-anchor="middle">非阻塞申请 chunk</text>
+
+      <rect x="410" y="350" width="200" height="45" rx="6" fill="#111827" stroke="#fb923c" stroke-width="1"/>
+      <text x="510" y="370" fill="#fb923c" font-size="10" text-anchor="middle" font-weight="600">SerializeToArray(chunk)</text>
+      <text x="510" y="385" fill="#94a3b8" font-size="9" text-anchor="middle">直接序列化到 SHM chunk</text>
+
+      <rect x="630" y="350" width="160" height="45" rx="6" fill="#111827" stroke="#a78bfa" stroke-width="1"/>
+      <text x="710" y="370" fill="#a78bfa" font-size="10" text-anchor="middle" font-weight="600">publish(chunk)</text>
+      <text x="710" y="385" fill="#94a3b8" font-size="9" text-anchor="middle">非阻塞发布 offset</text>
+
+      <path d="M210,372 L230,372" stroke="#94a3b8" stroke-width="1" marker-end="url(#arrowGray2)"/>
+      <path d="M390,372 L410,372" stroke="#94a3b8" stroke-width="1" marker-end="url(#arrowGray2)"/>
+      <path d="M610,372 L630,372" stroke="#94a3b8" stroke-width="1" marker-end="url(#arrowGray2)"/>
+
+      <path d="M510,280 L510,310" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowYellow)"/>
+
+      <text x="450" y="440" fill="#94a3b8" font-size="11" text-anchor="middle">Subscriber 端：IceoryxDispatcher (WaitSet/Poll) → take() → deserialize → callback</text>
+      <text x="450" y="458" fill="#94a3b8" font-size="10" text-anchor="middle">CAPRO Service: Deeproute / Church / {topic_name}</text>
+
+      <defs>
+        <marker id="arrowPurpleR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/></marker>
+        <marker id="arrowGray2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker>
+      </defs>
+    </svg>
+  </div>
+
+  <div class="card card-orange">
+    <h3 style="margin-top:0">Church 对 iceoryx 的定制</h3>
+    <ul>
+      <li><strong>KeepAlivePoshRuntime</strong> — 自定义 PoshRuntime 子类，将心跳线程迁移到 Deeproute 的 base::Thread 体系，支持 QNX SCHED_RR 优先级调度</li>
+      <li><strong>IceoryxDispatcher</strong> — 进程级单例，管理所有 topic 的 UntypedSubscriber。支持两种模式：<span class="code">kTrigger</span>（RouDi 驱动的 WaitSet 通知）和 <span class="code">kPoll</span>（定时轮询，默认 1000Hz）</li>
+      <li><strong>PROTOBUF_ARENA_OPTIMIZE</strong> — Church 特有优化：检测 protobuf 消息是否已在共享内存 arena 中，如果是则跳过 CopyFrom，直接共享 arena 引用</li>
+      <li><strong>CAPRO 命名</strong> — 所有 topic 统一使用 <span class="code">Deeproute/Church/{topic}</span> 三元组</li>
+    </ul>
+  </div>
+
+  <h3>Subscriber 端数据接收</h3>
+  <div class="card card-accent">
+    <p><strong>IceoryxDispatcher</strong> 是 Church 中统一的订阅数据分发器：</p>
+    <ul>
+      <li>每个 topic 对应一个 <span class="code">DispatcherObserver</span>，内含一个 <span class="code">UntypedSubscriber</span></li>
+      <li>多个 <span class="code">IceoryxReader</span> 可以注册到同一个 Observer 上（fan-out）</li>
+      <li><strong>Trigger 模式</strong>：使用 iceoryx WaitSet，RouDi 通过条件变量通知有新消息到达，延迟最低</li>
+      <li><strong>Poll 模式</strong>：Dispatcher 线程以 1000Hz 轮询所有 Subscriber，适用于 WaitSet 不可用的场景</li>
+      <li>收到数据后调用 <span class="code">take()</span> 取出 chunk，反序列化后回调到上层 Subscriber</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================== 对比传统 IPC ===================== -->
+<div class="section" id="sec-compare">
+  <h2>iceoryx vs 传统 IPC 对比</h2>
+
+  <table class="compare-table">
+    <thead>
+      <tr>
+        <th>维度</th>
+        <th>传统 IPC (Socket/Pipe/DDS)</th>
+        <th>iceoryx</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>数据拷贝</strong></td>
+        <td>2-4 次（用户→内核→用户 + 序列化）</td>
+        <td><span style="color:#4ade80">0 次</span>（直接在 SHM 中读写）</td>
+      </tr>
+      <tr>
+        <td><strong>延迟</strong></td>
+        <td>随数据大小线性增长（μs~ms）</td>
+        <td><span style="color:#4ade80">&lt;1μs 恒定</span>，与数据大小无关</td>
+      </tr>
+      <tr>
+        <td><strong>内核参与</strong></td>
+        <td>每次通信都经过内核（syscall）</td>
+        <td><span style="color:#4ade80">正常通信无 syscall</span>（仅初始化时 mmap）</td>
+      </tr>
+      <tr>
+        <td><strong>序列化</strong></td>
+        <td>必须序列化（网络字节序等）</td>
+        <td><span style="color:#4ade80">可选</span>（同机通信可直接共享内存布局）</td>
+      </tr>
+      <tr>
+        <td><strong>内存使用</strong></td>
+        <td>每个进程各持有一份副本</td>
+        <td><span style="color:#4ade80">所有进程共享同一份物理内存</span></td>
+      </tr>
+      <tr>
+        <td><strong>8MB 点云传输</strong></td>
+        <td>~2-5ms（含多次 memcpy + context switch）</td>
+        <td><span style="color:#4ade80">&lt;1μs</span>（仅传递 offset）</td>
+      </tr>
+      <tr>
+        <td><strong>同步机制</strong></td>
+        <td>阻塞/非阻塞 read/write</td>
+        <td><span style="color:#4ade80">Lock-free 队列</span>（无死锁风险）</td>
+      </tr>
+      <tr>
+        <td><strong>可靠性</strong></td>
+        <td>视实现而定</td>
+        <td><span style="color:#4ade80">静态分配 + 无 heap + 无 exception</span></td>
+      </tr>
+      <tr>
+        <td><strong>跨机通信</strong></td>
+        <td>天然支持</td>
+        <td><span style="color:#fb923c">仅同机</span>（需 gateway 桥接远程）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>QNX 微内核环境下的特殊考量</h3>
+
+  <div class="card card-red">
+    <p>在 QNX 微内核系统中，虽然 iceoryx 的 <span class="code">loan()</span> 和 <span class="code">publish()</span> 本身是非阻塞的，但以下场景仍可能触发<strong>同步 IPC 阻塞</strong>：</p>
+    <ul>
+      <li><strong>首次内存映射</strong>：<span class="code">mmap()</span> 在 QNX 上是同步 IPC → <span class="code">procnto</span></li>
+      <li><strong>Page Fault</strong>：访问尚未建立物理映射的 SHM 页面时，CPU 异常 → <span class="code">procnto</span> 处理</li>
+      <li><strong>Protobuf Arena 扩展</strong>：<span class="code">CreateSharedMessage</span> 底层可能触发 <span class="code">mmap()</span></li>
+    </ul>
+    <p style="margin-top:12px;">这正是 sensor_ins_online 679ms 断流事件的最可能根因 —— <span class="code">procnto</span> 忙于处理大量并发 SHM 请求时，<span class="code">SnrInsOnlnProc</span> 的 IPC 被延迟。</p>
+  </div>
+
+  <h3>关键源码路径</h3>
+  <div class="card">
+    <pre class="code-block">platform/church/node/
+├── iceoryx_writer.{h,cc}          # UntypedPublisher 封装，loan→serialize→publish
+├── iceoryx_reader.{h,cc}          # 注册到 Dispatcher，接收回调
+├── iceoryx_dispatcher.{h,cc}      # 进程级单例，管理所有 UntypedSubscriber
+├── iceoryx_transport_impl.{h,cc}  # PoshRuntime + KeepAlive + Writer/Reader 工厂
+├── iceoryx_constants.h             # CAPRO: "Deeproute"/"Church"
+├── publisher.cc                    # Writer 抽象 + per-topic mutex
+├── subscriber.cc                   # Reader 抽象 + callback 注册
+├── transport.cc                    # Transport 选择（ICEORYX/SHM/etc）
+└── transport_config.h              # Dispatcher mode (kTrigger/kPoll)
+
+platform/church/third_party/iceoryx/  # 完整 iceoryx 源码 fork
+├── iceoryx_hoofs/                     # 基础库（lock-free 队列、内存分配器等）
+├── iceoryx_posh/                      # 核心：RouDi、Publisher、Subscriber、SHM 管理
+└── iceoryx_binding_c/                 # C 语言绑定</pre>
+  </div>
+</div>
+
+</div><!-- content -->
+
+<script>
+const tabs = document.querySelectorAll('.tab');
+const sections = {
+  bg: document.getElementById('sec-bg'),
+  arch: document.getElementById('sec-arch'),
+  shm: document.getElementById('sec-shm'),
+  flow: document.getElementById('sec-flow'),
+  church: document.getElementById('sec-church'),
+  compare: document.getElementById('sec-compare')
+};
+
+tabs.forEach(tab => {
+  tab.addEventListener('click', () => {
+    tabs.forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    Object.values(sections).forEach(s => s.classList.remove('active'));
+    sections[tab.dataset.tab].classList.add('active');
+  });
+});
+</script>
+
+</body>
+</html>

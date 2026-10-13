@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "FlameCraft 系统架构",
+    "output": "flamecraft-architecture.html",
+    "quality_profile": "standard",
+    "locale": "zh-CN",
+    "viewBox": [1600, 1100],
+    "views": [
+      { "id": "trip-analyze", "label": "Trip 分析主路径", "focus": ["browser", "chi-router", "folded-resolver", "drfile", "filereader", "binsym", "profilestore", "frostdb"], "note": "从用户输入 Trip 名称到火焰图可查的完整写入路径" },
+      { "id": "query-path", "label": "火焰图查询路径", "focus": ["browser", "grpc-gw", "column-query", "parcacol", "frostdb"], "note": "前端 gRPC-Web 到 FrostDB 列式查询的读取路径" },
+      { "id": "auth-flow", "label": "认证鉴权流", "focus": ["browser", "auth-mw", "iamauth", "iam-platform"], "note": "DRPAT / SSO Cookie 双模式认证" }
+    ]
+  },
+  "components": [
+    { "id": "browser", "type": "external", "label": "浏览器", "sublabel": "React SPA + gRPC-Web", "pos": [40, 440], "size": [130, 64] },
+    { "id": "flamectl", "type": "external", "label": "flamectl CLI", "sublabel": "Bearer DRPAT", "pos": [40, 600], "size": [130, 64] },
+
+    { "id": "auth-mw", "type": "security", "label": "Auth Middleware", "sublabel": "Bearer / Cookie", "pos": [260, 440], "size": [140, 64], "tag": "iamauth" },
+    { "id": "iamauth", "type": "security", "label": "IAM Auth", "sublabel": "OIDC / Introspect", "pos": [260, 280], "size": [140, 64] },
+    { "id": "iam-platform", "type": "external", "label": "DR IAM", "sublabel": "drauth OAuth2", "pos": [260, 120], "size": [140, 64] },
+
+    { "id": "chi-router", "type": "backend", "label": "chi Router", "sublabel": "HTTP :7070", "pos": [500, 440], "size": [130, 64] },
+    { "id": "grpc-gw", "type": "backend", "label": "gRPC-Gateway", "sublabel": "Parca 标准接口", "pos": [500, 280], "size": [130, 64] },
+
+    { "id": "folded-resolver", "type": "backend", "label": "Trip Analyzer", "sublabel": "foldedresolver", "pos": [740, 520], "size": [130, 64] },
+    { "id": "drfile", "type": "backend", "label": "DrFile Client", "sublabel": "制品库代理", "pos": [740, 680], "size": [130, 64] },
+    { "id": "filereader", "type": "backend", "label": "File Reader", "sublabel": "Folded / Off-CPU", "pos": [740, 360], "size": [130, 64] },
+    { "id": "binsym", "type": "backend", "label": "Bin Symbolizer", "sublabel": "ELF symindex", "pos": [740, 200], "size": [130, 64] },
+
+    { "id": "column-query", "type": "backend", "label": "Query Engine", "sublabel": "ColumnQueryAPI", "pos": [980, 280], "size": [130, 64] },
+    { "id": "profilestore", "type": "backend", "label": "Profile Store", "sublabel": "gRPC → Arrow", "pos": [980, 440], "size": [130, 64] },
+    { "id": "parcacol", "type": "backend", "label": "ParcaCol", "sublabel": "FrostDB Querier", "pos": [980, 600], "size": [130, 64] },
+
+    { "id": "frostdb", "type": "database", "label": "FrostDB", "sublabel": "列式 + WAL + Parquet", "pos": [1220, 440], "size": [140, 64] },
+    { "id": "badger", "type": "database", "label": "Badger KV", "sublabel": "元数据 + 符号缓存", "pos": [1220, 600], "size": [140, 64] },
+
+    { "id": "trace-viewer", "type": "backend", "label": "Trace Viewer", "sublabel": "ftrace 解析", "pos": [500, 600], "size": [130, 64] },
+    { "id": "ai-agent", "type": "backend", "label": "AI Agent", "sublabel": "LLM SSE", "pos": [500, 760], "size": [130, 64] },
+
+    { "id": "drfile-platform", "type": "external", "label": "DrFile 平台", "sublabel": "Driver / Profiler", "pos": [980, 760], "size": [130, 64] },
+    { "id": "driver-factory", "type": "backend", "label": "Driver Factory", "sublabel": "项目 / 里程碑", "pos": [980, 120], "size": [130, 64] },
+
+    { "id": "static-ui", "type": "frontend", "label": "UI Static", "sublabel": "React SPA embed", "pos": [1220, 280], "size": [140, 64] },
+    { "id": "prometheus", "type": "backend", "label": "Metrics", "sublabel": "/metrics", "pos": [1220, 120], "size": [140, 64] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "FlameCraft 单体进程 (cmd/flamecraft)", "wraps": ["auth-mw", "chi-router", "grpc-gw", "folded-resolver", "drfile", "filereader", "binsym", "column-query", "profilestore", "parcacol", "trace-viewer", "ai-agent", "driver-factory", "static-ui", "prometheus"] }
+  ],
+  "connections": [
+    { "id": "c1", "from": "browser", "to": "auth-mw", "label": "HTTPS", "variant": "emphasis" },
+    { "id": "c2", "from": "flamectl", "to": "auth-mw", "label": "DRPAT", "variant": "emphasis", "fromSide": "top", "toSide": "bottom" },
+    { "id": "c3", "from": "auth-mw", "to": "chi-router", "label": "identity" },
+    { "id": "c4", "from": "auth-mw", "to": "iamauth", "label": "validate", "variant": "security", "fromSide": "top", "toSide": "bottom" },
+    { "id": "c5", "from": "iamauth", "to": "iam-platform", "label": "Introspect", "variant": "security" },
+
+    { "id": "c6", "from": "chi-router", "to": "grpc-gw", "label": "gRPC-Web", "fromSide": "top", "toSide": "bottom" },
+    { "id": "c7", "from": "chi-router", "to": "folded-resolver", "label": "/api/trip", "fromSide": "right", "toSide": "left" },
+    { "id": "c8", "from": "chi-router", "to": "trace-viewer", "label": "/api/trace", "fromSide": "bottom", "toSide": "top", "labelDy": 20 },
+
+    { "id": "c10", "from": "folded-resolver", "to": "filereader", "label": "parse", "fromSide": "top", "toSide": "bottom" },
+    { "id": "c11", "from": "folded-resolver", "to": "drfile", "label": "download", "fromSide": "bottom", "toSide": "top", "labelDy": 20 },
+    { "id": "c12", "from": "filereader", "to": "binsym", "label": "symbolize", "fromSide": "top", "toSide": "bottom", "labelDy": -20 },
+    { "id": "c13", "from": "filereader", "to": "profilestore", "label": "pprof", "fromSide": "right", "toSide": "left" },
+    { "id": "c14", "from": "drfile", "to": "drfile-platform", "label": "HTTP", "fromSide": "right", "toSide": "left" },
+
+    { "id": "c15", "from": "profilestore", "to": "frostdb", "label": "ingest", "fromSide": "right", "toSide": "left" },
+    { "id": "c16", "from": "grpc-gw", "to": "column-query", "label": "Query", "fromSide": "right", "toSide": "left" },
+    { "id": "c19", "from": "parcacol", "to": "frostdb", "label": "scan", "fromSide": "right", "toSide": "bottom" },
+    { "id": "c20", "from": "parcacol", "to": "badger", "label": "cache", "fromSide": "right", "toSide": "left" },
+    { "id": "c23", "from": "ai-agent", "to": "chi-router", "label": "loopback + 用户身份", "fromSide": "top", "toSide": "bottom" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "写入路径", "items": ["Trip 分析：Driver 下载 → Folded 解析 → 符号化 → FrostDB", "Linux / QNX 双平台自动检测", "Off-CPU 火焰图（调度延迟 / 等待）"] },
+    { "dot": "emerald", "title": "读取路径", "items": ["gRPC-Web → ColumnQueryAPI → FrostDB 列式扫描", "LRU + singleflight 缓存防击穿", "Arrow IPC 传输火焰图路径"] },
+    { "dot": "rose", "title": "认证鉴权", "items": ["DRPAT：CLI/API 不透明令牌", "SSO：OAuth2 → Cookie 会话", "Internal Token：AI 自调用旁路"] },
+    { "dot": "amber", "title": "扩展能力", "items": ["Trace Viewer：ftrace 可视化", "AI Agent：LLM 流式性能分析"] }
+  ]
+}

@@ -1,0 +1,2159 @@
+---
+title: "perf_event 与 BPF 内轻量化 DWARF CFI 堆栈回溯：从一次采样到完整调用链"
+date: 2026-10-12
+description: "面向初学者，结合 perf_ebpf 当前实现，详细解释 perf_event 如何触发采样、用户态如何预解析 ELF 的 DWARF CFI、BPF 如何在采样点逐帧恢复调用栈，以及回溯结果如何送到用户态。"
+categories:
+  - 撷简台
+  - 性能分析
+tags:
+  - perf_event
+  - eBPF
+  - DWARF
+  - CFI
+  - 堆栈回溯
+  - perf_ebpf
+---
+
+# perf_event 与 BPF 内轻量化 DWARF CFI 堆栈回溯：从一次采样到完整调用链
+
+> 本文专门解释 `/sandbox/platform/perf_ebpf` 当前 CPU 主路径采用的堆栈回溯方法：
+>
+> `perf_event` 负责在合适的时刻触发采样；用户态提前解析 ELF 中的 `.eh_frame` / `.debug_frame`，把回溯规则压缩后写入 BPF map；BPF 在采样点读取寄存器、查找规则、读取用户栈并逐帧恢复调用者。
+>
+> 文档重点是流程和原理，不要求读者先读懂 BPF C 代码。代码文件和行号只用于帮助读者在需要时回到真实实现核对。
+
+## 先看结论
+
+当前 `perf_ebpf` 的 CPU 用户栈主路径可以概括成下面这句话：
+
+```text
+perf_event 触发采样
+    -> BPF 读取当前 PC / SP / FP / LR
+    -> 用 PC 找到所属 ELF 和对应 CFI 规则
+    -> BPF 执行轻量化的 DWARF unwind
+    -> 从用户栈恢复上一帧的 PC / SP / FP
+    -> 重复上述过程
+    -> 输出 file_id + offset 形式的调用链
+```
+
+它不是“每次采样后都让用户态 libunwind 重新解析 ELF”，也不是“只沿着 FP 指针链走一遍”。它的特点是：
+
+1. **规则准备在用户态完成**：读取进程映射、解析 ELF、解析 CFI。
+2. **逐帧回溯在 BPF 中完成**：采样发生时只做有限的 map 查询、整数运算和用户内存读取。
+3. **函数名解析是后续阶段**：回溯得到的是调用地址或 `file_id + offset`，不等于已经得到 C++ 函数名。
+4. **`bpf_get_stackid()` 仍然存在**：当前主要用于内核栈采集，以及 DWARF 回溯失败时的用户栈备用路径。
+
+本文中的核心关系是：
+
+```text
+采样：现在 CPU 正在执行哪里？
+回溯：当前函数的调用者是谁？调用者的调用者是谁？
+符号化：这些地址属于哪个文件、哪个函数、哪一行？
+```
+
+三者不是同一件事。
+
+## 目录
+
+1. [从一个直觉问题开始：程序怎么知道自己从哪里返回](#1-从一个直觉问题开始程序怎么知道自己从哪里返回)
+2. [函数调用和栈帧：先看清内存如何变化](#2-函数调用和栈帧先看清内存如何变化)
+3. [三种坐标和四个关键寄存器](#3-三种坐标和四个关键寄存器)
+4. [DWARF 和 CFI 到底是什么](#4-dwarf-和-cfi-到底是什么)
+5. [三种常见回溯方法的区别](#5-三种常见回溯方法的区别)
+6. [perf_ebpf 的整体设计](#6-perf_ebpf-的整体设计)
+7. [阶段一：采样开始前，用户态准备回溯规则](#7-阶段一采样开始前用户态准备回溯规则)
+8. [阶段二：perf_event 如何触发 BPF 采样](#8-阶段二perf_event-如何触发-bpf-采样)
+9. [阶段三：BPF 如何用 CFI 一帧一帧地回溯](#9-阶段三bpf-如何用-cfi-一帧一帧地回溯)
+10. [用一个完整例子走完寄存器和 CFA 的变化](#10-用一个完整例子走完寄存器和-cfa-的变化)
+11. [回溯结果怎样传回用户态](#11-回溯结果怎样传回用户态)
+12. [当前实现中的备用路径和边界](#12-当前实现中的备用路径和边界)
+13. [为什么说它是“BPF 内轻量化”](#13-为什么说它是bpf-内轻量化)
+14. [初学者排查一条栈为什么断了](#14-初学者排查一条栈为什么断了)
+15. [把整套流程压缩成一张图](#15-把整套流程压缩成一张图)
+16. [源码对照表](#16-源码对照表)
+
+---
+
+## 1. 从一个直觉问题开始：程序怎么知道自己从哪里返回
+
+先看一个普通的调用关系：
+
+```cpp
+int read_sensor();
+
+int filter() {
+    return read_sensor();
+}
+
+int plan() {
+    return filter();
+}
+
+int main() {
+    return plan();
+}
+```
+
+当 `read_sensor()` 正在运行时，人类会说当前调用链是：
+
+```text
+main -> plan -> filter -> read_sensor
+```
+
+但 CPU 实际上只需要知道几件事：
+
+- 当前正在执行的指令地址是多少？
+- 当前函数执行完之后，要回到哪里？
+- 当前函数的局部变量和保存寄存器在哪里？
+- 上一层调用者的栈在哪里？
+
+这些信息分散在寄存器、线程栈和二进制文件携带的回溯规则中。
+
+### 1.1 什么是调用栈
+
+一个线程执行函数调用时，会形成一串嵌套的调用上下文。这个上下文通常放在线程自己的栈内存中：
+
+```text
+逻辑调用关系：
+
+main()
+  └── plan()
+        └── filter()
+              └── read_sensor()   <- 当前执行位置
+```
+
+可以把它想象成一摞“函数工作台”：
+
+```text
+高地址
+┌────────────────────────────────────┐
+│ main 的栈帧                         │  最外层调用者
+├────────────────────────────────────┤
+│ plan 的栈帧                         │
+├────────────────────────────────────┤
+│ filter 的栈帧                       │
+├────────────────────────────────────┤
+│ read_sensor 的栈帧                  │  当前函数
+└────────────────────────────────────┘
+低地址
+```
+
+在常见 ABI 中，栈大多向低地址增长。因此，函数越深入，栈指针通常越小。不过不要把“栈帧一定规则地一格一格排列”当成绝对事实：编译器会优化函数，函数可能没有栈帧、可能复用寄存器、可能省略帧指针，甚至可能被内联。
+
+### 1.2 什么是栈回溯
+
+栈回溯不是“把整个栈内存打印出来”，而是一个有规则的逆向过程：
+
+```text
+已知：当前函数的 PC、SP、FP、LR
+       |
+       v
+求出：当前函数调用者的返回地址、SP、FP
+       |
+       v
+再把调用者当成“当前函数”，继续求上一层
+       |
+       v
+直到无法继续或达到深度上限
+```
+
+每次回溯只解决一个问题：
+
+> 当前这一帧的调用者是谁，以及下一次回溯应该使用哪一组寄存器状态？
+
+### 1.3 什么是采样和符号化
+
+采样器不会记录 CPU 执行过的每一条指令，而是周期性地观察一次：
+
+```text
+t0       t1       t2       t3       t4
+ |        |        |        |        |
+ sample   sample   sample   sample   sample
+```
+
+某个函数在采样中出现得越多，说明采样期间 CPU 越可能花时间执行它。采样得到的调用栈是一张“统计快照”，不是完整的执行录像。
+
+采样和回溯通常先得到地址：
+
+```text
+0x7f12a0345678
+0x7f12a0123456
+0x00401820
+```
+
+符号化才负责把地址变成：
+
+```text
+libfoo.so!Foo::process()+0x28
+libc.so.6!memcpy()+0x80
+app!main()+0x20
+```
+
+因此完整链路是：
+
+```mermaid
+flowchart LR
+    A[CPU 当前执行位置] --> B[perf_event 采样]
+    B --> C[读取寄存器和栈]
+    C --> D[栈回溯]
+    D --> E[地址或 file_id+offset]
+    E --> F[ELF 映射]
+    F --> G[符号表 / DWARF 行号]
+    G --> H[函数名 / 源码行]
+```
+
+如果阅读器不支持 Mermaid，可以看等价的 ASCII 图：
+
+```text
+CPU 正在执行
+    |
+    v
+perf_event 触发采样
+    |
+    v
+得到当前 PC/SP/FP/LR
+    |
+    v
+栈回溯：恢复调用者地址
+    |
+    v
+得到地址链或 file_id + offset 链
+    |
+    v
+符号化：查 ELF、符号表、DWARF
+    |
+    v
+得到函数名、文件名、行号
+```
+
+---
+
+## 2. 函数调用和栈帧：先看清内存如何变化
+
+这一节不先讲 DWARF，而是先看“函数调用后，回溯所需要的信息到底藏在哪里”。
+
+### 2.1 函数调用至少要解决两个问题
+
+调用 `foo()` 时，调用者 `main()` 和被调用者 `foo()` 之间必须约定：
+
+1. `foo()` 执行完后回到 `main()` 的哪一条指令？
+2. `foo()` 使用的局部空间和寄存器，怎样不破坏 `main()` 的现场？
+
+第一个问题产生**返回地址**，第二个问题产生**栈帧和寄存器保存规则**。
+
+### 2.2 一个简化的调用过程
+
+```text
+调用前：
+    PC = main 中的 call/bl 指令
+    SP = 当前栈顶
+
+执行 call/bl：
+    保存返回地址
+    PC 跳转到 foo
+
+foo 建立栈帧：
+    SP 向下移动
+    保存需要保留的寄存器
+    为局部变量预留空间
+
+foo 执行中：
+    PC 在 foo 的代码范围内
+
+foo 返回：
+    恢复寄存器
+    取回返回地址
+    PC 跳回 main 的返回位置
+    SP 恢复到调用前
+```
+
+不同架构保存返回地址的方式不同：
+
+| 架构 | 常见返回地址位置 | 说明 |
+| --- | --- | --- |
+| AArch64 | `x30`，也叫 LR；复杂函数通常会把 LR 保存到栈 | `bl` 把返回地址写入 `x30` |
+| x86-64 | 栈顶，通常由 `call` 自动压入 | 返回地址常可按 CFA 的固定偏移找到 |
+
+这就是为什么 `perf_ebpf` 的回溯状态同时保存 `pc`、`sp`、`fp`、`lr`：同一套逻辑要覆盖不同架构和不同函数形态。
+
+### 2.3 AArch64 例子：保存 FP 和 LR 的函数
+
+假设调用关系是：
+
+```text
+main() -> foo() -> work()
+```
+
+假设 `foo()` 被调用之前：
+
+```text
+SP = 0x8000
+FP = 0x9000       // 这里只是假设的旧 FP
+```
+
+`main()` 调用 `foo()` 后，AArch64 的 `x30/LR` 里会暂时放着“返回到 main 的地址”：
+
+```text
+LR = 0x40100c      // foo 返回后，继续执行 main 的位置
+```
+
+随后 `foo()` 可能执行类似下面的函数序言：
+
+```asm
+stp x29, x30, [sp, #-32]!
+mov x29, sp
+```
+
+它的概念效果是：
+
+```text
+旧 SP = 0x8000
+新 SP = 0x7fe0
+新 FP = 0x7fe0
+```
+
+内存可以画成：
+
+```text
+高地址
+
+0x8000  ┌──────────────────────────────────┐
+        │ 调用者 main 的栈边界              │
+        │ 这可以作为 foo 的 CFA             │
+0x7ff8  ├──────────────────────────────────┤
+        │ foo 的局部空间 / 对齐空间          │
+0x7ff0  ├──────────────────────────────────┤
+        │ foo 的局部空间 / 对齐空间          │
+0x7fe8  ├──────────────────────────────────┤
+        │ 保存的 LR = 0x40100c               │
+0x7fe0  ├──────────────────────────────────┤
+        │ 保存的旧 FP                        │
+        └──────────────────────────────────┘
+
+低地址
+```
+
+此时可以用一条规则描述 `foo` 的栈帧：
+
+```text
+CFA = 当前 SP + 32
+保存的 FP = CFA - 32
+保存的 LR = CFA - 24
+```
+
+代入当前 `SP = 0x7fe0`：
+
+```text
+CFA       = 0x7fe0 + 32 = 0x8000
+保存的 FP = 0x8000 - 32 = 0x7fe0
+保存的 LR = 0x8000 - 24 = 0x7fe8
+```
+
+读取 `0x7fe8`，就能得到 `main` 的返回地址 `0x40100c`。
+
+### 2.4 LR 为什么会被覆盖
+
+`foo()` 调用 `work()` 时，`work()` 的返回地址也会写进 `x30/LR`。因此，在 `work()` 执行期间，寄存器里的 LR 已经是“回到 foo 的地址”，不是“回到 main 的地址”。
+
+```text
+foo 调用 work 之前：
+    foo 的 LR = 回到 main
+
+执行 bl work 后：
+    LR = 回到 foo
+    foo 原来的 LR 必须已经保存在 foo 的栈帧中
+```
+
+所以对 `work()` 采样时，回溯顺序是：
+
+```text
+当前 PC 在 work
+    |
+    | work 的 CFI 规则
+    v
+恢复 foo 的返回地址
+    |
+    | foo 的 CFI 规则
+    v
+从 foo 的栈帧恢复 main 的返回地址
+```
+
+### 2.5 没有 FP 的叶子函数和优化函数
+
+一个很短的叶子函数可能不需要保存 FP，也不需要调整 SP：
+
+```text
+leaf()
+    直接使用寄存器计算
+    通过 LR 返回
+```
+
+此时回溯规则可能是：
+
+```text
+返回地址仍然在 LR 寄存器中
+```
+
+另一个函数可能省略 FP，但把 LR 保存到了栈：
+
+```asm
+sub sp, sp, #32
+str x30, [sp, #24]
+```
+
+CFI 可以描述：
+
+```text
+CFA = SP + 32
+LR = CFA - 8
+```
+
+当前 `SP = 0x7fe0` 时：
+
+```text
+CFA = 0x7fe0 + 32 = 0x8000
+返回地址位置 = 0x8000 - 8 = 0x7ff8
+```
+
+因此没有 FP 也不等于不能回溯。DWARF CFI 描述的是“怎样恢复寄存器”，而不是假设“所有函数都遵循同一种栈布局”。
+
+---
+
+## 3. 三种坐标和四个关键寄存器
+
+理解回溯时，最容易混淆的是“当前指令地址”“ELF 文件偏移”和“栈地址”。它们属于不同坐标系。
+
+### 3.1 三种地址坐标
+
+#### 运行时虚拟地址
+
+这是 CPU 当前看到的地址，例如：
+
+```text
+PC = 0x7f12a0345678
+```
+
+它受 ASLR 和共享库加载位置影响。
+
+#### 映射地址
+
+`/proc/<pid>/maps` 记录了某段 ELF 映射在当前进程中的起止地址：
+
+```text
+7f12a0300000-7f12a0500000 r-xp ... /usr/lib/libfoo.so
+```
+
+如果当前 PC 落在这段范围内，就知道它属于 `libfoo.so`。
+
+#### 文件内偏移
+
+为了跨进程、跨 ASLR 比较，通常要把运行时地址归一化为文件内坐标：
+
+```text
+文件内偏移 = 运行时 PC - 装载 bias
+```
+
+当前 `EnhancedUnwinder` 根据映射的起始地址和文件偏移计算 bias，并把 `file_id + offset` 作为 BPF 回溯帧的主要表示。
+
+三个坐标可以画成：
+
+```text
+进程虚拟地址空间                         ELF 文件
+
+0x7f12a0300000  ┌──────────────┐          .text + 0x45678
+                 │ libfoo.so   │  <----->  file_id = 0x...
+0x7f12a0500000  └──────────────┘
+        ^
+        |
+        +-- PC = 0x7f12a0345678
+```
+
+### 3.2 PC：程序计数器
+
+PC 指向当前正在执行或即将执行的指令。回溯器首先使用 PC 判断：
+
+```text
+当前属于哪个 ELF？
+当前落在这个 ELF 的哪个代码范围？
+当前代码位置适用哪一组 CFI 规则？
+```
+
+### 3.3 SP：栈指针
+
+SP 指向当前栈的活动位置。它经常随函数序言和尾声变化，但不一定直接指向返回地址。
+
+```text
+SP 可能指向：
+    当前栈顶
+    局部变量区域
+    保存寄存器区域
+    对齐后的位置
+```
+
+所以只看 SP，通常不能直接找到调用者。
+
+### 3.4 FP：帧指针
+
+FP 如果存在，常常指向当前函数较稳定的帧基准。经典 FP 链可能长这样：
+
+```text
+当前 FP
+   |
+   | [FP]     = 上一帧 FP
+   | [FP+8]   = 返回地址
+   v
+上一帧 FP
+   |
+   v
+更上一帧 FP
+```
+
+这很快，但前提是：
+
+- 编译器保留 FP；
+- 函数序言符合预期；
+- FP 链没有损坏；
+- 运行时没有切换到另一套栈布局。
+
+### 3.5 LR：链接寄存器
+
+AArch64 使用 `x30` 保存函数返回地址，通常称为 LR。叶子函数可能直接使用 LR 返回，非叶子函数通常要在调用下一级前把 LR 保存到栈上。
+
+当前 `perf_ebpf` 的 BPF 状态保留：
+
+```text
+pc
+sp
+fp
+lr
+cfa
+```
+
+这些字段定义在 [`unwinder_common.h`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:31)。
+
+---
+
+## 4. DWARF 和 CFI 到底是什么
+
+### 4.1 DWARF 不是只有“调试符号”
+
+DWARF 是一种描述程序和机器码关系的数据格式。它可以描述：
+
+- 机器地址对应哪个函数；
+- 机器地址对应哪一行源码；
+- 内联函数关系；
+- 变量和类型；
+- 一个函数的调用帧如何恢复。
+
+本文关注最后一项：**Call Frame Information，简称 CFI**。
+
+可以这样区分：
+
+```text
+DWARF：一整套描述程序的语言
+  |
+  +-- 调试信息：函数名、源码行、类型、内联
+  |
+  +-- CFI：调用帧恢复规则
+```
+
+因此，“使用 DWARF CFI 回溯”不是说 BPF 在采样时读取了所有调试信息，而是说它使用了 DWARF 体系中的调用帧规则。
+
+### 4.2 `.eh_frame` 和 `.debug_frame`
+
+常见 ELF 中可能出现：
+
+```text
+.eh_frame      运行时异常处理 / 栈展开常用，通常随程序发布
+.debug_frame   调试用的 CFI，可能被拆走或 strip
+.debug_info    类型、函数、变量等调试信息
+.debug_line    地址到源码行的映射
+```
+
+当前 `EhFrameParser` 的实际逻辑是：
+
+1. 先查找 `.eh_frame`；
+2. 如果没有，再尝试 `.debug_frame`；
+3. 解析 CIE 和 FDE；
+4. 把规则转成项目自己的 `StackDeltaEntry`。
+
+对应实现见 [`eh_frame_parser.cc:101`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:101) 和 [`eh_frame_parser.cc:156`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:156)。
+
+### 4.3 CFI 是“当前 PC 对应的恢复说明书”
+
+CFI 更像一份“在某个 PC 范围内，如何找回上一帧”的说明书。
+
+例如它可能描述：
+
+```text
+在地址 A 到地址 B 之间：
+    CFA = SP + 32
+    返回地址 = 内存[CFA - 8]
+    FP = 内存[CFA - 16]
+```
+
+进入函数不同阶段后规则可能变化：
+
+```text
+函数入口：
+    CFA = SP + 0
+    LR 仍在寄存器中
+
+完成栈帧建立后：
+    CFA = SP + 32
+    LR  已保存到 CFA - 8
+
+函数尾声：
+    SP 即将恢复
+    保存寄存器规则又发生变化
+```
+
+所以 CFI 规则必须和 PC 绑定。采样发生在函数序言中间和发生在函数主体中间，可能适用不同规则。
+
+### 4.4 CFA：Canonical Frame Address
+
+CFA 可以译为“规范帧地址”或“规范调用帧地址”。它不是简单等于 SP，也不是简单等于 FP，而是由 CFI 规则计算出来的一个稳定参考点。
+
+常见形式：
+
+```text
+CFA = SP + 常量
+```
+
+或者：
+
+```text
+CFA = FP + 常量
+```
+
+为什么需要 CFA？因为当前函数执行过程中，SP 可能移动，但调用者的栈边界需要一个稳定的参照。返回地址、保存的 FP、其他寄存器，都可以用相对 CFA 的偏移描述。
+
+可以把它想象成测量坐标原点：
+
+```text
+当前 SP / FP 会随着函数实现变化
+        |
+        v
+CFI 计算出统一参考点 CFA
+        |
+        +-- 返回地址在 CFA + offset_ra
+        +-- FP 在 CFA + offset_fp
+        +-- 其他寄存器在 CFA + offset_reg
+```
+
+### 4.5 CFI 的几类规则
+
+当前解析器维护每个寄存器的恢复规则，核心类型包括：
+
+| 规则 | 通俗含义 |
+| --- | --- |
+| `UNDEFINED` | 这个寄存器无法从当前帧恢复 |
+| `SAME_VALUE` | 调用者的值还在当前寄存器中 |
+| `OFFSET` | 调用者的值保存在 `CFA + 偏移` 的内存中 |
+| `REGISTER` | 调用者的值放在另一个寄存器中 |
+| `EXPRESSION` | 需要执行更复杂的 DWARF 表达式 |
+
+当前项目会把适合 BPF 快速执行的规则压缩成：
+
+```text
+base_reg       = SP / FP
+param          = CFA 偏移
+aux_base_reg   = CFA / SP / FP / LR
+aux_param      = 返回地址偏移
+flags          = 是否需要按保存的 FP + LR 组合读取
+```
+
+解析器将 DWARF 的寄存器编号转换成项目内部的寄存器编号，见 [`eh_frame_parser.cc:245`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:245)。
+
+### 4.6 CIE 和 FDE
+
+`.eh_frame` 不是简单的“地址到规则”数组，而是由 CIE 和 FDE 组成：
+
+```text
+.eh_frame
+├── CIE  # Common Information Entry，公共初始规则
+│   ├── code alignment
+│   ├── data alignment
+│   ├── return address register
+│   └── initial CFI instructions
+│
+├── FDE  # Frame Description Entry，某个函数/地址范围的规则
+│   ├── pc_begin
+│   ├── pc_range
+│   └── CFI instructions
+│
+├── FDE
+└── FDE
+```
+
+CIE 可以理解为“默认规则模板”，FDE 可以理解为“函数 `foo` 在地址范围 A 到 B 内的具体变化”。
+
+解析顺序：
+
+```text
+读取 CIE
+    |
+    v
+保存公共初始状态
+    |
+    v
+读取 FDE
+    |
+    v
+关联对应 CIE
+    |
+    v
+从函数起始 PC 开始执行 CFI 指令
+    |
+    v
+在每个规则变化位置产生一条 delta
+```
+
+源码中 CIE/FDE 的遍历入口是 [`eh_frame_parser.cc:607`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:607)。
+
+### 4.7 为什么叫 delta
+
+同一个函数的 CFI 规则通常只在少数几个位置发生变化：
+
+```text
+函数地址：  A -------- B -------- C -------- D
+规则：      R0         R1         R2         R2
+```
+
+不需要把每一条机器指令都复制一份完整规则，只保存规则变化点：
+
+```text
+delta 0: 从 A 开始使用 R0
+delta 1: 从 B 开始使用 R1
+delta 2: 从 C 开始使用 R2
+```
+
+采样时给定 PC，只要找到“不超过当前 PC 的最后一个 delta”，就能得到当前适用的规则。
+
+---
+
+## 5. 三种常见回溯方法的区别
+
+### 5.1 方法一：FP 链回溯
+
+假设每个栈帧都遵循：
+
+```text
+[FP + 0] = 上一帧 FP
+[FP + 8] = 返回地址
+```
+
+算法非常简单：
+
+```text
+fp = 当前 FP
+while fp 合法：
+    next_fp = memory[fp]
+    return_pc = memory[fp + 8]
+    输出 return_pc
+    fp = next_fp
+```
+
+示意图：
+
+```text
+当前 FP = 0x7fe0
+    |
+    +-- [0x7fe0] = 0x8010  -> 上一帧 FP
+    +-- [0x7fe8] = 0x40100c -> 返回地址
+                                  |
+                                  v
+                           下一层 FP 链
+```
+
+优点：简单、快、容易在采样器中实现。
+
+缺点：
+
+- `-fomit-frame-pointer` 后可能没有可靠 FP；
+- 优化器可能复用寄存器；
+- 栈损坏时容易走到非法地址；
+- 协程、解释器、信号帧等特殊场景不一定适用。
+
+### 5.2 方法二：DWARF CFI 回溯
+
+算法是：
+
+```text
+当前 PC
+    |
+    v
+查询当前 PC 对应的 CFI 状态
+    |
+    v
+计算 CFA
+    |
+    v
+按规则找到保存的返回地址 / FP / SP
+    |
+    v
+更新状态，进入上一帧
+```
+
+优点：
+
+- 不要求所有函数保留 FP；
+- 能描述不同函数、不同指令阶段的栈布局；
+- 能处理返回地址在 LR、栈、或其他寄存器中的情况；
+- 更适合优化后的生产二进制。
+
+缺点：
+
+- 规则解析复杂；
+- 二进制必须有可用的 CFI；
+- 复杂 DWARF expression 在受限环境中不容易执行；
+- BPF verifier 要求循环有界、访问安全、程序复杂度可控。
+
+### 5.3 方法三：`bpf_get_stackid()`
+
+这是内核 BPF helper 提供的栈采集路径：
+
+```text
+BPF 采样上下文
+    |
+    v
+bpf_get_stackid(ctx, stack_trace_map, flags)
+    |
+    v
+内核采集地址数组并放入 STACK_TRACE map
+    |
+    v
+返回 stack_id
+    |
+    v
+用户态用 stack_id 读取地址数组并符号化
+```
+
+它的特点是：
+
+- 调用方不需要自己逐条读取用户栈；
+- 返回的是一个 ID，真正的地址数组在 `BPF_MAP_TYPE_STACK_TRACE` 中；
+- 具体的内部展开细节由内核 helper 决定；
+- 失败时通常只得到负的 stack ID，调用方需要结合上下文排查。
+
+### 5.4 三种方法对照表
+
+| 对比项 | FP 链 | DWARF CFI | `bpf_get_stackid()` |
+| --- | --- | --- | --- |
+| 回溯依据 | 固定的 FP 内存布局 | PC 对应的恢复规则 | 内核 helper 的栈采集逻辑 |
+| 是否需要 FP | 需要 | 不需要 | 由内核实现决定，调用方不直接控制 |
+| 采样时工作 | 读两个指针并循环 | 查规则、算 CFA、读内存 | helper 完成采集并返回 ID |
+| 结果 | 地址序列 | 地址/文件偏移序列 | stack ID，地址数组在 map 中 |
+| 控制粒度 | 高，但能力弱 | 高，能力强但复杂 | 低，接口简单 |
+| 对优化代码 | 容易断 | 通常更强 | 取决于内核展开能力 |
+| 当前 `perf_ebpf` 位置 | fallback 标记路径 | CPU 用户栈主路径 | 内核栈和用户栈 fallback |
+
+特别注意：当前代码将 `bpf_get_stackid()` 得到的用户栈 fallback 输出标记为 `[u/fp]`，这只是项目输出标签。它不等于项目在用户态手写了 FP `while` 循环。
+
+---
+
+## 6. perf_ebpf 的整体设计
+
+### 6.1 为什么不能在采样点解析整个 ELF
+
+采样点的 BPF 程序运行在内核上下文，受到 verifier 和运行环境限制，不能像普通用户态程序一样随意：
+
+- 打开 ELF 文件；
+- 分配动态内存；
+- 解析复杂二进制结构；
+- 调用 C++ 库；
+- 执行无限循环；
+- 读取任意用户地址。
+
+因此 `perf_ebpf` 把工作拆成两部分：
+
+```text
+用户态：做复杂的、低频的准备工作
+    - 读 /proc/<pid>/maps
+    - 打开 ELF
+    - 解析 .eh_frame / .debug_frame
+    - 把规则写入 BPF map
+
+BPF：做高频的、受限的采样工作
+    - 读取现场寄存器
+    - 查询映射
+    - 查询规则
+    - 计算 CFA
+    - 读取少量用户栈内存
+    - 输出一条 trace
+```
+
+这里的关键工程思想是：
+
+```text
+把“理解规则”放到采样前
+把“执行规则”留在采样点
+```
+
+### 6.2 总体数据流
+
+```mermaid
+flowchart TB
+    A[进程启动或映射变化] --> B[用户态读取 /proc/pid/maps]
+    B --> C[打开 ELF]
+    C --> D[解析 .eh_frame / .debug_frame]
+    D --> E[压缩为 StackDeltaEntry / UnwindInfo]
+    E --> F[写入 BPF maps]
+
+    G[每 CPU PERF_COUNT_SW_CPU_CLOCK] --> H[nu_tracer_entry]
+    F --> H
+    H --> I[读取 PC SP FP LR]
+    I --> J[PID + PC 映射查询]
+    J --> K[CFI delta 查询]
+    K --> L[unwind_one_frame]
+    L --> M{还能继续?}
+    M -->|是| J
+    M -->|否| N[nu_trace_events perf buffer]
+    N --> O[CPUTracker 用户态线程]
+    O --> P[folded stack / 可选符号化]
+```
+
+对应的 ASCII 版本：
+
+```text
+                    采样前的准备阶段
+        ┌───────────────────────────────────┐
+        │ /proc/<pid>/maps                   │
+        └────────────────┬──────────────────┘
+                         v
+        ┌───────────────────────────────────┐
+        │ ELF .eh_frame / .debug_frame       │
+        └────────────────┬──────────────────┘
+                         v
+        ┌───────────────────────────────────┐
+        │ 用户态 CFI parser                  │
+        └────────────────┬──────────────────┘
+                         v
+        ┌───────────────────────────────────┐
+        │ BPF mapping / delta / rule maps    │
+        └────────────────┬──────────────────┘
+                         │ 采样时查询
+                         v
+┌──────────────┐  ┌────────────────────┐  ┌─────────────────────┐
+│ perf_event   │->│ nu_tracer_entry    │->│ unwind_one_frame()   │
+│ CPU clock    │  │ 读 PC/SP/FP/LR     │  │ CFI 算 CFA、读用户栈 │
+└──────────────┘  └────────────────────┘  └──────────┬──────────┘
+                                                     │ 重复
+                                                     v
+                                      ┌────────────────────────┐
+                                      │ perf buffer trace       │
+                                      │ file_id + offset frames │
+                                      └────────────┬───────────┘
+                                                   v
+                                      ┌────────────────────────┐
+                                      │ 用户态输出 / 符号化      │
+                                      └────────────────────────┘
+```
+
+### 6.3 当前 CPUTracker 的启动证据
+
+当前 CPUTracker 初始化时创建 `EnhancedUnwinder`，见 [`cputracker.cc:81`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:81)。启动时调用 `attach()`，见 [`cputracker.cc:127`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:127)。
+
+`EnhancedUnwinder::attach()` 为每个 CPU 创建 `PERF_COUNT_SW_CPU_CLOCK`，并把 `nu_tracer_entry` 附加到 perf event，见 [`enhanced_unwinder.cc:121`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:121)。
+
+因此，当前 CPUTracker 的主路径是：
+
+```text
+CPUTracker
+   |
+   v
+EnhancedUnwinder
+   |
+   v
+native_unwinder BPF skeleton
+   |
+   v
+nu_tracer_entry -> nu_unwind_native -> nu_unwind_stop
+```
+
+仓库中仍有 `profile.bpf.c` 和 `CPUTrackerProgram`，它们直接使用 `bpf_get_stackid()`，但当前 `CPUTracker::initialize()` 和 `start()` 走的是 `EnhancedUnwinder`，不能把遗留的 `profile.bpf.c` 当成当前 CPUTracker 的主回溯路径。
+
+---
+
+## 7. 阶段一：采样开始前，用户态准备回溯规则
+
+这是整个方案中非常重要、但容易被忽略的一步：**采样发生之前，回溯规则已经被准备好并写进 BPF map。**
+
+### 7.1 读取进程的可执行映射
+
+用户态读取：
+
+```text
+/proc/<pid>/maps
+```
+
+并筛选有执行权限的文件映射，例如：
+
+```text
+7f12a0300000-7f12a0500000 r-xp 00000000 ... /usr/lib/libfoo.so
+00400000-00450000 r-xp 00000000 ... /opt/app/bin/app
+```
+
+当前 `EnhancedUnwinder::readProcessMappings()` 只保留可执行映射，并计算：
+
+- 映射起始地址；
+- 映射结束地址；
+- 文件偏移；
+- ELF 路径；
+- `file_id`；
+- 装载 bias。
+
+代码见 [`enhanced_unwinder.cc:321`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:321)。
+
+### 7.2 计算 file_id
+
+项目不是在每个 BPF 帧中携带完整路径，而是给 ELF 一个稳定的 `file_id`。当前实现会读取文件头部、尾部和文件大小，使用 FNV-1a 组合计算 ID，见 [`enhanced_unwinder.cc:294`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:294)。
+
+这样做的直觉是：
+
+```text
+完整路径很长，不适合高频采样携带
+        |
+        v
+文件路径 -> file_id
+        |
+        v
+BPF 每帧只记录 file_id + offset
+```
+
+用户态会保留：
+
+```text
+file_id -> /usr/lib/libfoo.so
+```
+
+所以 BPF 输出轻量，用户态仍然可以恢复文件名。
+
+### 7.3 解析 ELF 中的 CIE 和 FDE
+
+`EhFrameParser::parse()` 的过程可以画成：
+
+```text
+打开 ELF
+    |
+    v
+读取 .eh_frame
+    |
+    +-- 如果不存在，尝试 .debug_frame
+    |
+    v
+逐条读取 CIE / FDE
+    |
+    v
+CIE 建立默认状态
+    |
+    v
+FDE 指定函数地址范围和规则变化
+    |
+    v
+执行 CFI opcode 状态机
+    |
+    v
+在地址变化点生成 StackDeltaEntry
+    |
+    v
+按 address 排序
+```
+
+CIE/FDE 的实际处理见 [`eh_frame_parser.cc:629`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:629) 到 [`eh_frame_parser.cc:699`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:699)。
+
+### 7.4 一个规则如何被压缩
+
+假设解析器从某个 FDE 得到：
+
+```text
+地址范围 [0x1200, 0x1250)：
+    CFA = SP + 32
+    返回地址 = CFA - 8
+    FP 保存于 CFA - 16
+```
+
+项目会把它抽象为类似：
+
+```text
+StackDeltaEntry:
+    address       = 0x1200
+    base_reg      = SP
+    param         = 32
+    aux_base_reg  = CFA
+    aux_param     = -8
+    flags         = FRAME
+```
+
+用户态 `getOrCreateUnwindInfo()` 将规则写入 `nu_unwind_info_array`，见 [`enhanced_unwinder.cc:363`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:363)。
+
+注意：这不是把完整 DWARF opcode 原样搬进 BPF，而是把高频回溯阶段需要的结果压成固定字段。
+
+### 7.5 四类关键 BPF map
+
+#### Map A：PID + PC 页面到 ELF 映射
+
+```text
+(pid, pc_page) -> (file_id, bias, unwind_program)
+```
+
+对应 `nu_pid_page_to_mapping`，使用 LPM trie。它回答：
+
+> 当前这个进程的这个 PC，属于哪个 ELF？
+
+#### Map B：file_id + 代码页到 delta 范围
+
+```text
+(file_id, code_page) -> (first_delta, num_deltas)
+```
+
+对应 `nu_delta_page_to_info`。它回答：
+
+> 这个 ELF 的这一页代码，对应哪些 CFI delta？
+
+#### Map C：全局 delta 数组
+
+```text
+index -> (page_offset, unwind_info_index)
+```
+
+对应 `nu_stack_deltas`。它保存按地址排列的 delta。
+
+#### Map D：具体回溯规则
+
+```text
+unwind_info_index -> (base_reg, param, aux_base_reg, aux_param, flags)
+```
+
+对应 `nu_unwind_info_array`。它保存 BPF 真正执行所需的固定字段。
+
+四张表连起来：
+
+```text
+当前 PC
+  |
+  v
+(pid, pc_page)
+  |
+  v
+file_id + bias
+  |
+  v
+(file_id, code_page)
+  |
+  v
+delta 范围
+  |
+  v
+unwind_info_index
+  |
+  v
+CFA / 返回地址恢复规则
+```
+
+### 7.6 为什么按页面组织
+
+PC 是完整的 64 位地址，但规则通常集中在代码附近。项目将代码按 64 KB 页面组织，页内只需比较低 16 位地址：
+
+```text
+PC = [代码页号][页内偏移]
+                 ^
+                 +-- 在该页的 delta 中查找
+```
+
+这样可以避免每次采样都扫描整个 ELF 的所有 FDE。
+
+---
+
+## 8. 阶段二：perf_event 如何触发 BPF 采样
+
+### 8.1 为每个 CPU 建立 CPU clock 事件
+
+当前 `EnhancedUnwinder::attach()` 设置：
+
+```text
+type        = PERF_TYPE_SOFTWARE
+config      = PERF_COUNT_SW_CPU_CLOCK
+freq        = 1
+sample_freq = 配置值
+```
+
+并对每个在线 CPU 调用 `perf_event_open()`，再将 `nu_tracer_entry` 附加到这个事件。
+
+若配置为 `sample_freq = 97`，可以直观理解为：
+
+```text
+每秒大约希望看到 97 个采样机会
+```
+
+真实样本数会受调度、过滤、perf buffer、系统负载等影响。
+
+### 8.2 一次采样的入口
+
+采样发生时进入：
+
+```text
+nu_tracer_entry(ctx)
+```
+
+入口首先取得当前进程和线程标识：
+
+```text
+pid = 当前线程所属进程
+tid = 当前线程
+```
+
+如果启用了 PID 过滤，不在目标集合中的进程会直接返回。
+
+### 8.3 从 pt_regs 取初始现场
+
+以 AArch64 为例，BPF 从 perf 上下文的寄存器现场取得：
+
+```text
+PC = regs->pc
+SP = regs->sp
+FP = regs->regs[29]   // x29
+LR = regs->regs[30]   // x30
+```
+
+对应实现见 [`native_unwinder.bpf.c:375`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.bpf.c:375)。
+
+可以画成：
+
+```text
+perf_event 进入 BPF
+        |
+        v
+       pt_regs
+   ┌────────────┐
+   │ pc         │ ----> 当前执行位置
+   │ sp         │ ----> 当前栈位置
+   │ x29 / fp   │ ----> 当前帧参考
+   │ x30 / lr   │ ----> 暂存返回地址
+   └────────────┘
+```
+
+### 8.4 先采当前帧，再找调用者
+
+BPF 回溯循环的顺序是：
+
+```text
+1. 将当前状态的 file_id + offset 记录为一帧
+2. 根据当前 PC 查 CFI
+3. 执行 unwind_one_frame()
+4. 得到调用者状态
+5. 重复
+```
+
+所以如果当前 PC 在 `work()`，输出的内部顺序通常是：
+
+```text
+work -> foo -> main
+```
+
+生成 folded stack 时，用户态可能再反转为：
+
+```text
+main;foo;work
+```
+
+两者描述的是同一条调用链，只是存储方向不同。
+
+### 8.5 BPF 的 tail call 为什么出现
+
+BPF 程序有复杂度和指令限制。项目没有把 128 层回溯全部塞进一个巨大程序，而是：
+
+```text
+nu_unwind_native
+    一次展开最多 5 帧
+          |
+          v
+    tail call 自己
+          |
+          v
+    再展开最多 5 帧
+```
+
+定义见 [`native_unwinder.h:9`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.h:9)：
+
+```text
+最大深度       = 128 帧
+每次展开       = 5 帧
+最大 tail call = 28 次
+```
+
+这是一种工程上的“分段循环”：逻辑上仍然是一条栈，物理上拆成多次 BPF 程序调用。
+
+---
+
+## 9. 阶段三：BPF 如何用 CFI 一帧一帧地回溯
+
+这一节是整个教程的核心。我们把 `unwind_one_frame()` 拆成几个非常具体的动作。
+
+### 9.1 动作一：根据当前 PC 找适用的 delta
+
+当前状态类似：
+
+```text
+pc                  = 0x7f12a0345678
+text_section_id     = file_id(libfoo.so)
+text_section_offset = 0x345678
+```
+
+首先根据 `file_id` 和代码页查：
+
+```text
+(file_id, 0x340000) -> delta 起始下标 + delta 数量
+```
+
+然后在该页的 delta 范围中二分查找：
+
+```text
+找到最后一个 address <= 当前页内偏移的 delta
+```
+
+代码见 [`unwinder_common.h:150`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:150)。
+
+图示：
+
+```text
+该代码页的 delta：
+
+页内地址      0x0100      0x0180      0x0200      0x0300
+规则           R0          R1          R2          R3
+                                                        ^
+                                                        |
+当前 PC 页内偏移 = 0x0340 ------------------------------+
+
+适用规则 = R3
+```
+
+### 9.2 动作二：计算 CFA
+
+从 `unwind_info` 中得到：
+
+```text
+base_reg = SP
+param    = 32
+```
+
+BPF 执行：
+
+```text
+base_val = 当前 SP
+CFA      = base_val + param
+```
+
+如果当前：
+
+```text
+SP = 0x7fe0
+```
+
+那么：
+
+```text
+CFA = 0x7fe0 + 32 = 0x8000
+```
+
+对应 BPF 实现见 [`unwinder_common.h:282`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:282)。
+
+### 9.3 动作三：计算返回地址位置
+
+如果规则是：
+
+```text
+aux_base_reg = CFA
+aux_param    = -8
+```
+
+则：
+
+```text
+返回地址地址 = CFA - 8
+```
+
+如果规则是：
+
+```text
+aux_base_reg = LR
+```
+
+则说明返回地址仍在 LR 寄存器中：
+
+```text
+返回地址 = 当前 state.lr
+```
+
+当前 BPF 会分别处理这两种情况，见 [`unwinder_common.h:301`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:301)。
+
+### 9.4 动作四：从用户栈读取保存内容
+
+如果返回地址在栈上，BPF 使用安全的用户内存读取方式：
+
+```text
+ra = user_memory[CFA + aux_param]
+```
+
+AArch64 中如果检测到 FP 和 LR 按成对方式保存，项目会一次读取两个值：
+
+```text
+saved_fp = user_memory[ra - 8]
+saved_ra = user_memory[ra]
+```
+
+这样可以同时恢复 FP 和返回地址，见 [`unwinder_common.h:315`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:315)。
+
+### 9.5 动作五：更新下一帧状态
+
+成功读取后，BPF 更新：
+
+```text
+state.pc = 恢复出的返回地址
+state.sp = CFA
+state.fp = 恢复出的上一帧 FP（如果规则提供）
+```
+
+于是：
+
+```text
+当前帧：
+    PC = work
+    SP = 0x7fe0
+    FP = 0x7fe0
+
+下一帧：
+    PC = foo 的返回位置
+    SP = 0x8000
+    FP = foo 的 FP
+```
+
+然后 BPF 重新用新的 PC 查找新的 ELF 映射和 CFI 规则。
+
+### 9.6 一次 `unwind_one_frame()` 的完整流程
+
+```mermaid
+flowchart TD
+    A[当前 state: PC/SP/FP/LR] --> B[保存当前帧 file_id + offset]
+    B --> C[按 file_id + code_page 找 delta 页]
+    C --> D[按页内 PC 二分查找适用规则]
+    D --> E[读取 unwind_info]
+    E --> F[计算 CFA]
+    F --> G{返回地址在哪里?}
+    G -->|LR 寄存器| H[读取 state.lr]
+    G -->|CFA/SP/FP 加偏移| I[读取用户栈内存]
+    H --> J[更新 pc/sp/fp]
+    I --> J
+    J --> K[重新解析下一帧所属映射]
+    K --> L{停止?}
+    L -->|否| C
+    L -->|是| M[发送 trace]
+```
+
+### 9.7 什么时候停止
+
+当前实现会在这些情况停止或转备用路径：
+
+```text
+没有对应 mapping
+没有对应 delta
+unwind_info 无效
+CFI 指示 STOP
+返回地址无效
+用户栈读取失败
+PC 太小或明显非法
+SP 没有向调用者方向变化
+达到最大栈深度
+达到 tail call 限制
+```
+
+源码中的 `NU_CMD_STOP`、`NU_CMD_SIGNAL`、`NU_CMD_FRAME_POINTER` 命令处理见 [`unwinder_common.h:220`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:220)。
+
+这里的 `NU_CMD_FRAME_POINTER` 是 CFI 规则在特殊情况下要求采用 FP 读取的命令，不代表整个主算法退化成“永远使用 FP 链”。主算法仍然是由当前 PC 选择规则，再执行规则。
+
+---
+
+## 10. 用一个完整例子走完寄存器和 CFA 的变化
+
+下面构造一个便于手算的 AArch64 示例。它不是某个具体业务函数的反汇编，而是为了展示当前回溯器如何工作。
+
+### 10.1 调用关系和采样点
+
+```text
+main() -> foo() -> work()
+```
+
+假设采样发生在 `work()` 内部：
+
+```text
+main 的代码范围：0x401000 - 0x401100
+foo  的代码范围：0x402000 - 0x402100
+work 的代码范围：0x403000 - 0x403080
+```
+
+采样时寄存器是：
+
+```text
+PC = 0x403040       // work 内部
+SP = 0x7fc0
+FP = 0x7fc0
+LR = 0x402044       // work 返回 foo 的位置
+```
+
+当前栈内容简化为：
+
+```text
+高地址
+0x8000  ┌─────────────────────────────┐
+        │ foo 的调用者边界 / CFA(foo)   │
+0x7ff8  ├─────────────────────────────┤
+        │ foo 的局部空间 / 对齐空间     │
+0x7ff0  ├─────────────────────────────┤
+        │ foo 的局部空间 / 对齐空间     │
+0x7fe8  ├─────────────────────────────┤
+        │ 保存的 foo LR = 0x40100c      │
+0x7fe0  ├─────────────────────────────┤
+        │ 保存的 foo FP                 │
+0x7fd8  ├─────────────────────────────┤
+        │ foo 的局部空间                │
+0x7fd0  ├─────────────────────────────┤
+        │ foo 的局部空间                │
+0x7fc8  ├─────────────────────────────┤
+        │ 保存的 work LR = 0x402044     │
+0x7fc0  ├─────────────────────────────┤
+        │ 保存的 work FP                │
+        └─────────────────────────────┘
+低地址
+```
+
+为了便于例子成立，假设 `work` 的 CFI 是：
+
+```text
+CFA = SP + 32
+保存的 FP = CFA - 32
+保存的 LR = CFA - 24
+```
+
+### 10.2 回溯第 0 帧：记录 work
+
+BPF 首先不急着读取栈，而是把当前帧记录下来：
+
+```text
+frame[0] = file_id(work_binary) + 0x3040
+```
+
+注意：当前帧的 PC 是 `0x403040`，但 folded 输出中可能最终显示为 `work_binary+0x3040`，或者在后续符号化后显示为 `work()`。
+
+### 10.3 回溯第 1 步：从 work 找到 foo
+
+使用 work 的规则：
+
+```text
+CFA = SP + 32 = 0x7fc0 + 32 = 0x7fe0
+保存的 LR = CFA - 24 = 0x7fc8
+保存的 FP = CFA - 32 = 0x7fc0
+```
+
+读取用户栈：
+
+```text
+memory[0x7fc8] = 0x402044
+memory[0x7fc0] = work 的调用者 FP
+```
+
+更新状态：
+
+```text
+旧状态：
+    PC = 0x403040
+    SP = 0x7fc0
+    FP = 0x7fc0
+
+新状态：
+    PC = 0x402044
+    SP = 0x7fe0
+    FP = work 的调用者 FP
+```
+
+因为 `0x402044` 属于 foo，BPF 重新解析 foo 的 mapping 和 CFI。
+
+### 10.4 回溯第 1 帧：记录 foo 并找到 main
+
+```text
+frame[1] = file_id(foo_binary) + 0x2044
+```
+
+假设 foo 的规则同样是：
+
+```text
+CFA = SP + 32
+保存的 FP = CFA - 32
+保存的 LR = CFA - 24
+```
+
+代入当前状态：
+
+```text
+CFA = 0x7fe0 + 32 = 0x8000
+保存的 LR 地址 = 0x8000 - 24 = 0x7fe8
+```
+
+读取：
+
+```text
+memory[0x7fe8] = 0x40100c
+```
+
+更新为 main 的状态：
+
+```text
+PC = 0x40100c
+SP = 0x8000
+FP = main 的 FP
+```
+
+### 10.5 回溯结果和输出方向
+
+BPF 内部记录顺序是从当前帧向外层走：
+
+```text
+work_binary+0x3040
+foo_binary+0x2044
+main_binary+0x100c
+```
+
+生成 folded line 时，用户态通常反转成外层到内层：
+
+```text
+main_binary+0x100c;foo_binary+0x2044;work_binary+0x3040 1
+```
+
+如果之后做符号化，可能变成：
+
+```text
+app!main();app!foo();app!work() 1
+```
+
+### 10.6 这个例子中 CFA 的作用
+
+如果没有 CFA，回溯器需要猜：
+
+```text
+保存的 LR 到底在 SP + 8、SP + 24，还是 FP - 16？
+```
+
+有了 CFI，规则直接告诉它：
+
+```text
+先算 CFA，再按 CFA + 偏移取值
+```
+
+这就是 CFI 的核心价值：**把“怎样恢复上一帧”从经验猜测变成由二进制提供的规则。**
+
+---
+
+## 11. 回溯结果怎样传回用户态
+
+### 11.1 BPF 内部的 `nu_trace`
+
+每次采样会形成一个 `nu_trace`，其中包含：
+
+```text
+pid
+tid
+ktime
+comm
+kernel_stack_id
+user_stack_id
+num_frames
+frame_data[]
+```
+
+native 帧在 `frame_data[]` 中编码为：
+
+```text
+[frame header][file_id][offset]
+```
+
+解释器帧还可以使用不同的 frame type，例如 Python、HotSpot、Ruby、PHP、V8、Perl 等。当前文章重点是 native CFI，解释器扩展可以理解为：
+
+```text
+从 native CFI 展开到某个运行时区域
+    |
+    v
+通过 tail call 进入对应运行时的展开程序
+    |
+    v
+追加一类特殊 frame
+```
+
+### 11.2 通过 perf event array 传输
+
+BPF 不直接写普通文件，而是调用：
+
+```text
+bpf_perf_event_output(..., &nu_trace_events, ...)
+```
+
+将一条 trace 放入 `nu_trace_events` 对应的 perf buffer。实现见 [`unwinder_common.h:339`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:339)。
+
+数据流：
+
+```text
+BPF 当前 CPU
+    |
+    v
+nu_trace_events perf event array
+    |
+    v
+用户态 perf_buffer__poll()
+    |
+    v
+EnhancedUnwinder::handlePerfEvent()
+    |
+    v
+CPUTracker::processEnhancedTrace()
+```
+
+CPUTracker 工作线程中的 `pollTraces()` 会轮询 perf buffer，见 [`cputracker.cc:792`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:792)。
+
+### 11.3 当前用户态如何生成文本
+
+native DWARF 帧主要被转换为：
+
+```text
+basename + 0xoffset [u]
+```
+
+例如：
+
+```text
+libfoo.so+0x1234 [u]
+```
+
+对应处理见 [`cputracker.cc:508`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:508)。
+
+如果 `enable_deferred_symbolization` 开启，则可以暂存：
+
+```text
+file_id:offset
+```
+
+这再次说明：
+
+```text
+回溯完成  !=  函数名解析完成
+```
+
+### 11.4 符号化的另一条输入路径
+
+内核 stack ID 或用户栈 fallback 的地址数组，用户态可以：
+
+```text
+stack_id
+   |
+   v
+bpf_map_lookup_elem(STACK_TRACE map)
+   |
+   v
+[addr0, addr1, addr2, ...]
+   |
+   v
+blazesym
+   |
+   v
+函数名 / 模块 / 行号
+```
+
+`Symbolizer::symbolizeStack()` 见 [`symbolizer.cc:202`](/sandbox/platform/perf_ebpf/src/framework/symbolizer.cc:202)，它读取地址数组后调用 blazesym。
+
+---
+
+## 12. 当前实现中的备用路径和边界
+
+### 12.1 `bpf_get_stackid()` 的内核栈路径
+
+每次 `nu_tracer_entry()` 中，当前实现会采集内核 stack ID：
+
+```c
+rec->trace.kernel_stack_id =
+    bpf_get_stackid(ctx, &nu_kernel_stackmap, 0);
+```
+
+这与用户态 native DWARF CFI 路径是两套表示：
+
+```text
+用户态 native 栈：frame_data = file_id + offset
+内核态栈：        kernel_stack_id -> 地址数组
+```
+
+### 12.2 用户栈 DWARF 失败时的 fallback
+
+如果出现以下情况：
+
+- 找不到当前 PC 的进程映射；
+- 找不到对应 CFI delta；
+- 用户栈内存读取失败；
+- LR 无效；
+- DWARF 只展开出很浅的栈；
+
+BPF 会尝试：
+
+```text
+bpf_get_stackid(ctx, &nu_user_stackmap, BPF_F_USER_STACK | ...)
+```
+
+用户态在 DWARF 帧为空或帧数很少时，会比较 fallback 地址栈的深度，必要时使用 fallback 结果，见 [`cputracker.cc:592`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:592)。
+
+### 12.3 当前主路径不是 `profile.bpf.c`
+
+仓库中存在旧的 `profile.bpf.c`：
+
+```c
+bpf_get_stackid(ctx, &stack_traces, ...)
+```
+
+它仍被 BUILD 文件构建，但当前 CPUTracker 使用的是：
+
+```text
+EnhancedUnwinder
+native_unwinder.bpf.c
+```
+
+因此分析当前运行行为时，应沿着 `CPUTracker::initialize()` -> `EnhancedUnwinder::load()` -> `EnhancedUnwinder::attach()` 追踪，不能只因为仓库里有 `profile.bpf.c` 就断言 CPUTracker 仍然使用传统 stack ID 主路径。
+
+### 12.4 CFI 不一定覆盖所有代码
+
+CFI 路径可能中断于：
+
+```text
+某个 ELF 没有可用 .eh_frame
+该函数的 CFI 不完整
+映射刚变化，用户态还没有同步到 BPF map
+进程退出或 PID 变化
+栈地址不可读
+当前地址属于特殊运行时或信号帧
+规则超过 BPF map 容量
+perf buffer 丢事件
+```
+
+因此一个完整的性能采集系统通常需要主路径加 fallback，而不是假设所有样本都能以同样方式回溯到栈底。
+
+### 12.5 Off-CPU 复用相同的 CFI 组件
+
+如果启用 `sched_tracker` 的 Off-CPU DWARF 路径，被切出任务的用户寄存器会进入类似的 native unwind 流程：
+
+```text
+sched_switch
+    |
+    v
+拿到被切出任务的用户现场
+    |
+    v
+复用 mapping / delta / unwind_info
+    |
+    v
+执行 native CFI unwind
+    |
+    v
+用栈哈希和睡眠时间关联
+```
+
+对应入口见 [`sched_tracker.bpf.c:1585`](/sandbox/platform/perf_ebpf/bpf_common/sched_tracker.bpf.c:1585)。如果 DWARF 路径不能使用，off-CPU 代码同样保留 `bpf_get_stackid()` fallback，见 [`sched_tracker.bpf.c:1644`](/sandbox/platform/perf_ebpf/bpf_common/sched_tracker.bpf.c:1644)。
+
+---
+
+## 13. 为什么说它是“BPF 内轻量化”
+
+这里的“轻量化”不是说回溯没有计算，而是说把复杂工作从高频采样点搬走，并把采样点的操作压成固定形式。
+
+### 13.1 采样点不做什么
+
+BPF 采样点不负责：
+
+```text
+不打开 ELF 文件
+不解析 CIE/FDE 字节流
+不查询 C++ 函数名
+不读取源码文件
+不分配任意大小的动态容器
+不执行无限循环
+```
+
+### 13.2 采样点只做什么
+
+```text
+读取寄存器
+查 PID + PC 映射
+查代码页 delta
+二分查找适用规则
+计算 CFA
+读取少量用户栈内存
+更新固定大小状态
+追加 frame_data
+发送 trace
+```
+
+### 13.3 复杂度在哪里被控制
+
+```text
+规则解析复杂度：用户态低频完成
+单帧回溯：固定字段 + 有界 map 查询
+每个 tail call：最多 5 帧
+总深度：最多 128 帧
+frame_data：固定最大容量
+```
+
+这也是为什么项目将 `StackDeltaEntry` 转换为 `nu_unwind_info`：减少 BPF 端需要理解的语义。
+
+### 13.4 代价和风险
+
+这种设计并不是没有代价：
+
+- 用户态必须持续同步进程映射；
+- ELF 的 CFI 解析器必须覆盖目标平台常见编码；
+- BPF map 有容量上限；
+- 规则压缩或实现不完整时可能出现短栈；
+- 用户栈读取发生在内核上下文，权限和内存可访问性会影响结果；
+- 每个采样都做多次 map lookup 和用户内存读取，采样频率不能无限提高；
+- perf buffer 满时会丢事件。
+
+所以调优目标不是“让每条样本都回溯到 128 层”，而是：在可接受开销下，让热点路径具有足够稳定、可解释的深度。
+
+---
+
+## 14. 初学者排查一条栈为什么断了
+
+可以沿着数据链逐层判断，不要一看到 `no_stack` 就直接归因于符号化。
+
+### 14.1 第一步：有没有采样事件
+
+检查：
+
+```text
+perf_event 是否成功打开？
+BPF 程序是否成功 attach 到每个 CPU？
+perf buffer 是否创建成功？
+是否有 lost event 日志？
+```
+
+如果连 `nu_trace` 都没有，问题在采样或传输阶段，还没有进入回溯。
+
+### 14.2 第二步：有没有当前 PC
+
+当前实现会从 `pt_regs` 读取 PC。如果 PC 无效或处于内核地址，处理路径不同：
+
+```text
+用户 PC -> native DWARF 用户栈
+内核 PC -> 内核 stack ID，必要时再尝试用户栈
+```
+
+### 14.3 第三步：PC 是否能映射到 ELF
+
+如果 `nu_pid_page_to_mapping` 查不到：
+
+```text
+PID 是否正确？
+/proc/<pid>/maps 是否存在？
+映射是否刚加载？
+用户态是否调用了 synchronizeProcess？
+地址是否落在可执行映射？
+```
+
+映射缺失时，BPF 无法知道当前 PC 属于哪个文件，也无法索引 CFI。
+
+### 14.4 第四步：ELF 是否有 CFI
+
+检查用户态日志：
+
+```text
+Parsed N deltas from <path>
+```
+
+如果看到：
+
+```text
+No .eh_frame in <path>
+```
+
+说明该 ELF 没有被当前解析器找到的回溯信息，可能走 fallback，也可能只能得到浅栈。
+
+### 14.5 第五步：delta 是否命中
+
+即使 ELF 有 `.eh_frame`，也可能因为：
+
+```text
+PC 不在已解析的 FDE 范围
+page key 计算不一致
+file_id 不一致
+delta map 写入失败
+规则数组容量不足
+```
+
+导致 `get_stack_delta()` 失败。
+
+### 14.6 第六步：用户栈内存能否读取
+
+如果 CFI 找到了，但 `bpf_probe_read_user()` 失败，典型原因包括：
+
+```text
+SP/CFA 算错
+栈地址已经离开有效映射
+线程正在特殊信号帧中
+被采样任务的用户栈不可读
+```
+
+此时可能出现：
+
+```text
+只有当前一帧
+只有 1 到 3 帧
+转入 user_stack_id fallback
+```
+
+### 14.7 第七步：回溯成功但函数名为空
+
+这不是回溯失败。应区分：
+
+```text
+有 file_id + offset
+    -> 回溯成功
+
+没有函数名
+    -> 符号化材料不足或尚未执行符号化
+```
+
+当前 CPUTracker 默认配置中的 `enable_symbolization` 是 `false`，见 [`perf_ebpf.json:98`](/sandbox/platform/perf_ebpf/config/default/perf_ebpf.json:98)。但 native DWARF 路径仍可以输出 `basename + offset`，这属于地址归属信息，不等于函数名解析。
+
+### 14.8 一张排查决策图
+
+```text
+没有火焰图样本
+    |
+    +-- 没有 perf_event / BPF 事件？ -> 查 attach、权限、采样频率
+    |
+    +-- 有事件但 trace 丢失？       -> 查 perf buffer、lost event
+    |
+    +-- 有 trace 但 num_frames=0？   -> 查 PC、mapping、CFI、fallback
+    |
+    +-- 只有一两帧？                -> 查 delta 命中、用户栈读取、停止条件
+    |
+    +-- 有 file+offset 无函数名？    -> 查符号化配置、ELF 符号和 debuginfo
+    |
+    +-- 有函数名但火焰图不对？       -> 查栈方向、PID/TID、聚合和权重
+```
+
+---
+
+## 15. 把整套流程压缩成一张图
+
+### 15.1 从启动到输出的全流程
+
+```mermaid
+sequenceDiagram
+    participant U as 用户态 EnhancedUnwinder
+    participant E as perf_event
+    participant B as BPF native_unwinder
+    participant M as BPF maps
+    participant P as 用户态 CPUTracker
+
+    U->>U: 读取 /proc/pid/maps
+    U->>U: 解析 ELF .eh_frame / .debug_frame
+    U->>M: 写入 mapping / delta / unwind_info
+    U->>E: 每 CPU 打开 CPU_CLOCK event
+    U->>B: attach nu_tracer_entry
+
+    E->>B: 周期性触发采样
+    B->>B: 读取 PC/SP/FP/LR
+    B->>M: 查询 PID + PC 映射
+    B->>M: 查询当前 PC 的 CFI delta
+    B->>B: 计算 CFA，读取返回地址
+    B->>B: 更新下一帧 PC/SP/FP
+    B->>M: 重复查询和展开
+    B->>P: nu_trace_events perf buffer
+    P->>P: 解析 file_id + offset
+    P->>P: 生成 folded stack / 可选符号化
+```
+
+### 15.2 最重要的“前后状态”
+
+```text
+展开前：
+    state.pc = 当前函数地址
+    state.sp = 当前函数栈指针
+    state.fp = 当前函数帧指针（可能无效）
+    state.lr = 当前链接寄存器
+
+执行 CFI：
+    规则 = lookup(file_id, pc)
+    cfa  = base_register + cfa_offset
+    ra   = memory[cfa + ra_offset] 或 state.lr
+
+展开后：
+    state.pc = 调用者返回位置
+    state.sp = cfa
+    state.fp = 调用者 FP（如果能恢复）
+    state.lr = 按需要保留或更新
+```
+
+### 15.3 用一句话记忆
+
+```text
+先用 PC 找规则，再用规则找 CFA；
+先用 CFA 找返回地址，再把返回地址当成下一帧 PC。
+```
+
+---
+
+## 16. 源码对照表
+
+以下位置来自当前 `/sandbox/platform/perf_ebpf` 分支，便于学习者按模块回看实现。
+
+| 学习问题 | 源码位置 | 作用 |
+| --- | --- | --- |
+| CPUTracker 是否使用 EnhancedUnwinder | [`cputracker.cc:81`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:81) | 创建增强展开器 |
+| 什么时候 attach perf event | [`cputracker.cc:127`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:127) | 启动采样 |
+| perf event 如何附加 BPF | [`enhanced_unwinder.cc:121`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:121) | 每 CPU 打开 CPU clock event |
+| 如何轮询回溯结果 | [`cputracker.cc:792`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:792) | 用户态轮询 perf buffer |
+| BPF 采样入口 | [`native_unwinder.bpf.c:327`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.bpf.c:327) | 读取当前任务和寄存器 |
+| 如何获取 AArch64 PC/SP/FP/LR | [`native_unwinder.bpf.c:375`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.bpf.c:375) | 初始化回溯状态 |
+| 如何查进程映射 | [`unwinder_common.h:114`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:114) | PID + PC 到 file_id/bias |
+| 如何查 CFI delta | [`unwinder_common.h:150`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:150) | 页内二分查找 |
+| 如何展开一帧 | [`unwinder_common.h:202`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:202) | 执行规则、恢复 PC/SP/FP |
+| 如何发送 trace | [`unwinder_common.h:339`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:339) | 写入 perf event array |
+| ELF 是否读取 `.eh_frame` | [`eh_frame_parser.cc:143`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:143) | 读取 CFI section |
+| 是否 fallback 到 `.debug_frame` | [`eh_frame_parser.cc:156`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:156) | 无 `.eh_frame` 时尝试 |
+| CIE/FDE 如何转换成 delta | [`eh_frame_parser.cc:245`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:245) | 生成固定规则 |
+| 规则如何写入 BPF map | [`enhanced_unwinder.cc:397`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:397) | 加载 delta 和 page 索引 |
+| 进程映射如何同步 | [`enhanced_unwinder.cc:567`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:567) | 解析 ELF 并更新 map |
+| native frame 如何输出 | [`cputracker.cc:508`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:508) | `file + offset` 文本 |
+| stack ID 如何转地址和符号 | [`symbolizer.cc:202`](/sandbox/platform/perf_ebpf/src/framework/symbolizer.cc:202) | 读取 stack map 并调用符号器 |
+| Off-CPU 是否复用 DWARF | [`sched_tracker.bpf.c:1585`](/sandbox/platform/perf_ebpf/bpf_common/sched_tracker.bpf.c:1585) | sched_switch 中展开 |
+
+## 与其他文档的关系
+
+- [从堆栈回溯到火焰图：perf_ebpf 与 FlameCraft 教学](./2026-10-09%20从堆栈回溯到火焰图：perf_ebpf%20与%20FlameCraft%20教学.md)：全链路概览，继续讲 FlameCraft 如何解析和构建火焰图。
+- [函数调用与栈回溯：从栈帧到 FP、DWARF 与 eBPF](../正典阁/技术栈/操作系统/函数调用与栈回溯：从栈帧到%20FP、DWARF%20与%20eBPF.md)：函数调用、栈帧和三种回溯方法的基础篇。
+- [ELF 与符号化：从文件结构到运行时地址装载](../正典阁/技术栈/操作系统/ELF与符号化：从文件结构到运行时地址装载.md)：重点解释 ELF、装载 bias、符号表、DWARF 行号和地址符号化。
+
+---
+
+## 最后复习
+
+如果只记住五句话，请记住：
+
+1. `perf_event` 负责在 CPU 运行过程中定期触发观察。
+2. BPF 先拿到采样瞬间的 `PC/SP/FP/LR`，这些只是当前现场。
+3. DWARF CFI 负责告诉回溯器“从这个 PC 出发，怎样恢复上一帧”。
+4. CFA 是恢复保存寄存器和返回地址时的统一参考点。
+5. 当前 `perf_ebpf` 在用户态预解析 CFI，在 BPF 内执行轻量化逐帧回溯，最后才由用户态完成地址归属和可选符号化。
+
+最简心智模型：
+
+```text
+PC 告诉我“现在在哪儿”
+CFI 告诉我“上一帧怎么找”
+CFA 告诉我“从哪里量偏移”
+返回地址告诉我“调用者在哪儿继续”
+重复这些动作，就得到完整调用链
+```
