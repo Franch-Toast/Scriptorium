@@ -14,7 +14,7 @@ tags:
 
 # ELF 与符号化：从文件结构到运行时地址装载
 
-> 本文是《函数调用与栈回溯：从栈帧到 FP、DWARF 与 eBPF》的背景篇。栈回溯回答“调用栈里有哪些地址”，本文回答“这些地址如何变回函数名与源码行”。主线刻意从静态到动态：先讲清 ELF 文件里装了什么（第 2 节），再讲它如何被装进进程（第 3 节），然后是地址如何在多套坐标系之间换算（第 4 节）、如何匹配到名字（第 5 节），最后是工程上如何守护这些符号材料（第 6 节）。
+> 本文属于「栈回溯」系列，与同系列的 [函数调用与返回：AArch64栈帧与寄存器的逐步变化](./函数调用与返回：AArch64栈帧与寄存器的逐步变化.md)、[三种栈回溯方法总览](./栈回溯方法/三种栈回溯方法总览.md) 及其三个方法篇配套：它们回答“调用栈里有哪些地址、这些地址如何被找回”，本文回答“这些地址如何变回函数名与源码行”。主线刻意从静态到动态：先讲清 ELF 文件里装了什么（第 2 节），再讲它如何被装进进程（第 3 节），然后是地址如何在多套坐标系之间换算（第 4 节）、如何匹配到名字（第 5 节），最后是工程上如何守护这些符号材料（第 6 节）。
 
 > 文中以 Linux x86-64 为主线，QNX/AArch64 的思想一致；所有地址都是教学用示例，真实数值随编译器、链接器与 ASLR 变化。示例围绕三个全程自洽的二进制展开：主程序 `stack_demo`（函数 `checksum`/`process`/`main`）、自制共享库 `libcalc.so`（函数 `add`）、系统库 `libstdc++.so.6`。
 
@@ -627,7 +627,7 @@ checksum
 - System V ABI / ELF Specification: ELF header、program header、`.symtab`/`.dynsym` 与 DWARF 节的权威定义。
 - DWARF Standard: `.debug_info`、`.debug_line` 行号表语义。
 - GNU Binutils: `readelf`/`nm`/`objcopy --only-keep-debug`/`--add-gnu-debuglink`、`strip` 的符号与调试节语义；elfutils `eu-strip` 与发行版 debuginfo 分包实践。
-- 姐妹篇《函数调用与栈回溯：从栈帧到 FP、DWARF 与 eBPF》：栈帧、三种回溯方法与 profile 工作流全景。
+- 姐妹篇 [函数调用与返回：AArch64栈帧与寄存器的逐步变化](./函数调用与返回：AArch64栈帧与寄存器的逐步变化.md) 与 [三种栈回溯方法总览](./栈回溯方法/三种栈回溯方法总览.md)：调用栈的逐步变化、三种回溯方法与 profile 工作流全景。
 - `/sandbox/FlameCraft/pkg/symbolizer/normalize.go`: 归一化 `NormalizeAddress()` 的实现。
 - `/sandbox/FlameCraft/pkg/binsymbolizer/symbolizer.go`: 找 ELF、查 `.symtab`/`.dynsym`、demangle。
 - `/sandbox/FlameCraft/pkg/symbol/addr2line/`: DWARF/符号表还原函数、文件、行号。
