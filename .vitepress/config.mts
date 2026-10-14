@@ -48,8 +48,8 @@ function libSidebar(dir: string, title: string) {
   return [
     {
       // 库名可点：进入库的目录显示页（index.md）；子目录列表恒展开（一级目录可见）
-      text: title,
-      link: `/${libPath}/`,
+      // text: title,
+      // link: `/${libPath}/`,
       items: [{ text: `${title} · 首页`, link: `/${libPath}/` }, ...normalizeLinks(raw, libPath)],
     },
   ];
