@@ -34,8 +34,11 @@ function libSidebar(dir: string, title: string) {
       scanStartPath: libPath,
       useTitleFromFrontmatter: true,
       useFolderTitleFromIndexFile: true,
-      // 各级目录组默认折叠（collapseDepth 默认 1）：侧边栏初始仅展开到一级目录，
-      // 点击组名前的箭头逐层展开，避免深层树一次性铺满
+      // 目录节点链接到其 index.md：点击目录名进入该目录的显示页；
+      // 无 index.md 的目录不生成链接，保持纯分组（点击仅展开）
+      useFolderLinkFromIndexFile: true,
+      // 各级目录组默认折叠：首屏仅显示一级目录；点击目录名跳转后
+      // 当前页所在组自动展开，点击展开箭头仅展开/折叠不跳转
       collapsed: true,
     },
   ]) as unknown;
@@ -44,7 +47,9 @@ function libSidebar(dir: string, title: string) {
     : ((scanned as Record<string, { items?: SidebarItem[] }>)?.["/"]?.items ?? []);
   return [
     {
+      // 库名可点：进入库的目录显示页（index.md）；子目录列表恒展开（一级目录可见）
       text: title,
+      link: `/${libPath}/`,
       items: [{ text: `${title} · 首页`, link: `/${libPath}/` }, ...normalizeLinks(raw, libPath)],
     },
   ];
