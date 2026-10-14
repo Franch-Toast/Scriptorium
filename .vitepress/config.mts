@@ -42,7 +42,12 @@ function libSidebar(dir: string, title: string) {
       scanStartPath: libPath,
       useTitleFromFrontmatter: true,
       useFolderTitleFromIndexFile: true,
-      // 不设 collapseDepth：库内全树默认展开
+      // 目录节点链接到其 index.md：点击目录名进入该目录的显示页；
+      // 无 index.md 的目录不生成链接，保持纯分组（点击仅展开）
+      useFolderLinkFromIndexFile: true,
+      // 各级目录组默认折叠：首屏仅显示一级目录；点击目录名跳转后
+      // 当前页所在组自动展开，点击展开箭头仅展开/折叠不跳转
+      collapsed: true,
     },
   ]) as unknown;
   // 该选项组合下插件返回多段对象 { "/": { items } }；旧版/其他组合返回数组，两种形态都兼容
@@ -50,11 +55,14 @@ function libSidebar(dir: string, title: string) {
     ? (scanned as SidebarItem[])
     : ((scanned as Record<string, { items?: SidebarItem[] }>)?.["/"]?.items ?? []);
   return [
-    { text: "← 返回藏经阁", link: "/catalogue" },
-    {
-      text: title,
+    { 
       items: [
+        { text: "← 返回藏经阁", link: "/catalogue" },
         { text: `${title} · 首页`, link: `/${libPath}/` },
+      ],
+    },
+    {
+      items: [
         ...normalizeLinks(raw, libPath),
       ],
     },
