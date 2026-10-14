@@ -137,7 +137,7 @@ JOBS=8 bash run_linux_unit_tests.bash
 
 集成测试覆盖默认关闭（即使采样参数已设置）、仅 heap、仅 stats、两类同时输出、stats-only 不启用采样、采样开关打开但采样参数缺失、周期缺失和缺少自动输出配置。测试检查输出类型、采样数据状态、关闭自动输出时不创建目录，以及原有 `TCMALLOC_AUTODUMP_DIR` 能正常生成 stats 文件；同时验证输出路径指向普通文件时不会启动输出。
 
-QNX 修改验证按仓库 [验证 README](../../../../../google-gperftools/qnx_allocator_validation/README.md) 执行，区分交叉构建、目标机 `LD_PRELOAD` 启动短测和其他未执行项；Linux 单测通过不代表 QNX 目标机运行通过。
+QNX 修改验证按仓库 [验证 README](/sandbox/google-gperftools/qnx_allocator_validation/README.md) 执行，区分交叉构建、目标机 `LD_PRELOAD` 启动短测和其他未执行项；Linux 单测通过不代表 QNX 目标机运行通过。
 
 ## 7. 注意事项
 

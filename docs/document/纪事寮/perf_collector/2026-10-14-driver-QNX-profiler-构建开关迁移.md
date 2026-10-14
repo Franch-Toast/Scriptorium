@@ -179,4 +179,4 @@ copt=-DQNX_PROFILER=1
 - 它仍可能被其他仓库或尚未迁移的车型使用。
 - 它保留了 C++ feature 与 **-DQNX_PROFILER=1** 的既有语义；没有完成全量消费者审计前不应删除。
 
-如果未来要把接口统一成共享的 **--config=qnx_profiler_<mode>**，那应作为独立的跨仓库迁移：同时定义 RC alias/build setting、决定 C++ feature 是否继续适用、迁移所有 DEM 与 CI 调用方，并验证向后兼容。它不是当前 driver 新模式能够单独推出的改动。
+如果未来要把接口统一成共享的 `--config=qnx_profiler_<mode>`，那应作为独立的跨仓库迁移：同时定义 RC alias/build setting、决定 C++ feature 是否继续适用、迁移所有 DEM 与 CI 调用方，并验证向后兼容。它不是当前 driver 新模式能够单独推出的改动。
