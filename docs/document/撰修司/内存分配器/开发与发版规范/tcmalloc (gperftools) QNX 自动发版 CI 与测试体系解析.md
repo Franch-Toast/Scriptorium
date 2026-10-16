@@ -1,7 +1,7 @@
 ---
 title: "tcmalloc (gperftools) QNX 自动发版 CI 与测试体系解析"
-date: 2026-09-20
-description: "涉及文件：.gitlab-ci.yml、compile.bash、pipeline/、qnx_allocator_validation/、公共模板 /sandb"
+date: 2026-10-14
+description: "涉及文件：.gitlab-ci.yml、compile.bash、pipeline/、qnx_allocator_validation/ 与公共 CI 模板；覆盖 QNX 双平台四库交付"
 categories:
   - 撰修司
 tags:
@@ -12,9 +12,9 @@ tags:
 # tcmalloc (gperftools) QNX 自动发版 CI 与测试体系解析
 
 > 文档性质：对 `google-gperftools` 仓库 QNX 发版流水线（GitLab CI）的逐段解析 + 测试分析 + 开发者发版 SOP 存档。  
-> 生成日期：2026-09-09  
+> 初版日期：2026-09-09；最近一次代码同步：2026-10-14。
 > 源码仓库：`/sandbox/google-gperftools`（GitLab `third-party-repos/google-gperftools`）  
-> 参考分支：`codex/qnx-allocator-release-ci`（远端 HEAD `5c04902`，未合并默认分支）  
+> 本文的“当前实现”以仓库中的 `compile.bash`、`pipeline/`、`qnx_allocator_validation/` 为准。
 > 正式 tag：`v2.17.2-qnx.2`；正式产物源码 SHA：`75d23a135288367bbae59b1ca3ba3c92215a79eb`  
 > 涉及文件：`.gitlab-ci.yml`、`compile.bash`、`pipeline/*`、`qnx_allocator_validation/*`、公共模板 `/sandbox/cicd-common/*`
 
@@ -25,12 +25,25 @@ tags:
 本仓库的 QNX 发版不是"从零写 CI"，而是对 DeepRoute 公共模板 `cicd-common`  
 （`/sandbox/cicd-common`，include 时锁 `ref: development`）的**最小化适配**：  
 本地只写 4 个 job + 1 个注册 hook，构建、生成 Debian control、打 deb、上传、注册  
-全部复用模板。CI 保证的是"**能编、能链、ELF/ABI 正确、包能上传并能从公开源重新下载  
-校验**"；QNX 实机运行验证（双台架 8/8 冒烟）由人在 CI 之外执行。
+全部复用模板。当前 deb 要交付 SDP7.1/SDP8.0 的 minimal/full 共四份库。CI 保证的是
+"**能编、能链、ELF/ABI/SONAME 正确、full 库含 heap-profiler 导出、包能上传并能从公开源
+重新下载校验**"；QNX 实机运行验证（含 full 库实际 profile）仍由人在 CI 之外执行。
 
 **验收结论边界（务必记住）**：8650 / 8797 双平台正式发版 + 双台架核心短测已完成，  
 **不代表历史 crash 已归因，也不代表全部 QNX UT 已通过**。当前"默认使用 tcmalloc"  
 是运营决策而非完整验证结论。
+
+### 0.1 2026-10-14 双库交付变更
+
+- 旧实现使用 `configure --enable-minimal`，只构建并打包 minimal 库。该选项会关闭
+  heap profiler，因此**不会**生成 `libtcmalloc.so.10`。
+- 当前实现每平台只执行一次不带 `--enable-minimal` 的完整 `configure`，再按 target 分别
+  执行 `make libtcmalloc_minimal.la sampler_test` 和 `make libtcmalloc.la`。这避免第二次
+  configure 和第二个构建目录；两个 libtool target 仍各自编译所需对象。
+- 两次 `make` 必须分别覆盖 `LDFLAGS`，为 minimal/full 写入各自 SONAME。若在 configure
+  阶段全局写死 minimal SONAME，full 库会带错误 SONAME。
+- 包校验、manifest、台架 launcher、feature matrix 和回归测试均已适配 full 库，旧的
+  minimal-only 制品会被当前包校验器拒绝。
 
 ---
 
@@ -41,10 +54,12 @@ tags:
   ```
   opt/deeproute/tcmalloc/
     build-receipt.txt              # 构建批次凭据：status/platform/git_sha/build_run_id
-    sdp7.1/manifest.txt            # 该库的完整指纹
+    sdp7.1/manifest.txt            # minimal/full 两份库的完整指纹
     sdp7.1/lib/libtcmalloc_minimal.so.10
-    sdp8.0/manifest.txt
+    sdp7.1/lib/libtcmalloc.so.10   # 含 heap profiler 的完整库
+    sdp8.0/manifest.txt            # minimal/full 两份库的完整指纹
     sdp8.0/lib/libtcmalloc_minimal.so.10
+    sdp8.0/lib/libtcmalloc.so.10   # 含 heap profiler 的完整库
   ```
 - 
 
@@ -53,8 +68,15 @@ tags:
 | 8650 = sdp7.1 | QNX 7.1 (SDP7.1.0) | 16 KiB | `libc++.so.1` |
 | 8797 = sdp8.0 | QNX 8.0 (SDP8.0.0) | 4 KiB | `libc++.so.2` |
 
-- SONAME 均为 `libtcmalloc_minimal.so.10`，两个库都是 QNX AArch64 shared ELF。
-- 启用方式：`LD_PRELOAD=<库绝对路径> <业务程序>`，无需重新链接业务代码。
+- 两个平台各有两份 QNX AArch64 shared ELF：minimal 的 SONAME 是
+  `libtcmalloc_minimal.so.10`；full 的 SONAME 是 `libtcmalloc.so.10`。
+- minimal 是默认的 malloc/free 与 C++ new/delete 接管库，不带 heap profiler；full 包含
+  heap profiler，导出 `HeapProfilerStart`、`HeapProfilerDump`、`HeapProfilerStop` 和
+  `IsHeapProfilerRunning`。
+- 启用方式：`LD_PRELOAD=<同平台库绝对路径> <业务程序>`，无需重新链接业务代码。profile
+  场景使用 `HEAPPROFILE=/tmp/heapprof LD_PRELOAD=.../libtcmalloc.so.10 <业务程序>`。
+- 同一进程只能加载一个 allocator；SDP7.1 与 SDP8.0 的库不可混用，分别依赖
+  `libc++.so.1` 与 `libc++.so.2`。
 - **Debian `Architecture: amd64` 标记的是"交叉编译产物的宿主架构"（包在 x86 Linux  
 上打出的），不是库的目标架构**。
 - **QNX 本身没有 dpkg/apt**，deb 只是 Linux 侧的发布/分发载体，台架使用 = 拷库文件 +  
@@ -160,7 +182,9 @@ before_script:                 # 全局 before_script（每个未覆盖它的 jo
 | push tag（如 `v2.17.2-qnx.2`） | ✅ 重跑 Linux UT | ❌ | ✅ | ✅ |
 | 手动 / API 触发 | ✅ | 视 tag | 视 tag | ✅（相关 build job 缺席则跳过） |
 
-即：**普通分支推送自动发布 snapshot；Git tag 自动发布正式 release。**
+即：**普通开发分支推送自动发布 snapshot；合规且已批准的 Git tag 自动发布正式 release。**
+CI 的自动触发不等于发版授权：不得直接向集成主线开发或推送，正式 tag 只能指向已验收、
+已批准、且属于集成主线历史的提交。
 
 ### 2.7 值得注意的写法细节
 
@@ -193,8 +217,8 @@ snapshot `deeproute-tcmalloc-qnx-snapshot_2.17.3-<pipeline_id>_amd64.deb`（带 
 
 - `python3 -m unittest discover -s pipeline/tests -v`
 
-  - `test_release.py`：14 个用例全部跑；
-  - `test_package_artifacts.py`：8 个用例因 `@skipUnless(QNX_TEST_PACKAGE_ROOT)`  
+  - `test_release.py`：15 个纯逻辑用例全部跑；其中新增 full 库摘要转发覆盖；
+  - `test_package_artifacts.py`：10 个用例因 `@skipUnless(QNX_TEST_PACKAGE_ROOT)`
   此时**整体 skip**（还没有 QNX 产物）。
 - `bash -x ./run_linux_unit_tests.bash`：对干净 git 快照做 autogen → configure → make，  
 Linux 原生跑
@@ -204,12 +228,16 @@ Linux 原生跑
 
 **第 2 层 · build job 内部校验（随交叉编译强制执行）**
 
-- 每平台编译后立即做（见 `compile.bash`）：AArch64 + `Type: DYN`、SONAME、对应 libc++、  
-32 个必需导出符号、Build ID、SHA256 写入 manifest；
+- 每个平台先执行一次完整 configure（不传 `--enable-minimal`），再按 target 构建 minimal
+  和 full；minimal 构建同时交叉链接 `sampler_test`。
+- 每份库编译后立即做（见 `compile.bash`）：AArch64 + `Type: DYN`、各自 SONAME、对应
+  libc++、allocator C/C++ 导出、Build ID、SHA256 写入 manifest；full 还校验四个 heap-profiler
+  动态导出。manifest 保留 minimal 的 `sha256` 等旧字段，full 使用 `full_sha256`、
+  `full_soname`、`full_needed`、`full_build_id`、`full_profile_exports` 等字段；
 - **sampler_test 交叉链接门禁**（两平台都要能交叉链成 AArch64，测试程序不进发布包）；
 - `--platform all` 构建成功后：`verify_qnx_package.py` 全包校验 +  
-`QNX_TEST_PACKAGE_ROOT` 已置位 → `test_package_artifacts.py` 的 **8 项真实 ELF  
-集成测试**真正执行（= 验收报告"8 项实际 ELF/制包回归"）；
+`QNX_TEST_PACKAGE_ROOT` 已置位 → `test_package_artifacts.py` 的 **10 项真实 ELF
+集成测试**真正执行（含 full 库篡改和跨平台 ABI 串用）；
 - 模板制包环节：`/apt/control` 生成 = 校验三段数字；上传后**轮询下载链接 200** 确认可见。
 
 **第 3 层 · verify job（stage: verify）**  
@@ -228,11 +256,15 @@ Linux 原生跑
 CI **不测** QNX 实机运行。双台架冒烟  
 （8650=`ostest-8650-39` / QNX7.1；8797=`lp-8797B-1` / QNX8.0）由人把**下载的真实包**  
 传上台架，用 `run_qnx_release_smoke.sh`（内部经 `run_with_allocator.sh` 以 LD_PRELOAD  
-加载库，先校验 manifest sha256 与 ELF 归属）跑 **8/8 程序**：  
+加载库，先按实际库名校验 manifest 的 `sha256` 或 `full_sha256` 与 ELF 归属）跑 **8/8 程序**：
 sampler + O0/O2/O3 各一组 C API(`allocator_c_api_O*`)与 C++ 合约(`allocator_contract_O*`)
 
 - 双 DSO 交叉分配(`dso_contract_test`)；对应 **sampler 11/11、JSON/符号归属 21/21**。  
 每个平台分本地预验证 / 实际 snapshot 包 / 实际正式包三阶段。
+
+当前 feature matrix 还按实际传入的库区分能力：仅当库文件名是
+`libtcmalloc_minimal.so.10` 时跳过 heap profile/automatic dump 路径；full 库会继续执行该路径。
+这只覆盖脚本分支，不能替代 QNX 目标机上的 `HEAPPROFILE` 运行短测。
 
 ---
 
@@ -245,17 +277,17 @@ sampler + O0/O2/O3 各一组 C API(`allocator_c_api_O*`)与 C++ 合约(`allocato
 | `config.xml` | 发版配置：module_name/version/architecture/maintainer/description（声明态） | 模板 POST 给版本服务 |
 | `DEBIAN/control`(模板) | 真实 control 由版本服务生成后写回；模板里是占位符 | — |
 | \`DEBIAN/preinst | postinst | prerm |
-| `Makefile.deb` | `dpkg-deb --root-owner-group -b /pipeline /tmp/tcmalloc.deb` | 模板 `.old_make_deb` |
+| `Makefile.deb` | 先调用全包校验，再 `dpkg-deb --root-owner-group -b /pipeline /tmp/tcmalloc.deb`；基于 Makefile 自身路径定位脚本和 `DEBIAN/` | 模板 `.old_make_deb` |
 | `register_package.py` | 注册正式包到生产/预发布接口，校验 HTTP + JSON + 记录 ID | release job `.add-dr-package` |
 | `package_download.py` | 按 control 拼 URL → stdout 日志 + `download-url.txt` + `package.env` | 两个 build job 追加步骤 |
-| `verify_qnx_package.py` | 全包校验器（见 4.4） | compile.bash 尾部 + verify job + 本地 |
+| `verify_qnx_package.py` | 双平台四库全包校验器（见 4.4） | compile.bash 尾部 + 制包前 + verify job + 本地 |
 | `apt_update.bash` | apt 索引同步抖动时的**有界重试**（≤4 次） | compile.bash 装工具链 |
-| `tests/test_release.py` | 发布脚本的单元测试（14 用例） | CI test job / 本地 |
-| `tests/test_package_artifacts.py` | 校验器对真实交叉产物的破坏性测试（8 用例） | CI build job / 本地 |
+| `tests/test_release.py` | 发布脚本的单元测试（15 用例） | CI test job / 本地 |
+| `tests/test_package_artifacts.py` | 校验器对真实交叉产物的破坏性测试（10 用例） | CI build job / 本地 |
 
 > 备注：`DEBIAN` 维护脚本为空壳，进一步佐证 deb 在 Linux 上是纯载体（真正被消费的是库文件）。
 
-### 4.2 `test_release.py`（14 用例，纯逻辑，不需要 QNX）
+### 4.2 `test_release.py`（15 用例，纯逻辑，不需要 QNX）
 
 保护点 = "能发版的工具自己别坏"：
 
@@ -284,29 +316,35 @@ FAILED / 空 body → 全拒绝。
 **而非 `./res`**（防污染 root 拥有的 /pipeline）。
 14. `test_launcher_manifest_compatibility_and_digest_forwarding` — `run_with_allocator.sh`：  
 `tcmalloc`/`tcmalloc-minimal` 均兼容、`jemalloc` 拒绝(exit 3)、SHA 不匹配 exit 1（假 preflight）。
+15. `test_launcher_uses_full_tcmalloc_digest` — 传入 `libtcmalloc.so.10` 时，launcher 必须
+把 manifest 的 `full_sha256` 而非 minimal 的 `sha256` 交给 ELF preflight。
 
-### 4.3 `test_package_artifacts.py`（8 用例，**需要真实 QNX ELF**）
+### 4.3 `test_package_artifacts.py`（10 用例，**需要真实 QNX ELF**）
 
 整组 `@skipUnless(QNX_TEST_PACKAGE_ROOT)`。compile.bash 在 `--platform all` 成功后显式  
 `QNX_TEST_PACKAGE_ROOT="$PACKAGE_ROOT" python3 -m unittest ...` 才会真正执行。  
 copy 真实构建树逐项搞破坏，验证 `verify_qnx_package.py` 抓得到：
 
-1. `test_real_dual_platform_package` — 完整包 → 通过。
-2. `test_tampered_library` — 库尾追加字节 → `SHA256 mismatch`。
-3. `test_mixed_build_batches` — manifest 的 `build_run_id` 改成别批 → `build_run_id`（防混批次）。
-4. `test_wrong_libcxx_abi` — 把 sdp7.1 库塞进 sdp8.0 路径 → `libc++ ABI`（防串平台）。
-5. `test_wrong_elf_architecture` — 用 `/bin/true` 顶替库 → `AArch64`。
-6. `test_mismatched_build_id` — 篡改 Build ID → `Build ID`。
-7. `test_dirty_release_rejected` — manifest 标 `source_dirty=true` + `--require-clean` → `Dirty source`。
-8. `test_unexpected_artifact` — 目录多塞文件 → `Unexpected`（文件清单严格等于预期）。
+1. `test_real_dual_platform_package` — 完整双平台四库包 → 通过。
+2. `test_tampered_library` — minimal 库尾追加字节 → `SHA256 mismatch`。
+3. `test_tampered_profile_library` — full 库尾追加字节 → `full_library SHA256 mismatch`。
+4. `test_mixed_build_batches` — manifest 的 `build_run_id` 改成别批 → `build_run_id`（防混批次）。
+5. `test_wrong_libcxx_abi` — 把 sdp7.1 minimal 库塞进 sdp8.0 路径 → `libc++ ABI`（防串平台）。
+6. `test_wrong_profile_libcxx_abi` — 把 sdp7.1 full 库塞进 sdp8.0 路径，即使同步伪造
+   `full_sha256`，仍因 `libc++ ABI` 被拒绝。
+7. `test_wrong_elf_architecture` — 用 `/bin/true` 顶替 minimal 库 → `AArch64`。
+8. `test_mismatched_build_id` — 篡改 minimal Build ID → `Build ID`。
+9. `test_dirty_release_rejected` — manifest 标 `source_dirty=true` + `--require-clean` → `Dirty source`。
+10. `test_unexpected_artifact` — 目录多塞文件 → `Unexpected`（文件清单严格等于预期）。
 
 ### 4.4 `verify_qnx_package.py` 校验维度（被上面两组测试共同保护）
 
 receipt 完整性（status=complete / platform=all / git_sha 40hex / build_run_id 存在）  
-→ 双平台(枚举 sdp7.1+sdp8.0)各自：库与 manifest 存在 → manifest 关键字段与期望一致  
-→ 库 SHA256 == manifest → readelf 交叉检查 Machine=AArch64 + Type=DYN + SONAME +  
-NEEDED libc++ 对应 + Build ID 一致 + 必需导出符号 ⊇ 白名单且与 manifest.exports 相等  
-→ 整棵树无 symlink、文件清单严格相等。
+→ 双平台(枚举 sdp7.1+sdp8.0)各自：minimal/full 两库与 manifest 都存在，且 manifest 关键字段
+与期望一致 → 每份库 SHA256 == 对应 manifest 字段 → readelf 交叉检查 Machine=AArch64 +
+Type=DYN + 各自 SONAME + NEEDED libc++ 对应 + Build ID 一致 + allocator 导出白名单；full
+还必须有 heap-profiler 导出且与 `full_profile_exports` 一致 → 整棵树无 symlink、文件清单
+严格等于 receipt、两个 manifest 和四份库。
 
 ---
 
@@ -315,7 +353,7 @@ NEEDED libc++ 对应 + Build ID 一致 + 必需导出符号 ⊇ 白名单且与 
 | 层级 | 环境 | 内容 |
 |-|-|-|
 | CI test job | `deeproute-drydocker-2004:2662911-rc1`（**Ubuntu 20.04 x86_64**），runner `mapping`；无 QNX 工具链 | pipeline 脚本单测 + Linux 原生 tcmalloc UT |
-| CI build job | 同一镜像 + 进程内 `apt_update.bash` 安装 relocatable QNX 工具链包（`deeproute-toolchains-qnx-sdp7-relocatlable-dev=7.1.3` / `...sdp8...=8.1.1`） | `qcc -Vgcc_ntoaarch64le` 交叉编译到 `/pipeline` + 内嵌 ELF 校验 + artifact 8 项 |
+| CI build job | 同一镜像 + 进程内 `apt_update.bash` 安装 relocatable QNX 工具链包（`deeproute-toolchains-qnx-sdp7-relocatlable-dev=7.1.3` / `...sdp8...=8.1.1`） | `qcc -Vgcc_ntoaarch64le` 交叉编译到 `/pipeline` + 双平台四库内嵌 ELF 校验 + artifact 10 项 |
 | CI verify job | 纯 host 工具链：curl / dpkg-deb / sha256sum / readelf / python3 | 下载真实 deb 复验 |
 | 台架（CI 外，人工） | 8650 = QNX 7.1；8797 = QNX 8.0 | `run_qnx_release_smoke.sh` 8/8 + sampler 11/11 |
 
@@ -333,26 +371,33 @@ NEEDED libc++ 对应 + Build ID 一致 + 必需导出符号 ⊇ 白名单且与 
 ## 6. 开发者发版 SOP
 
 ```
-1. 改代码，本地验证
+1. 从最新集成主线创建开发分支（默认 `codex/` 前缀），不直接在主线开发。
+2. 改代码，本地验证
    JOBS=8 bash compile.bash --platform all        # 双平台建档
    python3 pipeline/verify_qnx_package.py build/qnx-package
    JOBS=8 bash run_linux_unit_tests.bash
-2. git commit（manifest 绑定 git_sha；脏源码会被 --require-clean 拒绝 → 先提交再构建）
-3. git push <remote> HEAD                           → 自动触发 snapshot
-4. 等待 snapshot 通过：verify-qnx-download-url 绿；
-   可选：下载包传台架跑 run_qnx_release_smoke.sh 验收
-5. 确认发正式版：
+3. 只暂存本次文件并提交开发分支，推送集成远程（操作前用 `git remote -v` 核对实际映射，
+   不按 remote 名称推断目标）→ 自动触发 snapshot。
+4. 创建 MR，至少一名非作者评审；required CI 必须对应最新 source SHA 且成功。snapshot
+   通过、下载复验绿灯只是可合入证据，不是正式发布批准。
+5. 获得合并授权后合入主线，记录最终提交 `C`；merge/squash/rebase 可能改变 SHA，必须从
+   干净源码和锁定构建输入重新验证 `C`，保存制品、payload SHA256、工具链/flags、适用平台
+   结果与回滚资产。
+6. 确认发正式版：
    a. 改 pipeline/config.xml 的 <version>（递增，三段数字）
-   b. git add + commit（本轮代码改动 + 版本号同一提交）
-   c. git push 再次触发 snapshot，确认新版本包 OK
-   d. 确认该 tag 不存在后打 tag：
+   b. 将版本改动经开发分支和 MR 合入；验证最终提交 `C` 的新版本 snapshot 包
+   c. 获得绑定 `C` 与制品摘要的发布批准，确认 tag 不存在后打 tag：
         git tag -a v2.17.2-qnx.N -m 'QNX package build revision N'
         git push <remote> v2.17.2-qnx.N            → 自动触发 release
-6. 等 release 完成，核对：
+7. 等 release 完成，核对：
    - register_package → SUCCESS + 记录 ID（生产 + 预发布）
    - apt.deeproute.cn/deeproute-release-2004 出现该版本，SHA 一致
    - 下载 deb 跑台架冒烟（人工发版验收）
 ```
+
+构建后还应针对四份库分别检查 `readelf -h -d -n`。如果发版目的包含 profile，台架验收
+必须选择同平台的 `libtcmalloc.so.10`，设置 `HEAPPROFILE` 后确认实际生成 profile；仅验证
+minimal 的 `LD_PRELOAD` 不足以证明完整库可用。
 
 **约束红线**
 
@@ -362,8 +407,9 @@ NEEDED libc++ 对应 + Build ID 一致 + 必需导出符号 ⊇ 白名单且与 
 - tag 命名 `v2.17.2-qnx.N`：`2.17.2` = upstream 源码版本，`N` = 包构建修订；  
 config.xml 的 `2.17.3` = 下游包版本。三者独立，真实源码版本由 manifest `source_version` 记录。
 
-**易踩的坑**：必须先"版本号提升 + 代码改动"一起提交，**再给该提交打 tag**；否则  
-release 会因 `--expected-sha` / `--require-clean` 校验失败，或产出旧代码新版本号。
+**易踩的坑**：必须先让"版本号提升 + 代码改动"经 MR 合入，并在最终主线提交 `C` 上重新
+验收，**再给 `C` 打 tag**；否则 release 可能因 `--expected-sha` / `--require-clean` 校验失败，
+或产出旧代码新版本号。不得移动旧 tag、复用已发布版本或为获得绿灯而绕过门禁。
 
 ### 什么时候要改 `pipeline/config.xml`
 
@@ -394,13 +440,17 @@ release 会因 `--expected-sha` / `--require-clean` 校验失败，或产出旧�
 
 ---
 
-## 8. 附录：v2.17.2-qnx.2 正式验收数据
+## 8. 附录：v2.17.2-qnx.2 正式验收数据（历史 minimal-only 制品）
+
+本节保留的是 2026-09 历史正式包的证据。当时 deb 每平台只有
+`libtcmalloc_minimal.so.10`；因此下列 Build ID、库 SHA256 和 deb SHA256 **不能**作为当前
+dual-library 包的验收依据，也不包含 full 库的指纹。当前代码的包校验器会拒绝该旧布局。
 
 - 正式包：`deeproute-tcmalloc-qnx-dev_2.17.3_amd64.deb`  
 链接：`https://apt.deeproute.cn/deeproute-release-2004/pool/d/deeproute-tcmalloc-qnx-dev/deeproute-tcmalloc-qnx-dev_2.17.3_amd64.deb`
 - 
 
-| 平台 | Build ID | 库 SHA256 |
+| 平台 | minimal Build ID | minimal 库 SHA256 |
 |-|-|-|
 | 8650/SDP7.1 | `499b847800389681a534ea4901ac7d89` | `0995fb6326a26a2cc5fa0dc3a95875b5394fe49fcb8f0e37530dc97bc831872c` |
 | 8797/SDP8.0 | `d3d4a771e71e0ef6f693a6746b3bba83` | `4eb99f26d9e48ff6b9a1a8a8d35368a3698cc2e79d0b761317a2e74d61aeb8fc` |
@@ -410,11 +460,15 @@ release 会因 `--expected-sha` / `--require-clean` 校验失败，或产出旧�
 - 注册记录 ID：生产 `5062648`、预发布 `11103239`
 - snapshot pipeline `49958009`（QNX job `272036689`）；release pipeline `49958649`（QNX job `272039280`）
 - 验收按"snapshot / 正式 release 均下载真实包、双台架 8/8"通过；  
-DEBIAN `Architecture: amd64` = 宿主架构（交叉编译产物），包内两库为 QNX AArch64。
+DEBIAN `Architecture: amd64` = 宿主架构（交叉编译产物），旧包内两份库为 QNX AArch64
+minimal 库。full 库必须由包含本次改动的新提交重新构建、下载、解包和验收。
 
 ---
 
 ## 9. 待办 / 验收边界（未闭环项）
+
+本节是历史风险和待办记录，未随双库构建改动重新审计；不能替代本次提交的 CI、制品或
+QNX 实机验收结论。
 
 - QNX8 `thread_dealloc_unittest`：thread cache 数量 1→3 待查；
 - QNX7 debug `ManyThreads` SIGSEGV、debug 回溯符号化不足待查；
