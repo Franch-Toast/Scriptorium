@@ -185,7 +185,7 @@ std::terminate();
 
 代码位置：
 
-[`deep_os_tool_cpp/main.cc`](/sandbox/onboard_application/perf_collector/deep_os_tool_cpp/main.cc:269)
+``deep_os_tool_cpp/main.cc``
 
 ```cpp
 std::shared_ptr<ReporterManager> reporter_manager =
@@ -203,7 +203,7 @@ if (!reporter_manager->initialize()) {
 
 代码位置：
 
-[`reporter_manager.cc:48-101`](/sandbox/onboard_application/perf_collector/deep_os_tool_cpp/common/reporter/reporter_manager.cc:48)
+``reporter_manager.cc:48-101``
 
 ```cpp
 church_node_ = std::make_shared<churchNode>("perf_collector_cpp");
@@ -215,7 +215,7 @@ church_node_ = std::make_shared<churchNode>("perf_collector_cpp");
 
 代码位置：
 
-[`reporter.h`](/sandbox/onboard_application/perf_collector/deep_os_tool_cpp/common/reporter/reporter.h:29)
+``reporter.h``
 
 ```cpp
 topic_name_ = config_->getTopic();
@@ -231,7 +231,7 @@ church_node_->AddPublisher(topic_name_, queue_size_, channel_type_);
 
 代码位置：
 
-[`churchNode.cc:8-16`](/sandbox/onboard_application/perf_collector/deep_os_tool_cpp/common/reporter/churchNode.cc:8)
+``churchNode.cc:8-16``
 
 ```cpp
 churchNode::churchNode(const std::string& name)
@@ -282,7 +282,7 @@ perf_collector_cpp
 
 代码中 `trans_channel` 的默认值也是 4：
 
-[`reporter_config.h:31-33`](/sandbox/onboard_application/perf_collector/deep_os_tool_cpp/common/reporter/reporter_config.h:31)
+``reporter_config.h:31-33``
 
 ```cpp
 return getValue<int>("trans_channel").value_or(4);

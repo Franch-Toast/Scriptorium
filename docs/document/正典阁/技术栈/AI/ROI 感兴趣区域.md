@@ -15,6 +15,6 @@ tags:
 
 **生活类比**：读书找重点——500 页的书不逐字读，先按目录（先验）翻到相关章节（ROI）精读；通读全书（全图处理）费时费力，重点还未必更清楚。
 
-**在 C01 项目中的体现**：traffic_2_crop 是从 traffic_2 主视场裁出的「虚拟相机」（T2C_CAMERA_NAME 常量定义），专门参与 mono3d 推理补足交通灯等小目标细节；两路检测结果用软化 IoU 去重后合并进 detection3d_objects（见 [camera 子模块 1](../../../撰修司/E2E架构拆解/Perception/02_核心子模块拆解/子模块1：camera%20相机感知子模块.md)）。
+**在 C01 项目中的体现**：traffic_2_crop 是从 traffic_2 主视场裁出的「虚拟相机」（T2C_CAMERA_NAME 常量定义），专门参与 mono3d 推理补足交通灯等小目标细节；两路检测结果用软化 IoU 去重后合并进 detection3d_objects（见 camera 子模块 1（E2E 主干 05《感知大模型》））。
 
 **延伸**：[IoU 交并比](IoU%20交并比.md)、[检测框 bbox](检测框%20bbox.md)、[CUDA 与 GPU 预处理](CUDA%20与%20GPU%20预处理.md)

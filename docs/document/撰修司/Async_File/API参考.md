@@ -21,7 +21,7 @@ tags: [AsyncFile, API, C++]
 | 二进制数据 | 使用带长度的 `std::string` / `string_view`；`const char*` 按零结尾字符串处理 |
 | 路径 | 非空、不含内嵌 NUL；路径有效性和 IO 错误通常在后台报告，不能由接收结果判断 |
 | 对象使用 | 不可复制；文件对象单次打开、关闭后不可重开 |
-| 创建对象 | `MakeFile/MakeOutput` 不做 IO；service 已开始关闭时返回 `nullptr` |
+| 创建对象 | `MakeFile/MakeOutput` 不做 IO；service 已开始关闭或注册资源满额时返回 `nullptr` |
 | 配置错误 | 非法服务/输出配置在构造时抛 `std::invalid_argument` |
 
 回调中收到的 `const FileResult&` 只在回调调用期间有效；异步转交结果时应复制。回调异常会被捕获并记录为 `kCallback`，worker 继续执行。
@@ -70,6 +70,7 @@ ServiceStats GetStats() const;
 | --- | --- | --- | --- |
 | `max_pending_tasks` | `size_t` | 1000 | 普通任务及尾批记录总额度，必须大于 0 |
 | `max_pending_bytes` | `size_t` | 10 MiB | 未完成输入负载额度，必须大于 0 |
+| `max_registered_resources` | `size_t` | 128 | 必须大于 0；普通文件与连续输出共享，直到关闭回调返回才释放 |
 | `destructor_timeout` | `milliseconds` | 200 ms | 析构请求 Fast 后的等待预算，不可为负；0 表示不等待 |
 
 ### WriteOptions
@@ -142,7 +143,7 @@ FileStats GetStats() const;
 | `batch_mode` | `BatchMode::kAuto` | `kNone` 逐条；`kAuto` 数量/时间触发；`kManual` 显式刷新 |
 | `batch_records` | 100 | Auto 批量记录阈值，必须大于 0 |
 | `flush_interval` | 200 ms | Auto 首条尾批开始计时，必须大于 0 |
-| `delimiter` | `"\n"` | 同批记录之间补分隔符，末记录不补 |
+| `delimiter` | `"\n"` | Auto/Manual 在同文件相邻记录间补充，跨批有效；已有后缀不重复补，文件末记录不补；None 原样输出 |
 | `file_header` | 空字符串 | 非空时每个新文件写入，缺少末尾换行时补 `\n` |
 | `max_file_bytes` | 50 MiB | 编码后文件轮转阈值，0 关闭；批次不拆，允许超限 |
 | `sync_interval_bytes` | 2 MiB | 累计实际写入字节触发 fsync，0 关闭周期 fsync |
@@ -220,11 +221,15 @@ using Completion = std::function<void(const FileResult&)>;
 | `buffered_records` / `buffered_bytes` | 连续输出尾批的记录数与原始输入字节 |
 | `compression_ratio` | 最近一个非空编码块的输入字节 / 编码字节，包含文件头块，不是累计平均压缩率 |
 
+注册额度包含未打开、失败及关闭中的资源；工厂拒绝不执行回调。满额为 `kAdmission/EAGAIN`，
+停机为 `kAdmission/ESHUTDOWN`，通过 service 的 `last_error` 观察。单次路径操作不占资源额度。
+
 ### ServiceStats
 
 | 字段 | 含义 |
 | --- | --- |
 | `accepted` / `rejected` | 队列接收/拒绝请求计数；Flush/Sync 计入，Close 使用单独通路不计入 |
+| `registered_resources` / `rejected_resources` | 当前注册资源数 / 累计注册拒绝次数；工厂拒绝不计入任务 rejected |
 | `executed` | 已处理的队列任务，含 Close；不能假设与 accepted 相等 |
 | `failed` / `cancelled` | 错误观察次数及其中取消观察次数，不能当作唯一失败 syscall 数 |
 | `pending_tasks` / `pending_bytes` | 未完成普通输入的额度，含在途、回调执行期及尾批，不含保留控制任务 |

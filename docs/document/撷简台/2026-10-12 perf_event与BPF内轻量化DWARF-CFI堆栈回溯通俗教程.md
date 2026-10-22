@@ -144,7 +144,7 @@ LR 会被一层层调用覆盖：`foo` 调用 `work` 后，`x30` 里已经是「
 | FP（x29） | 帧指针 | FP 链回溯的锚点；也是 CFI 规则的一种参考寄存器 |
 | LR（x30） | 链接寄存器 | 非叶子函数须先保存到栈，回溯时据此恢复上一帧 |
 
-当前 `perf_ebpf` 的 BPF 状态同时保留 `pc / sp / fp / lr / cfa` 五个字段，以覆盖不同架构与不同函数形态；字段定义在 [`unwinder_common.h`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:31)。
+当前 `perf_ebpf` 的 BPF 状态同时保留 `pc / sp / fp / lr / cfa` 五个字段，以覆盖不同架构与不同函数形态；字段定义在 ``unwinder_common.h``。
 
 > 寄存器合同与逐个拆解见 [函数调用与返回：AArch64栈帧与寄存器的逐步变化](../正典阁/技术栈/操作系统/函数调用与返回：AArch64栈帧与寄存器的逐步变化.md) 第 2 节；三种坐标与 CFI 规则如何结合见 [DWARF-CFI回溯](../正典阁/技术栈/操作系统/栈回溯方法/DWARF-CFI回溯.md)。
 
@@ -201,7 +201,7 @@ eBPF 栈采样：    bpf_get_stackid() 请内核帮忙抓栈，返回 stack ID�
 
 特别注意：当前代码将 `bpf_get_stackid()` 得到的用户栈 fallback 输出标记为 `[u/fp]`，这只是项目输出标签。它不等于项目在用户态手写了 FP `while` 循环。
 
-> 三种方法的全景对比、选型建议与「同一现场三种方法各自看到什么」，见 [三种栈回溯方法总览](../正典阁/技术栈/操作系统/栈回溯方法/三种栈回溯方法总览.md)；方法细节分别见 [FP帧指针链回溯](../正典阁/技术栈/操作系统/栈回溯方法/FP帧指针链回溯.md)、[DWARF-CFI回溯](../正典阁/技术栈/操作系统/栈回溯方法/DWARF-CFI回溯.md)、[eBPF栈采样](../正典阁/技术栈/操作系统/栈回溯方法/eBPF栈采样.md)。
+> 三种方法的全景对比、选型建议与「同一现场三种方法各自看到什么」，见 [三种栈回溯方法总览](../正典阁/技术栈/操作系统/栈回溯方法/index.md)；方法细节分别见 [FP帧指针链回溯](../正典阁/技术栈/操作系统/栈回溯方法/FP帧指针链回溯.md)、[DWARF-CFI回溯](../正典阁/技术栈/操作系统/栈回溯方法/DWARF-CFI回溯.md)、[eBPF栈采样](../正典阁/技术栈/操作系统/栈回溯方法/eBPF栈采样.md)。
 
 ---
 
@@ -305,9 +305,9 @@ flowchart TB
 
 ### 6.3 当前 CPUTracker 的启动证据
 
-当前 CPUTracker 初始化时创建 `EnhancedUnwinder`，见 [`cputracker.cc:81`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:81)。启动时调用 `attach()`，见 [`cputracker.cc:127`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:127)。
+当前 CPUTracker 初始化时创建 `EnhancedUnwinder`，见 ``cputracker.cc:81``。启动时调用 `attach()`，见 ``cputracker.cc:127``。
 
-`EnhancedUnwinder::attach()` 为每个 CPU 创建 `PERF_COUNT_SW_CPU_CLOCK`，并把 `nu_tracer_entry` 附加到 perf event，见 [`enhanced_unwinder.cc:121`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:121)。
+`EnhancedUnwinder::attach()` 为每个 CPU 创建 `PERF_COUNT_SW_CPU_CLOCK`，并把 `nu_tracer_entry` 附加到 perf event，见 ``enhanced_unwinder.cc:121``。
 
 因此，当前 CPUTracker 的主路径是：
 
@@ -356,11 +356,11 @@ nu_tracer_entry -> nu_unwind_native -> nu_unwind_stop
 - `file_id`；
 - 装载 bias。
 
-代码见 [`enhanced_unwinder.cc:321`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:321)。
+代码见 ``enhanced_unwinder.cc:321``。
 
 ### 7.2 计算 file_id
 
-项目不是在每个 BPF 帧中携带完整路径，而是给 ELF 一个稳定的 `file_id`。当前实现会读取文件头部、尾部和文件大小，使用 FNV-1a 组合计算 ID，见 [`enhanced_unwinder.cc:294`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:294)。
+项目不是在每个 BPF 帧中携带完整路径，而是给 ELF 一个稳定的 `file_id`。当前实现会读取文件头部、尾部和文件大小，使用 FNV-1a 组合计算 ID，见 ``enhanced_unwinder.cc:294``。
 
 这样做的直觉是：
 
@@ -413,14 +413,14 @@ FDE 指定函数地址范围和规则变化
 按 address 排序
 ```
 
-CIE/FDE 的实际处理见 [`eh_frame_parser.cc:629`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:629) 到 [`eh_frame_parser.cc:699`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:699)。
+CIE/FDE 的实际处理见 ``eh_frame_parser.cc:629`` 到 ``eh_frame_parser.cc:699``。
 
 ### 7.4 一个规则如何被压缩
 
 假设解析器从某个 FDE 得到：
 
 ```text
-地址范围 [0x1200, 0x1250)：
+地址范围 `0x1200, 0x1250)：
     CFA = SP + 32
     返回地址 = CFA - 8
     FP 保存于 CFA - 16
@@ -438,7 +438,7 @@ StackDeltaEntry:
     flags         = FRAME
 ```
 
-用户态 `getOrCreateUnwindInfo()` 将规则写入 `nu_unwind_info_array`，见 [`enhanced_unwinder.cc:363`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:363)。
+用户态 `getOrCreateUnwindInfo()` 将规则写入 `nu_unwind_info_array`，见 [`enhanced_unwinder.cc:363``。
 
 注意：这不是把完整 DWARF opcode 原样搬进 BPF，而是把高频回溯阶段需要的结果压成固定字段。
 
@@ -569,7 +569,7 @@ FP = regs->regs[29]   // x29
 LR = regs->regs[30]   // x30
 ```
 
-对应实现见 [`native_unwinder.bpf.c:375`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.bpf.c:375)。
+对应实现见 ``native_unwinder.bpf.c:375``。
 
 可以画成：
 
@@ -627,7 +627,7 @@ nu_unwind_native
     再展开最多 5 帧
 ```
 
-定义见 [`native_unwinder.h:9`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.h:9)：
+定义见 ``native_unwinder.h:9``：
 
 ```text
 最大深度       = 128 帧
@@ -665,7 +665,7 @@ text_section_offset = 0x345678
 找到最后一个 address <= 当前页内偏移的 delta
 ```
 
-代码见 [`unwinder_common.h:150`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:150)。
+代码见 ``unwinder_common.h:150``。
 
 图示：
 
@@ -709,7 +709,7 @@ SP = 0x7fe0
 CFA = 0x7fe0 + 32 = 0x8000
 ```
 
-对应 BPF 实现见 [`unwinder_common.h:282`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:282)。
+对应 BPF 实现见 ``unwinder_common.h:282``。
 
 ### 9.3 动作三：计算返回地址位置
 
@@ -738,7 +738,7 @@ aux_base_reg = LR
 返回地址 = 当前 state.lr
 ```
 
-当前 BPF 会分别处理这两种情况，见 [`unwinder_common.h:301`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:301)。
+当前 BPF 会分别处理这两种情况，见 ``unwinder_common.h:301``。
 
 ### 9.4 动作四：从用户栈读取保存内容
 
@@ -755,7 +755,7 @@ saved_fp = user_memory[ra - 8]
 saved_ra = user_memory[ra]
 ```
 
-这样可以同时恢复 FP 和返回地址，见 [`unwinder_common.h:315`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:315)。
+这样可以同时恢复 FP 和返回地址，见 ``unwinder_common.h:315``。
 
 ### 9.5 动作五：更新下一帧状态
 
@@ -820,7 +820,7 @@ SP 没有向调用者方向变化
 达到 tail call 限制
 ```
 
-源码中的 `NU_CMD_STOP`、`NU_CMD_SIGNAL`、`NU_CMD_FRAME_POINTER` 命令处理见 [`unwinder_common.h:220`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:220)。
+源码中的 `NU_CMD_STOP`、`NU_CMD_SIGNAL`、`NU_CMD_FRAME_POINTER` 命令处理见 ``unwinder_common.h:220``。
 
 这里的 `NU_CMD_FRAME_POINTER` 是 CFI 规则在特殊情况下要求采用 FP 读取的命令，不代表整个主算法退化成“永远使用 FP 链”。主算法仍然是由当前 PC 选择规则，再执行规则。
 
@@ -1048,7 +1048,7 @@ BPF 不直接写普通文件，而是调用：
 bpf_perf_event_output(..., &nu_trace_events, ...)
 ```
 
-将一条 trace 放入 `nu_trace_events` 对应的 perf buffer。实现见 [`unwinder_common.h:339`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:339)。
+将一条 trace 放入 `nu_trace_events` 对应的 perf buffer。实现见 ``unwinder_common.h:339``。
 
 数据流：
 
@@ -1068,7 +1068,7 @@ EnhancedUnwinder::handlePerfEvent()
 CPUTracker::processEnhancedTrace()
 ```
 
-CPUTracker 工作线程中的 `pollTraces()` 会轮询 perf buffer，见 [`cputracker.cc:792`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:792)。
+CPUTracker 工作线程中的 `pollTraces()` 会轮询 perf buffer，见 ``cputracker.cc:792``。
 
 ### 11.3 当前用户态如何生成文本
 
@@ -1084,7 +1084,7 @@ basename + 0xoffset [u]
 libfoo.so+0x1234 [u]
 ```
 
-对应处理见 [`cputracker.cc:508`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:508)。
+对应处理见 ``cputracker.cc:508``。
 
 如果 `enable_deferred_symbolization` 开启，则可以暂存：
 
@@ -1118,7 +1118,7 @@ blazesym
 函数名 / 模块 / 行号
 ```
 
-`Symbolizer::symbolizeStack()` 见 [`symbolizer.cc:202`](/sandbox/platform/perf_ebpf/src/framework/symbolizer.cc:202)，它读取地址数组后调用 blazesym。
+`Symbolizer::symbolizeStack()` 见 ``symbolizer.cc:202``，它读取地址数组后调用 blazesym。
 
 ---
 
@@ -1156,7 +1156,7 @@ BPF 会尝试：
 bpf_get_stackid(ctx, &nu_user_stackmap, BPF_F_USER_STACK | ...)
 ```
 
-用户态在 DWARF 帧为空或帧数很少时，会比较 fallback 地址栈的深度，必要时使用 fallback 结果，见 [`cputracker.cc:592`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:592)。
+用户态在 DWARF 帧为空或帧数很少时，会比较 fallback 地址栈的深度，必要时使用 fallback 结果，见 ``cputracker.cc:592``。
 
 ### 12.3 当前主路径不是 `profile.bpf.c`
 
@@ -1212,7 +1212,7 @@ sched_switch
 用栈哈希和睡眠时间关联
 ```
 
-对应入口见 [`sched_tracker.bpf.c:1585`](/sandbox/platform/perf_ebpf/bpf_common/sched_tracker.bpf.c:1585)。如果 DWARF 路径不能使用，off-CPU 代码同样保留 `bpf_get_stackid()` fallback，见 [`sched_tracker.bpf.c:1644`](/sandbox/platform/perf_ebpf/bpf_common/sched_tracker.bpf.c:1644)。
+对应入口见 ``sched_tracker.bpf.c:1585``。如果 DWARF 路径不能使用，off-CPU 代码同样保留 `bpf_get_stackid()` fallback，见 ``sched_tracker.bpf.c:1644``。
 
 ---
 
@@ -1376,7 +1376,7 @@ SP/CFA 算错
     -> 符号化材料不足或尚未执行符号化
 ```
 
-当前 CPUTracker 默认配置中的 `enable_symbolization` 是 `false`，见 [`perf_ebpf.json:98`](/sandbox/platform/perf_ebpf/config/default/perf_ebpf.json:98)。但 native DWARF 路径仍可以输出 `basename + offset`，这属于地址归属信息，不等于函数名解析。
+当前 CPUTracker 默认配置中的 `enable_symbolization` 是 `false`，见 ``perf_ebpf.json:98``。但 native DWARF 路径仍可以输出 `basename + offset`，这属于地址归属信息，不等于函数名解析。
 
 ### 14.8 一张排查决策图
 
@@ -1464,30 +1464,30 @@ sequenceDiagram
 
 | 学习问题 | 源码位置 | 作用 |
 | --- | --- | --- |
-| CPUTracker 是否使用 EnhancedUnwinder | [`cputracker.cc:81`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:81) | 创建增强展开器 |
-| 什么时候 attach perf event | [`cputracker.cc:127`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:127) | 启动采样 |
-| perf event 如何附加 BPF | [`enhanced_unwinder.cc:121`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:121) | 每 CPU 打开 CPU clock event |
-| 如何轮询回溯结果 | [`cputracker.cc:792`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:792) | 用户态轮询 perf buffer |
-| BPF 采样入口 | [`native_unwinder.bpf.c:327`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.bpf.c:327) | 读取当前任务和寄存器 |
-| 如何获取 AArch64 PC/SP/FP/LR | [`native_unwinder.bpf.c:375`](/sandbox/platform/perf_ebpf/bpf_common/native_unwinder.bpf.c:375) | 初始化回溯状态 |
-| 如何查进程映射 | [`unwinder_common.h:114`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:114) | PID + PC 到 file_id/bias |
-| 如何查 CFI delta | [`unwinder_common.h:150`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:150) | 页内二分查找 |
-| 如何展开一帧 | [`unwinder_common.h:202`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:202) | 执行规则、恢复 PC/SP/FP |
-| 如何发送 trace | [`unwinder_common.h:339`](/sandbox/platform/perf_ebpf/bpf_common/unwinder_common.h:339) | 写入 perf event array |
-| ELF 是否读取 `.eh_frame` | [`eh_frame_parser.cc:143`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:143) | 读取 CFI section |
-| 是否 fallback 到 `.debug_frame` | [`eh_frame_parser.cc:156`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:156) | 无 `.eh_frame` 时尝试 |
-| CIE/FDE 如何转换成 delta | [`eh_frame_parser.cc:245`](/sandbox/platform/perf_ebpf/src/framework/eh_frame_parser.cc:245) | 生成固定规则 |
-| 规则如何写入 BPF map | [`enhanced_unwinder.cc:397`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:397) | 加载 delta 和 page 索引 |
-| 进程映射如何同步 | [`enhanced_unwinder.cc:567`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/enhanced_unwinder.cc:567) | 解析 ELF 并更新 map |
-| native frame 如何输出 | [`cputracker.cc:508`](/sandbox/platform/perf_ebpf/src/plugins/cputracker/cputracker.cc:508) | `file + offset` 文本 |
-| stack ID 如何转地址和符号 | [`symbolizer.cc:202`](/sandbox/platform/perf_ebpf/src/framework/symbolizer.cc:202) | 读取 stack map 并调用符号器 |
-| Off-CPU 是否复用 DWARF | [`sched_tracker.bpf.c:1585`](/sandbox/platform/perf_ebpf/bpf_common/sched_tracker.bpf.c:1585) | sched_switch 中展开 |
+| CPUTracker 是否使用 EnhancedUnwinder | ``cputracker.cc:81`` | 创建增强展开器 |
+| 什么时候 attach perf event | ``cputracker.cc:127`` | 启动采样 |
+| perf event 如何附加 BPF | ``enhanced_unwinder.cc:121`` | 每 CPU 打开 CPU clock event |
+| 如何轮询回溯结果 | ``cputracker.cc:792`` | 用户态轮询 perf buffer |
+| BPF 采样入口 | ``native_unwinder.bpf.c:327`` | 读取当前任务和寄存器 |
+| 如何获取 AArch64 PC/SP/FP/LR | ``native_unwinder.bpf.c:375`` | 初始化回溯状态 |
+| 如何查进程映射 | ``unwinder_common.h:114`` | PID + PC 到 file_id/bias |
+| 如何查 CFI delta | ``unwinder_common.h:150`` | 页内二分查找 |
+| 如何展开一帧 | ``unwinder_common.h:202`` | 执行规则、恢复 PC/SP/FP |
+| 如何发送 trace | ``unwinder_common.h:339`` | 写入 perf event array |
+| ELF 是否读取 `.eh_frame` | ``eh_frame_parser.cc:143`` | 读取 CFI section |
+| 是否 fallback 到 `.debug_frame` | ``eh_frame_parser.cc:156`` | 无 `.eh_frame` 时尝试 |
+| CIE/FDE 如何转换成 delta | ``eh_frame_parser.cc:245`` | 生成固定规则 |
+| 规则如何写入 BPF map | ``enhanced_unwinder.cc:397`` | 加载 delta 和 page 索引 |
+| 进程映射如何同步 | ``enhanced_unwinder.cc:567`` | 解析 ELF 并更新 map |
+| native frame 如何输出 | ``cputracker.cc:508`` | `file + offset` 文本 |
+| stack ID 如何转地址和符号 | ``symbolizer.cc:202`` | 读取 stack map 并调用符号器 |
+| Off-CPU 是否复用 DWARF | ``sched_tracker.bpf.c:1585`` | sched_switch 中展开 |
 
 ## 与其他文档的关系
 
 - [从堆栈回溯到火焰图：perf_ebpf 与 FlameCraft 教学](./2026-10-09%20从堆栈回溯到火焰图：perf_ebpf%20与%20FlameCraft%20教学.md)：全链路概览，继续讲 FlameCraft 如何解析和构建火焰图。
 - [函数调用与返回：AArch64栈帧与寄存器的逐步变化](../正典阁/技术栈/操作系统/函数调用与返回：AArch64栈帧与寄存器的逐步变化.md)：本文第 1–3 节的展开版——调用与返回每一步的寄存器与内存变化（AArch64 主线，附 x86-64 对照）。
-- [三种栈回溯方法总览](../正典阁/技术栈/操作系统/栈回溯方法/三种栈回溯方法总览.md)：本文第 5 节的展开版——方法对比、选型与学习导航；方法细节分别见 [FP帧指针链回溯](../正典阁/技术栈/操作系统/栈回溯方法/FP帧指针链回溯.md)、[DWARF-CFI回溯](../正典阁/技术栈/操作系统/栈回溯方法/DWARF-CFI回溯.md)、[eBPF栈采样](../正典阁/技术栈/操作系统/栈回溯方法/eBPF栈采样.md)。
+- [三种栈回溯方法总览](../正典阁/技术栈/操作系统/栈回溯方法/index.md)：本文第 5 节的展开版——方法对比、选型与学习导航；方法细节分别见 [FP帧指针链回溯](../正典阁/技术栈/操作系统/栈回溯方法/FP帧指针链回溯.md)、[DWARF-CFI回溯](../正典阁/技术栈/操作系统/栈回溯方法/DWARF-CFI回溯.md)、[eBPF栈采样](../正典阁/技术栈/操作系统/栈回溯方法/eBPF栈采样.md)。
 - [ELF 与符号化：从文件结构到运行时地址装载](../正典阁/技术栈/操作系统/ELF与符号化：从文件结构到运行时地址装载.md)：重点解释 ELF、装载 bias、符号表、DWARF 行号和地址符号化。
 
 ---

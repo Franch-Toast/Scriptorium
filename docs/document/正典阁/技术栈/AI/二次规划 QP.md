@@ -16,6 +16,6 @@ tags:
 
 **生活类比**：在规定跑道内（约束）铺一条最平顺的过山车轨道（代价）。「平顺」被精确量化为轨道弯曲程度的平方和，QP 求解器就是那位给出「唯一最顺轨道」的总工程师——只要跑道规则是线性的，答案存在且唯一。
 
-**在 C01 项目中的体现**：EmPlanner 的精优化用 QP：路径侧 QpSplinePathOptimizer 把 DP 折线拟合成样条（QP_path），速度侧 QpSpeedOptimizer 用 OptimalStSolver 在 ST 图约束内把 DP 粗解磨平。QP 与 DP 是接力关系：初值来自 DP；没有 DP 兜底的 QP 容易掉进局部最优，所以 QP_path 失败仅告警沿用 DP 结果而不触发 fallback（见 [Planning 子模块 1](../../../撰修司/E2E架构拆解/Planning/02_核心子模块拆解/子模块1：planner%20与%20tasks%20决策规划任务管线.md)）。
+**在 C01 项目中的体现**：EmPlanner 的精优化用 QP：路径侧 QpSplinePathOptimizer 把 DP 折线拟合成样条（QP_path），速度侧 QpSpeedOptimizer 用 OptimalStSolver 在 ST 图约束内把 DP 粗解磨平。QP 与 DP 是接力关系：初值来自 DP；没有 DP 兜底的 QP 容易掉进局部最优，所以 QP_path 失败仅告警沿用 DP 结果而不触发 fallback（见 Planning 子模块 1（E2E 主干 07《规划模型》））。
 
 **延伸**：[动态规划 DP](动态规划%20DP.md)、[iLQR 与 LQR](iLQR%20与%20LQR.md)、[样条与曲线拟合](样条与曲线拟合.md)、[期望最大化 EM](期望最大化%20EM.md)

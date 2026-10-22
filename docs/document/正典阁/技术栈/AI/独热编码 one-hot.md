@@ -15,6 +15,6 @@ tags:
 
 **生活类比**：酒店走廊的开关面板——每盏灯一个独立开关，任何时刻「只亮一盏」的状态就是一组 one-hot；把走廊、房间、卫生间的面板并排装（拼接），整面墙就表达了组合状态。
 
-**在 C01 项目中的体现**：perception_routing 的 e2e_action_one_hot 是 main / step_main / assistant / step_assistant 四组 one-hot 拼接的端到端动作编码，不常见动作映射到公共 bit（配置注释 L905-906，见 [perception_routing 子模块 7](../../../撰修司/E2E架构拆解/Perception/02_核心子模块拆解/子模块7：perception_routing%20子模块.md)）；uni_model 的 driving_style_id（INFER_IN:49）也是同类控制量输入。
+**在 C01 项目中的体现**：perception_routing 的 e2e_action_one_hot 是 main / step_main / assistant / step_assistant 四组 one-hot 拼接的端到端动作编码，不常见动作映射到公共 bit（配置注释 L905-906，见 perception_routing 子模块 7（E2E 主干 05《感知大模型》））；uni_model 的 driving_style_id 一类控制量输入也属于同类（具体槽位随版本变化，以 cfg 为准）。
 
 **延伸**：[张量 Tensor](张量%20Tensor.md)、[神经网络与推理引擎](神经网络与推理引擎.md)
