@@ -1,7 +1,7 @@
 ---
 title: "05 感知大模型：一次 BEV 推理看懂世界"
 date: 2026-10-21
-description: "感知大模型在做什么：为什么要把 11 路相机和点云统一到 BEV 鸟瞰视角，22 路输入如何一次前向推理出检测、占用、路面结构、交通灯等多任务结果。"
+description: "感知大模型在做什么：为什么要把 11 路相机和点云统一到 BEV 鸟瞰视角，17 路输入如何一次前向推理出检测、占用、路面结构、交通灯等多任务结果。"
 categories:
   - 撰修司
 tags:
@@ -13,8 +13,8 @@ tags:
 ---
 
 > **这一篇讲什么**：整条链路里最「黑盒」的一段——感知大模型。它到底吃什么、算出什么、为什么非要 BEV 视角、为什么是「一次推理出多个结果」。
-> **读完你能回答**：什么是 BEV？为什么不用相机原图直接检测？backbone/neck/head 是什么？22 路输入怎么用？一个模型怎么同时干好几件事？
-> **前置知识**：读完第 04 篇（前处理如何准备 22 路输入）。不需要神经网络基础，本篇会把所有术语拆成白话。
+> **读完你能回答**：什么是 BEV？为什么不用相机原图直接检测？backbone/neck/head 是什么？17 路输入怎么用？一个模型怎么同时干好几件事？
+> **前置知识**：读完第 04 篇（前处理如何准备 17 路输入）。不需要神经网络基础，本篇会把所有术语拆成白话。
 
 ## 1. 感知大模型的位置和职责
 
@@ -29,7 +29,7 @@ flowchart LR
     C --> D["/perception/objects<br/>交给规划"]
 ```
 
-前处理负责把数据整理成模型能吃的 22 路输入；大模型负责「看一眼，说出周围有什么」；后处理负责把这些原始说法整理成规划能用的障碍物清单。
+前处理负责把数据整理成模型能吃的 17 路输入；大模型负责「看一眼，说出周围有什么」；后处理负责把这些原始说法整理成规划能用的障碍物清单。
 
 **为什么这段叫「大模型」**：它的参数量、计算量在整条链路里最大，单帧推理就要占用 GPU 的主要算力。对比之下，规划和控制基本在 CPU 上跑，计算量小得多。
 
@@ -52,7 +52,7 @@ flowchart LR
 - 每个格子对应地面上一块固定的真实区域（比如 0.5 米 × 0.5 米）
 - 距离可以直接用格子数换算
 - 不管车怎么转，世界坐标系是稳定的
-- 所有传感器都能投影到同一张图上
+- 相机和激光雷达都能投影到同一张图上，直接叠加；毫米波雷达不参与 BEV，它的目标帧在模型之后才合并
 
 **生活类比**：看监控录像（透视）vs 看停车场的平面图（俯视）。找车位时你肯定看平面图，因为平面图上「我的车在哪、空位在哪、通道在哪」一目了然。
 
@@ -75,21 +75,25 @@ flowchart TB
     C3 --> F1
     F1 --> F2 --> B1
     L1["激光雷达点云<br/>本来就是三维的"] --> B1
-    R1["毫米波雷达 BEV 特征<br/>（第 04 篇已铺好）"] --> B1
     B1 --> H1["检测头：障碍物"]
     B1 --> H2["分割头：可行驶区域"]
     B1 --> H3["结构头：车道线/路面"]
+    subgraph S4["④ 模型之后才发生的事（第 06 篇）"]
+        M1["多模态合并<br/>激光 + 相机 + 雷达目标"]
+    end
+    H1 --> M1
+    R1["毫米波雷达目标帧<br/>不进模型"] --> M1
 ```
 
-*图 5-1 BEV 视角示意：把 11 路相机的透视画面、激光雷达的三维点、毫米波雷达的俯视特征，全部「摊平」到同一张以自车为中心的俯视地图上*
+*图 5-1 BEV 视角示意：把相机的透视画面和激光雷达的三维点「摊平」到同一张以自车为中心的俯视地图上；毫米波雷达不参与这张图，它在模型之后才合并进来*
 
-**读图提示**：中间那张 BEV 特征图是全篇的核心——它不是给人看的图片，而是一个数值网格（张量）。所有下游任务都在这个网格上做。
+**读图提示**：中间那张 BEV 特征图是全篇的核心——它不是给人看的图片，而是一个数值网格（张量）。所有下游任务都在这个网格上做。注意右下角那个「④」框：雷达目标走的是它，不是 BEV。
 
 ### 2.3 BEV 带来的三个好处
 
 | 好处 | 白话解释 |
 |-|-|
-| 多传感器可融合 | 相机、激光雷达、毫米波雷达的数据都能投影到同一张图，直接叠加 |
+| 多传感器可融合 | 相机、激光雷达的数据都能投影到同一张图，直接叠加（雷达目标则在模型之后合并） |
 | 距离直接可读 | 每格对应固定米数，检测框直接带真实尺寸和位置 |
 | 时序可对齐 | 车往前走 1 米，上一帧的 BEV 图平移 1 米就能和当前帧对上 |
 
@@ -111,7 +115,7 @@ flowchart TB
 
 ## 4. 一次推理到底发生了什么
 
-**一句话结论**：22 路输入进入同一个神经网络实例，执行一次前向计算，输出一大块原始张量，再由后续节点拆分给不同任务。
+**一句话结论**：17 路输入进入同一个神经网络实例，执行一次前向计算，输出一大块原始张量，再由后续节点拆分给不同任务。
 
 ### 4.1 入口：uni_model 节点
 
@@ -123,7 +127,7 @@ node {
   calculator: "NNInternalCalculator"
   input_stream: "INFER_IN:0:lidar_backbone_network_input"
   ...
-  input_stream: "INFER_IN:21:ddrouting_model_input"
+  input_stream: "INFER_IN:16:ddrouting_model_input"
   output_stream: "INFER_OUT:uni_model_output"
   input_side_packet: "CONFIG:0:uni_model_nn_param_path"
   output_side_packet: "NN_INSTANCE:nn_instance_uni_model"
@@ -133,7 +137,7 @@ node {
 逐行翻译：
 
 - `NNInternalCalculator`：Church 框架里「跑一次神经网络」的计算器，它不关心网络内容，只负责按配置加载模型、喂数据、取输出。
-- `INFER_IN:0~21`：22 个输入槽位，顺序固定，模型内部按编号取数据。
+- `INFER_IN:0~16`：17 个输入槽位，顺序固定，模型内部按编号取数据。（雷达不在这 17 路里）
 - `INFER_OUT:uni_model_output`：**所有任务的输出都在这一个 blob 里**，不是每个任务一个 topic。
 - `NN_INSTANCE`：模型实例。同一时刻一个实例只能跑一次推理，这是「一次推理」的字面含义。
 
@@ -144,8 +148,13 @@ node {
 配置里有大量 `back_edge: true`：
 
 ```text
-input_stream_info { tag_index: "INFER_IN:11"  back_edge: true }  # prev_bev_feats
-input_stream_info { tag_index: "INFER_IN:20"  back_edge: true }  # prev_fpn
+input_stream_info { tag_index: "INFER_IN:2"   back_edge: true }  # imgs（相机图）
+input_stream_info { tag_index: "INFER_IN:3"   back_edge: true }  # lidar2img
+input_stream_info { tag_index: "INFER_IN:4"   back_edge: true }  # delta_pose
+input_stream_info { tag_index: "INFER_IN:5"   back_edge: true }  # prev_pose_inv
+input_stream_info { tag_index: "INFER_IN:9"   back_edge: true }  # prev_bev_feats
+input_stream_info { tag_index: "INFER_IN:10"  back_edge: true }  # curr_frame_speed
+input_stream_info { tag_index: "INFER_IN:15"  back_edge: true }  # prev_fpn_feats
 ```
 
 **白话**：回边（back edge）就是「这条数据来自上一帧的自己」。它不是从上游节点流过来的，而是模型上一次推理的输出被缓存下来、这一帧再喂回去。
@@ -161,7 +170,7 @@ input_stream_info { tag_index: "INFER_IN:20"  back_edge: true }  # prev_fpn
 对小白来说只需记住三点：
 
 1. 推理是**同步阻塞**的：这一帧的推理不结束，下一帧进不来（配合第 04 篇的在飞帧上限 = 1）。
-2. 推理是**整批一次**的：22 路输入凑齐后一次性送进网络，不是一路一路喂。
+2. 推理是**整批一次**的：17 路输入凑齐后一次性送进网络，不是一路一路喂。
 3. 推理结果是**原始张量**：还没变成「障碍物列表」，那一步留到第 06 篇。
 
 ## 5. 一个模型，多种输出
@@ -232,7 +241,7 @@ flowchart LR
 - 感知大模型 = 看：把 12 路传感器信息压成一张以自车为中心的 BEV 特征图，再一次算出多种结果。
 - BEV 解决了「距离不可读、多相机拼不起来、视角不稳定」三个问题，也是时序记忆的基础。
 - 网络分 backbone（提特征）、neck（融合）、head（出结果）三段；多任务共享同一份特征。
-- 入口是 `uni_model` 节点，22 路输入、1 个输出 blob；大量回边输入提供「上一帧的记忆」。
+- 入口是 `uni_model` 节点，17 路输入、1 个输出 blob；7 路回边输入提供「上一帧的记忆」。
 - 推理是同步阻塞的，一帧一帧串行，主算力在 GPU。
 - 输出是原始张量，还不是障碍物清单——那是下一篇的事。
 
@@ -242,10 +251,10 @@ flowchart LR
 
 | 结论 | 证据位置 |
 |-|-|
-| `uni_model` 节点与 22 路 `INFER_IN` | `perception/perception/cfg/graphs/graph_l2avp.cfg`（`name: "uni_model"`） |
-| 回边输入（`back_edge`） | 同上（`input_stream_info { tag_index: "INFER_IN:11" back_edge: true }`） |
+| `uni_model` 节点与 17 路 `INFER_IN` | `perception/perception/cfg/graphs/graph_l2avp.cfg`（`name: "uni_model"`，`INFER_IN:0`~`INFER_IN:16`） |
+| 回边输入（`back_edge`） | 同上（`input_stream_info` 共 7 处：2/3/4/5/9/10/15） |
 | 拆分输出的节点 | 同上（`uni_model_spliter_image_backbone_output`，`NnInternalDataFilterUnifiedCalculator`） |
-| 多任务后处理节点清单 | 同上（`MultiModalityPreprocessCalculator`、`RadarProcessorCalculator`、`RadarBEVEncoderCalculator`） |
-| 图像/雷达/点云三支线预处理子图 | 同上（`CameraProcessSubgraphL2AVP`、`LidarOccProcessSubgraph`、`AvpProcessSubgraphL2`） |
+| 雷达与推理并行、后处理才合并 | 同上（`RadarProcessorCalculator` → `radar_frame_output`；`MultiModalityPreprocessCalculator` 的 `RADAR` 输入） |
+| 图像/点云/泊车三支线预处理子图 | 同上（`CameraProcessSubgraphL2AVP`、`LidarOccProcessSubgraph`、`AvpProcessSubgraphL2`） |
 | NN 独立执行器线程（4 线程、`nn_` 前缀） | `driver/config/component/perception_graph_l2avp_interleaving.cfg`（`executor nn_internal_designated`） |
 | 单帧在飞上限（推理串行） | `platform/church/graph/calculators/frame_sync_calculator.cc`（`kMaxFramesInFlight`） |
