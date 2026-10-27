@@ -56,3 +56,17 @@
     padding-left: var(--vp-sidebar-width);
   }
 }
+
+/*
+ * mermaid 宽图（甘特图/时序图）不被正文栏压扁：
+ * 正文栏宽度是 calc(100vw - 800px)，1440 屏也只有 640px，而一张甘特图按
+ * 1:1 需要 1000~1200px。默认 mermaid 会让 svg 宽 100% 自适应，结果 14px
+ * 的字被缩到 5~7px，整张图看不见内容。
+ * 处理：甘特图在各自 init 指令里设 useMaxWidth: false（按自然尺寸渲染），
+ * 这里让图容器自己横向滚动，既不压扁图，也不让整页出现横向滚动条。
+ */
+.vp-doc .mermaid {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 6px;
+}
