@@ -56,6 +56,6 @@ deploy:
       shopt -s dotglob
       for f in *; do webfile file upload "$f" "${NAMESPACE}:/" --override; done
       # 刷新配置缓存，随产物上传的 /.webfile/config.yaml 立即生效
-      webfile server config refresh "${NAMESPACE}"
+      webfile site config refresh "${NAMESPACE}"
       echo ""
       echo "发布完成：https://webfile.deeproute.cn/${NAMESPACE}/  (tag: ${CI_COMMIT_TAG})"
