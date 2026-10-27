@@ -1,51 +1,44 @@
 ---
-title: "Driver QNX Profiler：旧 qnxprofiler 与新模式开关"
+title: "Driver QNX Profiler：模式开关与运行时状态统一"
 date: 2026-10-14
-description: "本文说明 driver 当前分支最近两笔提交引入的 QNX profiler 开关迁移：旧的 --config=qnxprofiler 与新的 QNXPROFILER=oncpu|offcpu|all 分别做什么、应如何打包，以及为什么两者不能混为同一类配置。"
+description: "说明 driver 如何通过 QNX_PROFILER 选择 profiler 打包模式，以及 profiler 库和 monitor 如何统一使用 QNX_PROFILER_MODE 控制运行时行为。"
 categories:
   - "纪事寮"
 tags: []
 ---
 
-# Driver QNX Profiler：旧 qnx_profiler 与新模式开关
+# Driver QNX Profiler：模式开关与运行时状态统一
 
-本文说明 driver 当前分支最近两笔提交引入的 QNX profiler 开关迁移：旧的 **--config=qnx_profiler** 与新的 **QNX_PROFILER=oncpu|offcpu|all** 分别做什么、应如何打包，以及为什么两者不能混为同一类配置。
+本文说明 QNX profiler 当前的构建和运行时配置：打包时通过 **QNX_PROFILER=oncpu|offcpu|all** 选择采集模式，车端进程统一通过 **QNX_PROFILER_MODE** 判断是否开启 On-CPU 或 Off-CPU。旧的 **--config=qnx_profiler** engineering feature 不再作为兼容入口。
 
 ## 背景
 
-### 需求从“是否开启”变为“选择采集模式”
+### 从单一开关改为选择采集模式
 
-原有方案只有 **qnx_profiler** 这一开关，语义是开启 On-CPU 采样。它由 bazel_configs 中的 Bazel RC 预设提供：
+原有方案通过 bazel_configs 中的 `qnx_profiler` RC 预设启用 On-CPU 采样，同时开启 C/C++ toolchain feature。该 feature 曾将 `-DQNX_PROFILER=1` 添加到适用的编译 action。现在 profiler 改为由打包配置选择 On-CPU、Off-CPU 或两者同时启用；旧 RC 预设和 engineering feature 已从 bazel_configs 移除。
 
 ~~~bazelrc
 build:qnx_profiler --@deeproute_build_tools//:qnx_profiler=ON
 build:qnx_profiler --features="qnx_profiler"
 ~~~
 
-最近两笔提交把 driver 中三个 DEM 配置扩展为可选择 On-CPU、Off-CPU 或两者同时采集：
-
-| 提交 | 目的 | 结果 |
-| --- | --- | --- |
-| faac26e928 | 增加 **--define QNX_PROFILER=oncpu/offcpu/all**，并由 package.sh 接收同名环境变量 | driver 可按模式生成不同的运行时 machine_config |
-| 547315bbca | 修复新逻辑初版忽略旧开关的问题 | 继续使用 **--config=qnx_profiler** 时仍会注入 On-CPU profiler，不会静默失效 |
-
-新模式当前只接入以下车型的 DEM：
+driver 在公共 `config/qnx_profiler` 中定义模式条件和 selector，以下 DEM 共用同一套选择规则：
 
 - LP8650-V1-SHARE
+- LP8650-OS-SHARE
 - LP8797-V1-SHARE
 - LP8797-V2-SHARE
 
-### 两种入口的差异
+### 构建入口与运行时状态的分工
 
-| 维度 | 旧入口：--config=qnx_profiler | 新入口：--define QNX_PROFILER=模式 |
+| 维度 | 构建入口：QNX_PROFILER=模式 | 车端状态：QNX_PROFILER_MODE |
 | --- | --- | --- |
-| 入口性质 | .bazelrc 中真实存在的命名预设 | Bazel 的键值构建参数 |
-| 传给 Bazel 的值 | 共享 build setting **qnx_profiler=ON**，并启用 feature | **QNX_PROFILER=oncpu/offcpu/all** |
-| driver 的条件判断 | 外部条件 **@deeproute_build_tools//:qnx_profiler_on** | 本地 **:qnx_profiler_oncpu/offcpu/all** config_setting |
-| machine_config 运行时结果 | 仅注入 On-CPU profiler | 按模式注入 On-CPU、Off-CPU 或两者 |
-| C/C++ 编译选项 | 尝试通过 toolchain feature 向适用目标加入 **-DQNX_PROFILER=1** | 不会自动启用该 feature，也不会自动加入此宏 |
+| 用途 | 由 package.sh 转换为 Bazel `--define`，供 config_setting 匹配 | machine_config 注入所有相关进程，供 profiler 库和 monitor 判断模式 |
+| 可用值 | `oncpu`、`offcpu`、`all`；未指定时为 `none` | `none`、`oncpu`、`offcpu`、`all` |
+| 决定的行为 | profiler 库是否进入 release package，以及生成哪种运行时配置 | profiler 库初始化哪些采集器，monitor 扫描哪些共享内存 |
+| C/C++ 编译选项 | 不会开启旧 toolchain feature，也不会注入 `-DQNX_PROFILER=1` | 不控制 C/C++ 编译参数 |
 
-其中 **qnx_profiler_all** 只是 BUILD 文件内一个 config_setting 的目标名，不是 Bazel RC 的 config 名称。因此 **--config=qnx_profiler_all** 会报“Config value is not defined in any .rc file”：在 .bazelrc 中没有对应的 **build:qnx_profiler_all** 段落。
+`qnx_profiler_oncpu`、`qnx_profiler_offcpu` 和 `qnx_profiler_all` 是 BUILD 中的 `config_setting` 名称。它们检查 Bazel 收到的 `--define QNX_PROFILER=...`，本身不会设置该值。因此 `--config=qnx_profiler_all` 会报“Config value is not defined in any .rc file”：这不是 `.bazelrc` 中定义的 config 名称。
 
 正确的因果关系是：
 
@@ -57,7 +50,7 @@ build:qnx_profiler --features="qnx_profiler"
 select() 选择 qnx_profiler_mode=all
 ~~~
 
-所以 **QNX_PROFILER=all 是因**，**qnx_profiler_all 条件命中是果**。config_setting 不会设置变量；它只检查 Bazel 已收到的变量值。
+所以构建参数 **QNX_PROFILER=all 是因**，**qnx_profiler_all 条件命中是果**；selector 随后将 `all` 传给 Jsonnet。`QNX_PROFILER_MODE=all` 则是生成到车端配置中的运行时结果，不是构建输入。
 
 ## 做法
 
@@ -88,45 +81,35 @@ build_options="--define QNX_PROFILER=all" \
 ./pipeline/package.sh
 ~~~
 
-这两个入口应二选一。不要把 **QNX_PROFILER=...** 和同一个模式的 **build_options=--define ...** 同时传入，以免最终命令重复；更不要使用不存在的 **--config=qnx_profiler_all**。
-
-仍需保持旧 On-CPU 打包流程时，可以继续使用兼容入口：
-
-~~~sh
-build_options="--config=qnx_profiler" \
-./pipeline/package.sh
-~~~
-
-当前最新提交下，上述旧命令仍会得到 On-CPU 的运行时配置；与新入口 **QNX_PROFILER=oncpu** 的车端采集行为相同。两者的差别在于旧入口还会启用 C++ toolchain feature。
+这两个入口应二选一。不要同时设置 **QNX_PROFILER=...** 和同模式的 **build_options=--define ...**，否则会重复传入构建定义。旧的 **--config=qnx_profiler** 不再兼容；不要将 BUILD 中的 `config_setting` 名称误当作 `--config` 参数。
 
 ### 各模式最终写入包内 machine_config 的运行时变量
 
-| 打包模式 | LD_PRELOAD | QNX_PROFILER_DISABLE_ONCPU | QNX_PROFILER_OFFCPU_ENABLE | QNX_PROFILER_OFFCPU_INTERVAL_MS | 采集效果 |
-| --- | --- | --- | --- | --- | --- |
-| 不传新旧开关 | 不含 libqnx_profiler.so | 不设置 | 不设置 | 不设置 | 不采集 |
-| QNX_PROFILER=oncpu | 含 libqnx_profiler.so | 不设置 | 不设置 | 不设置 | 仅 On-CPU |
-| QNX_PROFILER=offcpu | 含 libqnx_profiler.so | 1 | 1 | 100 | 仅 Off-CPU |
-| QNX_PROFILER=all | 含 libqnx_profiler.so | 不设置 | 1 | 100 | On-CPU + Off-CPU |
-| --config=qnx_profiler | 含 libqnx_profiler.so | 不设置 | 不设置 | 不设置 | 仅 On-CPU（兼容路径） |
+| 打包模式 | LD_PRELOAD | QNX_PROFILER_MODE | QNX_PROFILER_OFFCPU_INTERVAL_MS | 采集效果 |
+| --- | --- | --- | --- | --- |
+| 未设置 QNX_PROFILER | 不含 libqnx_profiler.so | none | 不设置 | 不采集 |
+| QNX_PROFILER=oncpu | 含 libqnx_profiler.so | oncpu | 不设置 | 仅 On-CPU |
+| QNX_PROFILER=offcpu | 含 libqnx_profiler.so | offcpu | 100 | 仅 Off-CPU |
+| QNX_PROFILER=all | 含 libqnx_profiler.so | all | 100 | On-CPU + Off-CPU |
 
 这里的 **QNX_PROFILER=all** 与车端进程环境不是同一个层级：
 
 1. 命令前的 **QNX_PROFILER=all** 是 package.sh 读取的 shell 环境变量。
 2. package.sh 将其转为 Bazel 参数 **--define QNX_PROFILER=all**。
 3. Bazel 的 select() 决定 Jsonnet 的 **qnx_profiler_mode**。
-4. Jsonnet 生成 machine_config，并在车端进程环境中写入 **LD_PRELOAD**、**QNX_PROFILER_OFFCPU_ENABLE** 等真正控制 profiler 的变量。
+4. Jsonnet 生成 machine_config，在相关车端进程中设置 **LD_PRELOAD** 和 **QNX_PROFILER_MODE**；profiler 库与 monitor 均读取该 mode。Off-CPU 周期仍通过 **QNX_PROFILER_OFFCPU_INTERVAL_MS** 配置。
 
 打包日志中的 **build_options=...** 应能看到 **--define QNX_PROFILER=all**（或所选模式），可作为入口是否生效的第一项检查。
 
 ### 车型范围与例外
 
-**LP8650-OS-SHARE** 仍只读取旧的 **@deeproute_build_tools//:qnx_profiler_on** 条件，尚未接入三个新 config_setting。为该车型单独传入 **QNX_PROFILER=oncpu/offcpu/all** 不会启用新模式；若需要 Off-CPU 或 all，应在该车型自己的 driver DEM 配置中完成同样的迁移。
+上述四个 DEM 均已使用公共 mode selector。其他车型是否注入 profiler，仍取决于其 machine_config 和打包规则；本次公共规则迁移没有自动改变其他车型的运行时配置。
 
 ## 原因
 
 ### 两条配置链路在 Bazel 与运行时的分工不同
 
-旧链路既包含 driver 的运行时开关，也包含 C++ toolchain feature：
+旧链路曾将 driver 的运行时开关和 C++ toolchain feature 绑定在同一个 RC 预设中：
 
 ~~~text
 --config=qnx_profiler
@@ -134,11 +117,10 @@ build_options="--config=qnx_profiler" \
   → @deeproute_build_tools//:qnx_profiler=ON
   → @deeproute_build_tools//:qnx_profiler_on 命中
   → Jsonnet 的 use_profiler=true
-  → machine_config 的 LD_PRELOAD 加入 libqnx_profiler.so（On-CPU）
-
-  └→ --features=qnx_profiler
-      → QNX C++ toolchain feature
-      → 对适用编译 action 追加 -DQNX_PROFILER=1
+  → machine_config 的 LD_PRELOAD 加入 libqnx_profiler.so
+  → --features=qnx_profiler 开启 toolchain feature
+  → 对适用编译 action 追加 -DQNX_PROFILER=1
+  → 上述旧 feature 和 RC 入口现已从 bazel_configs 移除
 ~~~
 
 新链路只解决 driver 打包后运行时应启用哪种采集模式：
@@ -149,7 +131,8 @@ QNX_PROFILER=all
   → --define QNX_PROFILER=all
   → driver 中 :qnx_profiler_all 命中
   → select() 传入 qnx_profiler_mode=all
-  → Jsonnet 写入 LD_PRELOAD 与 Off-CPU 环境变量
+  → Jsonnet 写入 LD_PRELOAD、QNX_PROFILER_MODE 和 Off-CPU 周期配置
+  → profiler 库与 monitor 读取同一个 QNX_PROFILER_MODE
 ~~~
 
 这解释了为何新方案不需要为了模式选择而新建 **--config=qnx_profiler_all**：它直接消费的是 **--define**，不是 Bazel RC 预设名。
@@ -167,16 +150,10 @@ copt=-DQNX_PROFILER=1
 
 因此 **-DQNX_PROFILER=1** 是旧 feature 可能附加给 C/C++ 编译器的宏；**--define QNX_PROFILER=all** 则是 Bazel 配置键值。两者同名但层级和语义不同，后者不会自动变成前者。
 
-当前检索到的 profiler 运行时行为由 **LD_PRELOAD**、**QNX_PROFILER_DISABLE_ONCPU** 和 **QNX_PROFILER_OFFCPU_ENABLE** 等环境变量控制；未发现 driver/onboard_application 源码直接以 **#ifdef QNX_PROFILER** 或 **defined(QNX_PROFILER)** 消费该编译宏。因此在这三个已迁移 DEM 上，旧方式与新 **oncpu** 方式的运行时 On-CPU 结果相同，构建层才存在 feature/macro 的差异。
+这段旧配置解释了 `create_engineering_flag_set(...)` 和编译宏的历史用途；当前 profiler 启停不依赖该宏。运行时由 profiler 库和 monitor 共同读取 **QNX_PROFILER_MODE**，其中 `none` 不启动采集或周期扫描，`oncpu`、`offcpu`、`all` 分别决定对应功能。
 
-### 为什么 bazel_configs 暂时不需要随 driver 修改
+### 为什么 mode 选择放在 driver，运行状态使用单一变量
 
-本次新模式是 driver 内部生成 DEM 运行时配置的选择逻辑，本地 config_setting 已能完成匹配；共享的 bazel_configs 无需为此立刻增加 **qnx_profiler_all**。
+`QNX_PROFILER` 是打包阶段的输入，用来选择产物和生成配置；`QNX_PROFILER_MODE` 是部署给进程的运行时状态。两者处于不同阶段，但 mode 值由同一条构建选择链路传递，避免 profiler 库和 monitor 分别维护启停条件。
 
-保留旧 **qnx_profiler** 仍有价值：
-
-- 它是已有调用方可继续使用的兼容接口。
-- 它仍可能被其他仓库或尚未迁移的车型使用。
-- 它保留了 C++ feature 与 **-DQNX_PROFILER=1** 的既有语义；没有完成全量消费者审计前不应删除。
-
-如果未来要把接口统一成共享的 `--config=qnx_profiler_<mode>`，那应作为独立的跨仓库迁移：同时定义 RC alias/build setting、决定 C++ feature 是否继续适用、迁移所有 DEM 与 CI 调用方，并验证向后兼容。它不是当前 driver 新模式能够单独推出的改动。
+driver 内的 `config_setting` 直接匹配 `--define QNX_PROFILER=<mode>`，因此无需在 bazel_configs 新增 `--config=qnx_profiler_<mode>`。旧的 `qnx_profiler` engineering feature、RC alias 和 `-DQNX_PROFILER=1` 注入已移除；现有打包调用应迁移到 `QNX_PROFILER=...` 或 `build_options="--define QNX_PROFILER=..."`。

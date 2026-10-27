@@ -13,6 +13,8 @@ tags: [tcmalloc, QNX, crash分析, sized-delete]
 
 本文是截至 2026-10-22 的排查快照，存档位置不代表问题已闭环。普通小对象的完整数据结构和申请、释放流程见 [tcmalloc 小对象申请与释放流程图解](../撰修司/内存分配器/tcmalloc小对象申请与释放流程图解.md)，这里重点记录证据、候选因果链和下一步判据。
 
+**2026-10-27 补记：**第 5.3 节已根据后续源码检查补充 Span 损坏与故障读取机制，其余历史现场和诊断版本描述仍保留原时间范围。后续“不再 abort、输出堆栈”的诊断库、台架日志、OpenCL 初始化调用链和 LLVM 附加数据分配假设，见 [排查续记：堆栈诊断与 LLVM 分配模式分析](./2026-10-27_dr_perception_sized-free堆栈诊断与LLVM分配模式分析续记.md)。后续已观测到 mismatch，但仍未证明历史 SIGSEGV 的根因。
+
 ## 1. 背景与问题演变
 
 此前排查中，用户提供过两个都落在 `CentralFreeList::FetchFromOneSpans+0x40` 的案例：一个申请约 1792B、上游线程涉及 Qualcomm OpenCL 编译，另一个申请约 48B、上游涉及 farseer/protobuf。不同分配尺寸、不同业务调用者出现相似 allocator 故障，使“分配器共享状态被提前破坏”成为重点方向。
@@ -147,7 +149,7 @@ old_size / 2 <= new_size <= old_size
 
 ```mermaid
 flowchart TD
-    R["realloc 返回 p<br/>实际 A，逻辑尺寸映射 B"] --> S["sized free 使用 hint B"]
+    R["p 的实际 class 为 A<br/>释放 hint 映射为 B，来源待查"] --> S["sized free 使用 hint B"]
     S --> T["p 进入 ThreadCache.list B"]
     T --> U["回收进入 CentralFreeList B<br/>可能先停留 transfer cache"]
     U --> V["B.ReleaseToSpans p<br/>PageMap 却返回真实 Span A"]
@@ -161,12 +163,54 @@ flowchart TD
 
 `DLL_Remove(span)` 根据 Span 的 `prev/next` 修改原链，不会检查原链归属。B 的锁不保护 A 的 central 链；两个 class 的代码可能同时操作同一个 Span 或它的邻居，进而造成摘链/插链丢失、旧节点仍被引用等异常。这是能够从“放错对象缓存”发展到“Span 链表出问题”的关键。
 
+**2026-10-27 源码补充：错误 class 进入 Span 层以后，不需要先发生一次业务越界写，也可能破坏元数据。** `ReleaseToSpans` 的关键代码是：
+
+```cpp
+// 当前持有 CentralFreeList B 的锁。
+Span* span = Static::pageheap()->GetDescriptor(page_of(object));
+// PageMap 返回的可能是实际 class A 的 Span；这里没有验证 A == B。
+if (span->objects == nullptr) {
+  DLL_Remove(span);
+  DLL_Prepend(&nonempty_, span);  // 这里的 nonempty_ 属于 B。
+}
+counter_++;
+span->refcount--;
+// 随后按 refcount 分支归还 Span，或向 span->objects 插入 object。
+```
+
+此处 `objects == nullptr` 表示 Span 没有留在中央对象链中的空闲对象，不表示所有对象都已从业务或线程缓存归还。若真实 Span 此时处于 A 的 `empty_` 链，B 会把它摘下并挂入 B 的 `nonempty_`，但 `span->sizeclass` 仍是 A。
+
+并发保护由此失效：线程 1 可以持 A 的锁操作真实 Span，线程 2 持 B 的锁也操作该 Span。两把锁互不排斥。`DLL_Remove` 和 `DLL_Prepend` 都由多次指针写组成，交错执行可能破坏双向链接；即使没有发生摘链，在 B 锁下更新 A 的 `objects/refcount` 也可能与 A 下的更新冲突。对象链更新或 refcount 更新丢失后，还可能发生后续错误回收与复用。仅向 B 记账、却处理 A 的对象和 Span，也会使统计失去一致性。这里描述的是可成立的演化机制，不是现有 dump 已还原的执行过程。
+
+后来的 `FetchFromOneSpans` 则假定这些状态仍然正确：
+
+```cpp
+Span* span = nonempty_.next;
+ASSERT(span->objects != nullptr);
+void* curr = span->objects;
+do {
+  curr = *reinterpret_cast<void**>(curr);
+} while (...);
+```
+
+| 损坏后的状态 | 可能触发异常的访问 |
+| --- | --- |
+| `nonempty_.next` 已为不可读地址 | 读取 `span->objects` |
+| Span 地址可读，但 `objects == nullptr` | 首次读取 `curr` 的 next，即解引用地址 0 |
+| 对象链头可读，但后续某个 next 损坏 | 遍历至坏节点后解引用 |
+
+本次历史现场对应第二种**访问表现**：从 x22 指向的地址读出 objects 为 0，再读取地址 0。它仍不能证明 x22 是有效 Span，因为错误链指针也可能落在可读地址上。发布构建中被 `NDEBUG` 禁用的 `ASSERT` 不会提前阻断；具体故障访问以第 3 节运行库反汇编为准。
+
 还要限定两点：
 
 - 单线程、结构仍完好的执行中，`ReleaseToSpans` 会完成必要的摘链/接链和对象插入；一次错配**不必然**立刻留下 `nonempty_ + objects=NULL`。要解释本次现场，还需竞争、失效节点或其他后续状态破坏的证据。
 - `FetchFromOneSpans` 沿已有 next 取对象，不会按 B 的步长把 A Span 重新切一遍。因此不能断言“256B Span 一进 160B class 就必然错位分配并覆盖相邻前 8B”。错误大小重用可能在特定条件下引起覆盖，但不是已核实的必经步骤。
 
 这类错误起初是**错误归类/契约破坏**，不能未经证据直接命名为 UAF；后续可能演化为重复分配、失效引用等内存破坏。
+
+若 A 的物理对象大于 B 所允许的请求，小请求使用大对象可能暂时不越界，程序因而可以输出许多 mismatch 后继续运行；但跨 class 操作和锁保护失效仍有风险。若 B 对应容量反而更大，后续使用还可能直接超出物理对象边界。两种方向都不能仅凭 class 编号差值推断最终破坏时刻。
+
+此外，错误对象在 flush 前可能被 B 的 ThreadCache 再次分配：`ThreadCache::Allocate` 弹出对象时不逐个核对 PageMap。后续正常 `new(24)` 和正常 sized delete 也可能重复报告同一大 class 地址。因此，**后续 mismatch 栈可能是缓存污染后的受害者，不能全部视作独立的错误释放源头。** 附加数据分配等不经过 realloc 的首次错配候选，在续记中展开。
 
 ## 6. 从运行包找到了哪些入口
 
@@ -224,11 +268,13 @@ tc_delete_sized / tc_deletearray_sized / tc_free_sized / free_sized
 
 前期用户判断“问题版本没有带修复”，应作为待核对的版本线索。修复日期早于 driver 打包日期不证明补丁被打入；本地分支没有修复，也不自动证明旧包的具体源码状态。
 
-诊断检查在 `src/tcmalloc.cc:1550` 之后，对实际采用小对象 hint 的路径读取 PageMap，比较 `span->sizeclass` 与 hint class。异常输出 `ptr`、`size_hint`、`hint_class`、`actual_class`、`span`、`page_id` 并 `abort()`，在进入 ThreadCache 前阻断，不主动修正 class。
+上述 `0b07e0cf…` 版本的诊断检查在 `src/tcmalloc.cc:1550` 之后，对实际采用小对象 hint 的路径读取 PageMap，比较 `span->sizeclass` 与 hint class。异常输出 `ptr`、`size_hint`、`hint_class`、`actual_class`、`span`、`page_id` 并 `abort()`，在进入 ThreadCache 前阻断，不主动修正 class。2026-10-26 后改成输出堆栈后继续释放，行为和新构建记录见续记。
 
-当前补丁没有保存 realloc 历史。**即使新运行捕获 class mismatch，也首先只证明“当时该释放的 hint 与元数据不一致”**；还需区分真实 realloc 后错配、调用者传错 size、无效指针、生命周期错误或此前 Span 元数据已损坏。日志和 abort 栈是定位入口，不应直接当作 realloc 根因的充分证明。
+当时补丁没有保存 realloc 历史。**即使新运行捕获 class mismatch，也首先只证明“当时该释放的 hint 与元数据不一致”**；还需区分真实 realloc 后错配、调用者传错 size、无效指针、生命周期错误或此前 Span 元数据已损坏。日志和 abort 栈是定位入口，不应直接当作 realloc 根因的充分证明。
 
 ## 8. 竞争假设与下一步验证判据
+
+本节保留 2026-10-22 的验证计划，其中“运行 abort 诊断”的阶段后来已改为主动输出堆栈；新进展和后续判据见续记第 4～8 节。
 
 | 假设 | 与本次现场的关系 | 最有价值的新增证据 |
 | --- | --- | --- |
@@ -278,7 +324,7 @@ rg -n 'perception.*Execute command' \
 
 源码与修复依据：
 
-- [旧 realloc 及当前诊断分支源码：tcmalloc.cc:1630](https://code.deeproute.ai/third-party-repos/google-gperftools/-/blob/0b07e0cf56fd09037bb7220a28343d82103249f1/src/tcmalloc.cc#L1630)。
+- [旧 realloc 及当时诊断版本源码：tcmalloc.cc:1630](https://code.deeproute.ai/third-party-repos/google-gperftools/-/blob/0b07e0cf56fd09037bb7220a28343d82103249f1/src/tcmalloc.cc#L1630)。
 - [进入缓存前的 hint class 诊断：tcmalloc.cc:1550](https://code.deeproute.ai/third-party-repos/google-gperftools/-/blob/0b07e0cf56fd09037bb7220a28343d82103249f1/src/tcmalloc.cc#L1550)。
 - [ReleaseToSpans：central_freelist.cc:92](https://code.deeproute.ai/third-party-repos/google-gperftools/-/blob/0b07e0cf56fd09037bb7220a28343d82103249f1/src/central_freelist.cc#L92)。
 - [上游修复 868a588](https://github.com/gperftools/gperftools/commit/868a588ad8afd5e6c9b795363a83fea282ecd491)。
