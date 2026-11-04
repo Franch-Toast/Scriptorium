@@ -1,16 +1,19 @@
 ---
 title: 04 数据模型与内存生命周期
 date: 2026-11-04
-description: DataBatch、Record、StackSample、Arena、字符串驻留、发布只读约定与 JSON 表达的详细设计。
+description: DataBatch、Record、StackSample、Arena、字符串驻留、所有权与可变性、时间单位和序列化损失。
 categories: [撰修司]
-tags: [Illuminator, 数据模型, Arena, 内存管理]
+tags: [Illuminator, 数据模型, Arena, 内存]
 ---
 
 # 04 数据模型与内存生命周期
 
-DataBatch 是 Pipeline 各阶段传递的基本单位。每批数据持有 Arena，标签、字段名和符号字符串通常以 string_view 引用 Arena 中的内存。批次通过 shared_ptr 穿过通道和输出任务，以明确所有权延长数据寿命。
+Pipeline 传递的基本单位不是单条记录，而是 `DataBatch`。理解数据模型的关键是两件事：
 
-这种设计减少批次传递中的深拷贝，但没有消除所有分配，也没有自动保证线程安全。返回 [设计总览](./index.md)。
+1. **哪些内存属于批次**：字符串在 Arena 里，容器和元数据仍各自堆分配。
+2. **谁在什么时候可以改**：Processor 可以改，发布给 Sink 后只能读。
+
+返回 [设计总览](./index.md)。
 
 ## 1. 数据结构
 
@@ -20,126 +23,170 @@ DataBatch 是 Pipeline 各阶段传递的基本单位。每批数据持有 Arena
 %%{init: {"class":{"useMaxWidth":false},"state":{"useMaxWidth":false}}}%%
 classDiagram
     class DataBatch {
-        +type() Type
+        +Type type_
+        +shared_ptr~Arena~ arena_
+        +vector~Record~ records_
+        +vector~StackSample~ stack_samples_
+        +map~string,string~ metadata_
         +AddRecord() Record
         +AddStackSample() StackSample
         +InternString(text) string_view
         +Size() size_t
         +Clear()
-        +SetMeta(key, value)
     }
     class Record {
-        +timestamp Timestamp
-        +labels LabelVector
-        +fields FieldMap
+        +Timestamp timestamp
+        +vector~Label~ labels
+        +unordered_map~string_view,FieldValue~ fields
     }
     class Label {
-        +key string_view
-        +value string_view
+        +string_view key
+        +string_view value
     }
     class StackSample {
-        +timestamp Timestamp
-        +pid uint32
-        +tid uint32
-        +cpu uint32
-        +comm string_view
-        +count uint64
-        +duration_ns uint64
+        +Timestamp timestamp
+        +uint32 pid
+        +uint32 tid
+        +uint32 cpu
+        +string_view comm
+        +vector~StackFrame~ kernel_stack
+        +vector~StackFrame~ user_stack
+        +uint64 count
+        +uint64 duration_ns
+        +SampleType sample_type
+        +int32 kernel_stack_id
+        +int32 user_stack_id
     }
     class StackFrame {
-        +address uint64
-        +function_name string_view
-        +file_name string_view
-        +line_number uint32
-        +module_name string_view
+        +uint64 address
+        +string_view function_name
+        +string_view file_name
+        +uint32 line_number
+        +string_view module_name
     }
     class Arena
-    DataBatch o-- Arena : shared_ptr
+    DataBatch o-- Arena
     DataBatch *-- Record
     DataBatch *-- StackSample
     Record *-- Label
-    StackSample *-- StackFrame : kernel_stack / user_stack
+    StackSample *-- StackFrame
 ```
 
 </div>
 
-### 1.1 Record 与字段
+## 2. Record 与 FieldValue
 
-Record 包含纳秒时间戳、标签向量和字段哈希表。标签键值均为 string_view，字段键也是 string_view。FieldValue 支持 monostate、bool、int64_t、uint64_t、double、string_view。
+`Record` 包含：
 
-标签描述来源与分组维度，字段保存观测值。当前没有全局 metric schema、单位校验或标签基数限制；“字段为 double”不自动说明单位是百分比还是比例。插件及组装方需要明确约定并在文档中说明。
+- `Timestamp timestamp`
+- `std::vector<Label> labels`
+- `std::unordered_map<std::string_view, FieldValue> fields`
 
-字段哈希表的键不允许悬空或被原地改写，否则除数据内容损坏外，还会破坏哈希查找语义。
+`FieldValue` 支持：
 
-### 1.2 StackSample 与栈帧
+```cpp
+using FieldValue = std::variant<std::monostate, bool, int64_t, uint64_t,
+                                double, std::string_view>;
+```
 
-StackSample 包含 pid、tid、cpu、comm、count、内核栈、用户栈、采样类型和 duration_ns，以及 BPF 内核/用户 stack id。OnCPU 样本通常以 count 表达权重，OffCPU 可用 duration_ns 表达持续时间，具体统计含义由采样插件定义。
+要点：
 
-StackFrame 同时支持地址、函数名、源文件、行号和模块。原始地址的有效解析依赖采样时的二进制与映射信息；DataBatch 不会自动捕获 build-id、进程映射或符号版本。
+- 标签和字段键值都是 `string_view`，**必须指向寿命足够的内存**。
+- 没有全局 schema、单位校验或标签基数限制。
+- 字段名重复时，后写入的覆盖先写入的。
+- 字段哈希表的键不能被原地改写，否则会破坏哈希查找。
 
-### 1.3 批次类型与元数据
+## 3. StackSample 与 StackFrame
 
-Type 枚举包括 Metrics、Profile、Trace、Log、Generic，但实际载荷只有 Record 和 StackSample 两类容器。标记为 Trace 或 Log 不会获得独立事件 schema。
+`StackSample` 同时支持 On-CPU 和 Off-CPU：
 
-Size 是 records 数加 stack_samples 数；AddRecord/AddStackSample 自动设置当前系统时间，若原始数据携带采样时间，Source 应主动覆写。批次 metadata 使用拥有字符串的 map 保存附加信息，不参与当前 BatchToJson 的完整输出。
+| 字段 | 含义 |
+| --- | --- |
+| `pid` / `tid` / `cpu` | 进程、线程、CPU |
+| `comm` | 进程名（string_view） |
+| `kernel_stack` / `user_stack` | 栈帧数组 |
+| `count` | 合并后的采样次数 |
+| `duration_ns` | Off-CPU 持续时间 |
+| `sample_type` | `kOnCpu` / `kOffCpu` |
+| `kernel_stack_id` / `user_stack_id` | eBPF 侧栈 ID |
 
-## 2. 时钟与单位
+`StackFrame` 保存地址、函数名、源文件、行号、模块名。但不同输出格式会丢字段（见第 8 节）。
 
-| 位置 | 时钟 / 单位 | 用途 |
-| --- | --- | --- |
-| Timestamp | system_clock，自 Unix epoch 起纳秒 | 观测数据时间 |
-| StackSample duration_ns | 纳秒时长 | OffCPU 等持续时间 |
-| TimerWheel | CLOCK_MONOTONIC | 调度到期 |
-| Pipeline 超期刷新 | steady_clock | 计算刷新间隔 |
-| BatchToJson timestamp | epoch 毫秒 | 当前 JSON 输出 |
-| `.ilr` 外层 ts / started_at | epoch 毫秒 | 写入时间与会话开始时间 |
-| SQLite timestamp_ns | epoch 纳秒整数 | 历史查询 |
+## 4. Arena：批内 bump 分配
 
-单调时钟不能直接当作 epoch 时间写入记录。系统时间校正也可能改变记录的墙钟顺序，不能只靠文件行顺序推导原始事件顺序。
+Arena 是碰撞指针分配器：
 
-## 3. Arena 的分配方式
-
-Arena 通过块内 bump pointer 分配对齐内存，不为每个小对象单独调用 free。默认创建时即申请 64KiB 首块，空间不足时申请更多块；Reset 释放后续块并复用首块。
+```cpp
+void* Allocate(size_t size, size_t alignment) {
+    size_t aligned = AlignUp(current_offset_, alignment);
+    if (aligned + size > current.capacity) {
+        AllocateBlock(max(block_size_, size + alignment));
+        aligned = 0;
+    }
+    void* ptr = current.data + aligned;
+    current_offset_ = aligned + size;
+    return ptr;
+}
+```
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
 ```mermaid
 %%{init: {"flowchart":{"useMaxWidth":false,"htmlLabels":false}}}%%
 flowchart LR
-    A[Arena] --> B1[首块 64KiB]
-    A --> B2[后续块]
-    B1 --> S1[标签和字段字符串]
-    B1 --> S2[符号字符串]
-    B2 --> S3[更多字符串或 Arena 对象]
-    R[Reset] -.保留并复位.-> B1
-    R -.释放.-> B2
+    A["Arena 构造"] --> B["分配 64KiB 首块"]
+    B --> C["Allocate / CopyString<br/>移动 offset"]
+    C --> D{"当前块够?"}
+    D -- 是 --> C
+    D -- 否 --> E["分配新块"]
+    E --> C
+    R["Reset"] -.保留并复位.-> B
+    R -.释放.-> E
 ```
 
 </div>
 
-Arena 只管理放进它的内存。Record 向量、字段 unordered_map、StackFrame 向量、metadata 与驻留缓存仍可能分别堆分配，因此不能宣称整个 DataBatch 是连续内存或零分配。
+关键边界：
 
-Arena 的 `New<T>` 使用 placement new，不在 Reset 时逐个调用 T 的析构函数。需要管理文件、堆内存或复杂 RAII 状态的对象，不应直接依赖 Arena Reset 完成资源清理。分配失败路径会调用回调、重试，仍失败时 abort；它不是可恢复的 Status 错误通道。
+- 默认 `DataBatch` 构造时就会分配 64KiB 首块；使用外部共享 Arena 构造则不会。
+- `Reset()` 只保留第一块，释放后续块，并把 offset 归零。
+- `New<T>` 使用 placement new；**Arena 不调用析构函数**。
+- 分配失败会先调用 OOM 回调再重试，仍失败则 `abort()`；没有可恢复的 `Status` 通道。
+- Arena 只管理放进去的字符串/对象；`records_`、`fields`、`metadata`、驻留缓存仍是独立堆分配。
 
-## 4. 字符串驻留
+所以不要宣称“整个批次零分配”或“连续内存”。
 
-InternString 先查每批缓存，已有内容直接复用，否则复制到 Arena 并缓存。重复字段名、进程名、模块名可在一批内共享字节；不同批次默认不共享驻留表。
+## 5. 字符串驻留
+
+`InternString` 先查当前批次的缓存，未命中才复制进 Arena：
 
 ```cpp
-auto batch = std::make_shared<illuminator::DataBatch>(
-    illuminator::DataBatch::Type::kMetrics);
-auto& record = batch->AddRecord();
-std::string temporary_name = "worker";
-record.labels.push_back({batch->InternString("source"),
-                         batch->InternString(temporary_name)});
-record.SetField(batch->InternString("counter"), uint64_t{42});
+std::string_view InternString(std::string_view s) {
+    if (s.empty()) return {};
+    auto it = intern_cache_.find(s);
+    if (it != intern_cache_.end()) return it->second;
+    auto interned = arena_->CopyString(s);
+    intern_cache_.emplace(interned, interned);
+    return interned;
+}
 ```
 
-这段代码在 temporary_name 销毁后仍有效，因为字符串已被复制进该批次 Arena。直接把 temporary_name 转成 string_view 放入标签会悬空。字符串字面量本身寿命足够长，但统一驻留更易保持插件间一致规则。
+```cpp
+auto batch = std::make_shared<DataBatch>(DataBatch::Type::kMetrics);
+auto& record = batch->AddRecord();
 
-注意继续 AddRecord 可能让 records 向量扩容，使此前保存的 Record 引用失效；批次共享所有权不能阻止内部 vector 的引用失效。
+std::string name = "worker";
+record.labels.push_back({batch->InternString("source"),
+                         batch->InternString(name)});
+record.SetField(batch->InternString("value"), uint64_t{42});
+```
 
-## 5. 跨线程寿命与发布规则
+- `name` 销毁后，标签值仍有效，因为已经复制进 Arena。
+- 不同批次默认不共享驻留表。
+- 返回的 `string_view` 依赖该批次 Arena 存活。
+- 继续 `AddRecord()` 可能让 `records_` 扩容，之前保存的 `Record&` 会失效。
+
+## 6. 所有权与可变性
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
@@ -147,66 +194,147 @@ record.SetField(batch->InternString("counter"), uint64_t{42});
 %%{init: {"sequence":{"useMaxWidth":false}}}%%
 sequenceDiagram
     participant S as Source
-    participant Q as Channel
-    participant P as ProcessThread
-    participant W as 输出任务
     participant A as Arena
-    S->>A: 复制临时字符串
-    S->>Q: 交付 shared_ptr 批次
-    Q->>P: 移交批次引用
+    participant P as ProcessThread
+    participant W as SinkPool
+    participant K as Sink
+    S->>A: InternString / CopyString
+    S->>P: shared_ptr<DataBatch>
     P->>P: Processor 可修改
-    P->>W: 发布 shared_ptr<const DataBatch>
-    Note over P,W: 发布后不再通过可变别名修改
-    W->>W: 最后一个消费者结束
-    W->>A: 最后所有者释放后销毁
+    P->>W: shared_ptr<const DataBatch>
+    W->>K: 只读
+    Note over P,K: 发布后不得再通过可变别名修改
+    K-->>A: 最后一个 shared_ptr 释放
 ```
 
 </div>
 
-ConstDataBatchPtr 约束 Sink 所见的访问接口，但不能撤销 Source 或 Processor 留下的 mutable shared_ptr。发布不可变是插件契约；向多个 Sink 发出后修改字段、Clear 或复用 Arena 都可能产生竞争与悬空视图。
+| 阶段 | 可变性 | 说明 |
+| --- | --- | --- |
+| Source 构造 | 可变 | 填充记录、驻留字符串 |
+| 通道中 | 可变（但不应修改） | 所有权已移交 |
+| Processor | 可变 | 原地改或返回新批 |
+| 发布给 Sink | 只读（`ConstDataBatchPtr`） | 契约约束；无法撤销上游别名 |
+| 所有 Sink 完成 | 释放 | 最后一个所有者销毁批次与 Arena |
 
-Processor 返回新批次时，复制 Record 不会复制字符串字节。若新批次引用旧 Arena，必须确保 Arena 继续存活且不会 Reset；更直观的做法是向新批次重新 InternString。Aggregator 同样不能只保留 string_view 而丢弃其所有者。
+### 6.1 拷贝是浅拷贝
 
-### 5.1 Clear 与共享 Arena
+`DataBatch` 没有删除拷贝构造。拷贝一个批次会共享同一个 `Arena` 和所有 `string_view`：
 
-DataBatch::Clear 会清空记录、栈样本和驻留缓存，随后 Reset Arena，**不会清空 metadata**。重复使用批次时需要主动管理旧元数据。
+```cpp
+DataBatch copy = *batch;   // 共享 Arena，不是深拷贝
+```
 
-多个 DataBatch 可以共享同一 Arena，但一个批次 Clear 后会使其他批次引用的字节失效或被复写。共享 Arena 不等于拥有独立可回收区域，也不是线程安全内存池。当前最稳妥的默认方式是每批独立 Arena，等所有消费者释放后再回收。
+不要在别名上调用 `Clear()` 或复用 Arena。
 
-## 6. JSON 表达与信息损失
+### 6.2 Clear 的真实行为
 
-BatchToJson 输出对象包括 pipeline、records，以及非空时的 stack_samples。Record 以 timestamp、labels 对象、fields 对象表示；monostate 序列化为 null。栈帧输出 address、可选 function_name 和 module_name。
+```cpp
+void Clear() {
+    records_.clear();
+    stack_samples_.clear();
+    intern_cache_.clear();
+    arena_->Reset();
+    // metadata_ 不会被清空
+}
+```
+
+- 记录、栈样本、驻留缓存被清空。
+- Arena 首块保留但逻辑失效，后续分配会覆盖旧字节。
+- 仍持有该批次 `shared_ptr` 或 `string_view` 的其他消费者会看到空数据/悬空视图。
+- **metadata 不会被清空**；复用批次时要手动管理。
+
+### 6.3 Processor / Aggregator 的寿命规则
+
+- Processor 返回新批次时，不能只复制旧批次的 `string_view` 然后丢掉旧批次。
+- Aggregator 跨批保存数据时，必须保留完整批次所有权，或复制到自己的长期存储。
+- Sink 只读；但 Sink 可以保留 `ConstDataBatchPtr` 延长寿命。
+
+## 7. 时钟与单位
+
+| 位置 | 时钟 / 单位 | 用途 |
+| --- | --- | --- |
+| `Timestamp` | `system_clock`，Unix epoch 纳秒 | 观测数据时间 |
+| `StackSample.duration_ns` | 纳秒 | Off-CPU 持续时间 |
+| TimerWheel | `steady_clock` / `CLOCK_MONOTONIC` | 调度，不受校时影响 |
+| Pipeline 刷新判断 | `steady_clock` | 超时兜底 |
+| JSON `timestamp` | epoch 毫秒 | 截断纳秒 |
+| `.ilr` 外层 `ts` | epoch 毫秒 | 写入时间 |
+| `.ilr` `started_at` | epoch 毫秒 | 会话开始 |
+| SQLite `timestamp_ns` | epoch 纳秒整数 | 历史查询 |
+
+不能把单调时钟直接当 epoch 时间写入记录；系统校时也可能让墙钟顺序与文件行顺序不一致。
+
+## 8. JSON 与 SQLite 的损失
+
+### 8.1 JSON
+
+`BatchToJson` 输出：
 
 ```json
 {
   "pipeline": "demo_counter",
   "records": [
     {
-      "timestamp": 1793750400000,
-      "labels": {"source": "demo"},
-      "fields": {"counter": 42}
+      "timestamp": 1793750400050,
+      "labels": {},
+      "fields": {"value": 42}
     }
   ]
 }
 ```
 
-这是格式示例，不要求与 demo 当前所有字段完全一致。关键边界如下：
-
-| 内存信息 | 当前 JSON 行为 |
+| 信息 | JSON 行为 |
 | --- | --- |
-| 纳秒 Timestamp | 除以 1000000，截为毫秒 |
-| DataBatch Type / metadata | 未完整编码 |
-| StackFrame 源文件与行号 | 未输出 |
-| BPF stack id | 未输出 |
-| 标签向量的重复键 | 写入 JSON 对象时后者覆盖前者 |
-| 有符号 / 无符号整数 | JSON 文本不提供完整的原生类型 schema 契约 |
+| 纳秒时间戳 | 截断为毫秒 |
+| `DataBatch::Type` | 不输出 |
+| `metadata` | 不输出 |
+| `StackFrame.file_name` / `line_number` | 不输出 |
+| BPF stack id | 不输出 |
+| 重复标签键 | JSON 对象后者覆盖前者 |
 
-当前 JSON 是输出格式，不是完整、无损的批次快照协议。若后续要回放、跨进程传输或 schema 迁移，需要新增明确的版本、时间单位与反序列化契约。
+### 8.2 SQLite
 
-## 7. 性能与扩展方向
+`SqliteBackend::SerializeStack` 只序列化 `user_stack`，但**保留每帧的 `addr/fn/file/line`**。它丢掉的是：
 
-批处理减少任务和调用次数，Arena 减少字符串碎片；代价是每批首块开销、字段哈希布局、shared_ptr 原子引用计数和序列化分配。性能验证应同时测批大小、字段数、标签基数、栈深度及输出扇出数。
+- `kernel_stack`
+- `cpu`
+- `sample_type`
+- `duration_ns`
+- `kernel_stack_id` / `user_stack_id`
 
-后续可评估安全的 Batch/Arena 复用、固定 schema 字段布局、按字节预算和版本化事件信封。复用必须建立在消费者已完成的证据之上，不能以“入队后过了一段时间”作为回收条件。
+不要把 JSON 的“丢 file/line”与 SQLite 混为一谈。
 
-源码依据：`src/core/common/data_batch.h`、`json_serializer.h`、`src/core/memory/arena.h`；持久化损失与格式边界另见 [08](./08-recording-and-storage.md)。
+### 8.3 类型边界
+
+- JSON 文本不携带完整的 C++ 原生类型 schema。
+- SQLite 查询把数字反序列化为 `double` / `int64_t` / `uint64_t` 之一；原始 `FieldValue` 的精确类型不一定能恢复。
+- 大 `uint64_t` 在某些 JSON 消费端可能丢精度。
+
+## 9. 成本模型
+
+| 成本 | 说明 |
+| --- | --- |
+| 每批 64KiB 起步 | 默认构造即分配 Arena 首块 |
+| `records_` 向量 | 扩容会移动 `Record`，使引用失效 |
+| `fields` 哈希表 | 每记录一个，键为 `string_view` |
+| `shared_ptr` | 跨线程传递的原子引用计数 |
+| 序列化 | JSON 构造/解析、SQLite 绑定都会分配 |
+| 驻留缓存 | 每批一个哈希表，减少重复字符串 |
+
+## 小结
+
+- `DataBatch` 是交付单位；字符串在 Arena，容器/元数据仍独立分配。
+- `InternString` 只在批内去重；返回的 `string_view` 依赖 Arena 寿命。
+- 默认批次从 64KiB 首块开始；`Clear` 不清 metadata，共享 Arena 不能单独 Reset。
+- 发布给 Sink 后只读；Processor/Aggregator 要注意旧 Arena 的寿命。
+- JSON 和 SQLite 都会丢失部分字段，不能当作无损快照。
+
+## 边界与后续
+
+- 没有全局 metric schema、单位校验、标签基数限制。
+- `DataBatch` 拷贝是浅拷贝，容易误用。
+- `Arena::New` 不调用析构，不适合复杂 RAII 对象。
+- 没有跨进程数据格式或回放协议。
+
+返回 [设计总览](./index.md) · 上一篇：[插件系统](./03-plugin-system.md) · 下一篇：[配置与状态](./05-configuration-and-status.md)

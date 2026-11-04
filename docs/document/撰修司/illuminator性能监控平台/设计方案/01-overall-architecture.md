@@ -1,176 +1,309 @@
 ---
-title: 01 总体架构与模块边界
+title: 01 全局架构与模块边界
 date: 2026-11-04
-description: 说明 Illuminator 核心的分层、模块依赖、运行关系、对象所有权及宿主集成边界。
+description: 系统上下文、组件职责、分层与构建依赖、对象所有权、线程拓扑和宿主必须遵守的契约。
 categories: [撰修司]
-tags: [Illuminator, 架构设计, 模块边界]
+tags: [Illuminator, 架构, 模块边界]
 ---
 
-# 01 总体架构与模块边界
+# 01 全局架构与模块边界
 
-Illuminator 的核心由数据契约、执行引擎和组件扩展三部分组成。CLI 是这些能力的一个使用者。引擎无需 HTTP、界面或业务 Feature 即可执行；插件实现也无需通过上层 Driver 才能加入 Pipeline。
+本篇是整套设计文档的“地图”：只回答系统由什么组成、谁拥有谁、什么代码跑在哪个线程，以及宿主必须遵守哪些契约。具体机制链接到专题，不在本篇展开。
 
-返回 [设计总览](./index.md)。事件与并发细节见 [Pipeline v3](./02-pipeline-v3.md)。
+返回 [设计总览](./index.md)。
 
-## 1. 逻辑分层
+## 1. 设计目标与约束
+
+| 目标 | 具体表现 | 代价 |
+| --- | --- | --- |
+| 低开销 | 无锁通道、Arena、批量传递 | 有界丢弃、每批 64KiB 起步 |
+| 可嵌入 | 不依赖 Server/UI，宿主控制生命周期 | 宿主必须自己组装和调度 |
+| 采集与处理解耦 | Timer 只调度，CollectPool 执行采集 | 多一层任务队列 |
+| 处理状态简单 | 每 Pipeline 一个处理线程 | 单 Pipeline 处理能力受单核限制 |
+| 输出隔离 | SinkPool 执行慢 I/O | 同一 Sink 可能并发、乱序 |
+| 可扩展 | 四类插件接口 + 动态库 | C++ ABI 兼容约束 |
+| 可观测 | 通道/输出池指标、日志 | 指标不是精确实时快照 |
+
+非目标：它不是服务端、不是数据库、不是完整 APM 产品，也不提供开箱即用的生产探针。
+
+## 2. 系统上下文
+
+<div style="overflow-x: auto; margin: 1.5rem 0;">
+
+```mermaid
+%%{init: {"flowchart":{"useMaxWidth":false,"htmlLabels":false}}}%%
+flowchart LR
+    subgraph HOST["宿主 / CLI"]
+        H["配置 · 组装 · 调度 · 关闭"]
+    end
+    subgraph IL["Illuminator 内核"]
+        P["Pipeline v3"]
+        R["PluginRegistry / Manager"]
+        I["InfrastructureManager"]
+        ST["StorageBackend"]
+    end
+    subgraph KERNEL["Linux"]
+        PROC["/proc · /sys"]
+        BPF["eBPF / libbpf / ring buffer"]
+    end
+    subgraph OUT["输出"]
+        ILR[".ilr 文件"]
+        DB["SQLite"]
+        OTHER["未来 Sink"]
+    end
+    H --> R
+    H --> I
+    H --> P
+    H --> ST
+    PROC --> P
+    BPF --> P
+    P --> ILR
+    ST --> DB
+    P -.-> OTHER
+```
+
+</div>
+
+明确边界：
+
+- **不是服务端**：没有 HTTP API、没有 Web UI、没有告警引擎。
+- **不是数据库**：SQLite 只是可选持久化后端，不自动接入 Pipeline。
+- **不是探针集合**：当前只有 eBPF Source 基类和事件结构，没有生产探针。
+- **不是编排框架**：YAML 只配置资源和全局项，不定义 Pipeline 图。
+
+## 3. 组件职责
+
+| 组件 | 是什么 | 输入 | 输出 | 不做什么 |
+| --- | --- | --- | --- | --- |
+| Host | 组合根 | 配置、插件 | 运行中的 Pipeline | 不实现业务 Driver |
+| Source | 数据生产者 | 无 | `DataBatchPtr` | 不决定何时运行 |
+| Processor | 逐批转换 | 批次 | 批次 / `nullptr` / 错误 | 不跨批保存状态 |
+| Aggregator | 跨批聚合 | 批次 | 0..N 批次 | 不自动刷新 |
+| Sink | 输出终点 | 只读批次 | 外部副作用 | 不保证顺序 |
+| Pipeline | 一条数据路径 | 批次 | 交给 Sink | 不调用 `Init()` |
+| AsyncChannel | 有界事件通道 | 数据 / Sentinel | 事件 | 不保证控制信号不丢 |
+| TimerWheel | 全局调度 | 定时器注册 | 回调 | 不执行重活 |
+| CollectPool | 采集线程池 | 任务 | 执行结果 | 不防重入 |
+| ProcessThread | 处理线程 | 事件 | 处理/提交 | 每 Pipeline 一个 |
+| SinkPool | 输出线程池 | Write 任务 | 执行结果 | 不丢弃任务（丢弃在 Pipeline） |
+| PluginRegistry | 工厂表 | 名称 | 实例 | 不管理生命周期 |
+| PluginManager / SoLoader | 动态库发现 | 目录 | 工厂 | 不保证全部成功 |
+| StorageBackend | 持久化接口 | 记录/样本 | 数据库 | 不自动接入 Pipeline |
+| InternalMetrics | 自观测 | 计数/仪表 | 导出文本 | 不提供 HTTP |
+| ResourceLimiter | 资源检查 | `/proc/self/statm` | RSS/告警 | 不强制限额 |
+
+### 3.1 组件交互矩阵
+
+行是调用方，列是被调用方；“数据”表示传批次，“控制”表示启停/注册，“所有权”表示持有对象。
+
+| 调用方 → | Host | Pipeline | Channel | TimerWheel | CollectPool | SinkPool | Plugin | Storage |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Host | — | 组装/启停 | — | 注册定时器 | 间接 | 注入 | Init/创建 | 直接调用 |
+| Pipeline | — | — | 入队/出队 | — | — | 提交 Write | Start/Stop/调用 | — |
+| TimerWheel | — | 注入 Flush | 入队 | — | 提交 Collect | — | — | — |
+| CollectPool | — | 入队 | 入队 | — | — | — | 调用 Collect | — |
+| ProcessThread | — | — | 出队 | — | — | 提交 Write | 调用 Process/Add/Flush | — |
+| SinkPool | — | — | — | — | — | — | 调用 Write | — |
+| Sink | — | — | — | — | — | — | — | 可选 |
+| Storage | — | — | — | — | — | — | — | — |
+
+## 4. 分层与构建依赖
+
+概念上的层次：
+
+```text
+应用/宿主（CLI、嵌入式程序）
+        ↓
+具体插件（RecordingSink、eBPF Source、教学插件）
+        ↓
+插件 API（Source/Processor/Aggregator/Sink）
+        ↓
+引擎（Pipeline、Channel、TimerWheel、ThreadPool）
+        ↓
+数据与公共契约（DataBatch、Arena、Status、Config）
+```
+
+构建上要注意一个“反向”关系：
+
+- `core:engine` 依赖 `plugin:api` 的接口来持有和调用插件。
+- 具体插件依赖 `plugin:api` 和 `core:common`，不应反向依赖 `core:engine`。
+- CLI 负责把两者装配起来。
+
+因此“插件在概念上位于引擎之上，但引擎在编译上依赖插件接口”。这不是循环依赖，而是接口倒置。
+
+## 5. 运行全景与线程拓扑
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
 ```mermaid
 %%{init: {"flowchart":{"useMaxWidth":false,"htmlLabels":false}}}%%
 flowchart TB
-    H[宿主入口：src/cli 或嵌入程序]
-    H --> E[执行引擎：Pipeline / AsyncChannel]
-    H --> L[组件发现：Registry / Manager / SoLoader]
-    H --> I[基础设施：Timer / Pools / Metrics]
-    H --> ST[独立存储：StorageBackend]
-    E --> A[插件接口：Source / Processor / Aggregator / Sink]
-    L --> A
-    IM[具体插件：RecordingSink / 外部插件] --> A
-    A --> D[数据与公共契约：DataBatch / ConfigValue / Status]
-    ST --> D
-    D --> M[Arena / 公共工具]
-    E --> TH[线程和队列]
-    I --> TH
-    EB[eBPF Source 公共基类] --> A
-    EB --> BPF[eBPF loader / compat / 构建规则]
+    HOST["宿主控制线程"]
+    TW["timer-wheel ×1"]
+    CP["collecter-* ×M"]
+    PA["ProcessThread A"]
+    PB["ProcessThread B"]
+    SP["sink-write-* ×K"]
+    HOST --> TW
+    HOST --> CP
+    HOST --> PA
+    HOST --> PB
+    TW --> CP
+    CP --> PA
+    CP --> PB
+    PA --> SP
+    PB --> SP
 ```
 
 </div>
 
-分层描述的是依赖方向，而不是每层各自启动一个服务。大量基础设施是头文件实现；静态链接和 `#include` 边界同样需要通过 Bazel target 约束。
+| 线程 | 数量 | 职责 | 阻塞点 |
+| --- | --- | --- | --- |
+| TimerWheel | 1 | 定时调度、轻量回调 | `epoll_wait`、回调 |
+| CollectPool | M（默认 2） | `Source::Collect()` | 采集 I/O |
+| ProcessThread | 每 Pipeline 1 | Processor/Aggregator | Dequeue、Processor、同步 Sink |
+| SinkPool | K（默认 `max(2, CPU/2)`） | `Sink::Write()` | 文件/网络 I/O |
+| Host | 1+ | 配置、组装、启停 | 由宿主决定 |
 
-### 1.1 数据与公共契约
+线程数公式：
 
-`src/core/common` 提供 Status、ConfigValue、GlobalConfig、YAML、日志、DataBatch 和 JSON。虽然物理目录相同，Bazel 已拆成 `common`、`data`、`serialization`、`yaml_config` 等目标，避免让每个使用方都隐含依赖 YAML 或全部引擎。
+```text
+1 + M + N + K + 宿主控制线程
+```
 
-DataBatch 是运行期交付单位；Status 是调用结果契约；ConfigValue 是插件参数载体。它们不应反向依赖 CLI、存储后端或具体插件。
+其中 N 是 Pipeline 数量。详细规则见 [02/04 线程模型](./02-pipeline-v3/04-thread-model-and-scheduling.md)。
 
-### 1.2 执行引擎
-
-`Pipeline` 管理组件组合、处理线程、输入通道、输出提交及整管道停止。`AsyncChannel` 提供有界事件传递与水位状态。Pipeline 自身不扫描动态库、不解析配置文件，也不自动建立采集定时器。
-
-`InfrastructureManager` 管理 TimerWheel、CollectPool、SinkPool，当前通过单例提供访问。它不持有 Pipeline 集合，不提供应用级编排能力。
-
-### 1.3 组件扩展与持久化
-
-`plugin/api` 定义四类组件；`plugin/infra` 创建实例。当前显式注册的内建输出为 RecordingSink。Processor、Aggregator 保留接口及扩展位置，文档中的过滤、符号化、窗口统计属于可实现的插件职责，不表示当前存在对应的生产插件。
-
-`src/storage` 是独立持久化 API。SQLite 不再位于 Server 目录，构建仅依赖基础数据、公共配置及 SQLite 系统库。后续 StorageSink 可以依赖它，引擎不必知道数据库结构。
-
-## 2. 源码与构建地图
-
-下表中的路径相对 `/sandbox/illuminator`。
-
-| 目录 / 文件 | 主要职责 | 关键构建目标 |
-| --- | --- | --- |
-| `src/core/common/status.h`、`config.h` | 状态与配置基础结构 | `//src/core:common` |
-| `src/core/common/data_batch.h` | Record、StackSample、批次与字符串驻留 | `//src/core:data` |
-| `src/core/common/json_serializer.h` | 数据 JSON 输出 | `//src/core:serialization` |
-| `src/core/common/yaml_config_loader.h` | 根配置解析和校验 | `//src/core:yaml_config` |
-| `src/core/engine` | Pipeline、Channel、调度、PID、自观测 | `//src/core:engine` |
-| `src/core/memory` | Arena、环形队列 | `//src/core:memory` |
-| `src/core/threading` | 线程池与线程工具 | `//src/core:threading` |
-| `src/plugin/api` | 四类接口、录制控制接口 | `//src/plugin:api` |
-| `src/plugin/api/ebpf_source_base.h` | eBPF skeleton 生命周期 | `//src/plugin:ebpf_source_base` |
-| `src/plugin/infra` | 注册、发现、动态装载 | `//src/plugin:infra`、`//src/plugin:builtin` |
-| `src/plugin/sinks/recording_sink` | `.ilr` 输出 | `//src/plugin/sinks:recording_sink` |
-| `src/storage` | StorageBackend、SQLite | `//src/storage:storage`、`//src/storage:sqlite_backend` |
-| `src/ebpf_common` | 公共 BPF 类型、用户态工具、探针规则 | `//src/ebpf_common:loader` 等 |
-| `src/cli` | 参数处理、组装、调度和关闭 | `//src/cli:illuminator` |
-
-注意 `//src/core:engine` 依赖 `//src/plugin:api`，而 `api` 依赖 `core:common/data/memory`，不依赖 `core:engine`，因此不存在这一层面的引擎循环依赖。概念上的“插件在引擎之上”和构建上的“引擎调用插件接口”需要区分。
-
-## 3. 运行关系与对象所有权
+## 6. 对象所有权
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
 ```mermaid
 %%{init: {"class":{"useMaxWidth":false},"state":{"useMaxWidth":false}}}%%
 classDiagram
-    class Host {
-        +loadConfig()
-        +assemblePipeline()
-        +scheduleCollection()
-        +shutdown()
+    class Host
+    class InfrastructureManager {
+        +TimerWheel timer_
+        +unique_ptr~ThreadPool~ collect_pool_
+        +shared_ptr~ThreadPool~ sink_pool_
     }
     class Pipeline {
-        +Start() Status
-        +Enqueue(batch)
-        +InjectFlush()
-        +Stop() Status
+        +unique_ptr~SourcePlugin~ source_
+        +vector~unique_ptr~ processors_
+        +unique_ptr~AggregatorPlugin~ aggregator_
+        +vector~shared_ptr~ sinks_
+        +shared_ptr~ThreadPool~ sink_pool_
+        +AsyncChannel ingest_channel_
+        +thread process_thread_
     }
-    class InfrastructureManager
-    class SourcePlugin
-    class ProcessorPlugin
-    class AggregatorPlugin
-    class SinkPlugin
-    class AsyncChannel
-    class ThreadPool
-    Host --> Pipeline : 创建与串行管理
-    Host --> InfrastructureManager : 启停共享资源
-    Pipeline *-- SourcePlugin : unique_ptr
-    Pipeline *-- ProcessorPlugin : unique_ptr 数组
-    Pipeline *-- AggregatorPlugin : 可选 unique_ptr
-    Pipeline o-- SinkPlugin : shared_ptr 数组
-    Pipeline *-- AsyncChannel
-    Pipeline o-- ThreadPool : shared SinkPool
+    class PluginRegistry
+    Host --> InfrastructureManager
+    Host --> Pipeline
+    Host --> PluginRegistry
+    Pipeline o-- InfrastructureManager : 共享 SinkPool
+    Pipeline *-- SourcePlugin
+    Pipeline *-- ProcessorPlugin
+    Pipeline *-- AggregatorPlugin
+    Pipeline o-- SinkPlugin
 ```
 
 </div>
 
-Source、Processor 和 Aggregator 通常只属于一条 Pipeline。Sink 使用共享所有权，因为异步输出任务需要延长其实例寿命。**共享所有权只能延长对象内存寿命，不能自动延长已关闭文件、BPF fd 等外部资源的可用期。**
-
-宿主必须比其提交的采集回调活得更久；动态库必须比从中创建的组件实例及仍可调用的工厂活得更久。独立 StorageBackend 的 Close 应发生在其所有读写调用结束之后。
-
-## 4. 宿主的责任
-
-| 阶段 | 宿主应执行的工作 | Pipeline 自动执行的工作 |
+| 对象 | 所有权 | 说明 |
 | --- | --- | --- |
-| 配置 | 读取 YAML、选择工厂、逐个 Init 插件 | 不解析 YAML，不调用 Init |
-| 组装 | 设置 Source、Processor、Aggregator、Sink 和 SinkPool | 保存对象所有权 |
-| 启动 | 启动基础设施、调用 Pipeline Start、安装定时任务 | 按顺序 Start 插件并启动 ProcessThread |
-| 采集 | 定时投递 Collect、阻止同一 Source 重叠采集、检查结果 | 接收有效批次并处理 |
-| 聚合调度 | 根据正的 FlushIntervalMs 注入 Flush | 在 ProcessThread 执行 Flush、超期兜底 |
-| 停止 | 停止并等待定时回调、排空外部 Collect 任务 | 停 Source、排空通道、等待自身 Write、停其余组件 |
-| 释放 | 停止共享基础设施、关闭存储、最后处理动态库寿命 | 析构调用 Stop，但无法补救外部悬空回调 |
+| Source / Processor / Aggregator | Pipeline `unique_ptr` | 独占，生命周期与 Pipeline 一致 |
+| Sink | Pipeline `shared_ptr` | 支持 `GetSinks()` 快照和异步任务捕获 |
+| SinkPool | Host 创建，Pipeline 共享 | `InfrastructureManager` 持有，Pipeline 持有 `shared_ptr` |
+| CollectPool | `InfrastructureManager` `unique_ptr` | 只在 Start 后有效，Stop 后裸指针失效 |
+| TimerWheel | `InfrastructureManager` 成员 | 全局唯一 |
+| 动态库 | `SoLoader` 句柄 | 必须活过工厂和实例 |
+| DataBatch | `shared_ptr` 流动 | 最后一个所有者释放时销毁 Arena |
 
-不要把 `GetSource()` 返回的裸指针当作可独立保存的所有权句柄。读取 `IsRunning()` 后继续调用 Source 也不是生命周期屏障；状态可能在检查之后改变。
+## 7. 宿主必须遵守的 8 条契约
 
-## 5. 最小运行闭环
+| # | 契约 | 违反后果 |
+| --- | --- | --- |
+| 1 | 先 `Init()`，再交给 Pipeline `Start()` | 插件使用未初始化状态 |
+| 2 | 同一 Source 不重叠 `Collect()` | 数据竞争、重复计数、资源冲突 |
+| 3 | Pipeline 不自动注册采集/Flush 定时器 | 没有数据或聚合永不刷新 |
+| 4 | 停止顺序：Timer → CollectPool → Pipeline → Infrastructure | 残留 Enqueue、Stop 卡死、最终 Flush 无人执行 |
+| 5 | 不能提前停止 SinkPool | `pending_writes_` 永不归零，Stop 永久等待 |
+| 6 | Start/Stop 串行调用 | 重复启动第二个处理线程，或并发 Stop 语义混乱 |
+| 7 | 动态 Sink 移除前自行处理在途写 | 写入已停止的 Sink |
+| 8 | `GetCollectPool()` 返回裸指针，Stop 后不得使用 | 悬空指针 |
+
+## 8. 最小运行闭环
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
 ```mermaid
 %%{init: {"sequence":{"useMaxWidth":false}}}%%
 sequenceDiagram
-    participant H as CLI 宿主
-    participant R as 注册表
-    participant I as 基础设施
+    participant H as Host
+    participant R as Registry
+    participant I as Infrastructure
     participant P as Pipeline
-    participant F as 录制文件
-    H->>R: 注册内建插件 / 加载动态插件
-    H->>R: 创建 Source 和 recording Sink
-    H->>H: Init 与组装
-    H->>I: Start
-    H->>P: Start
-    H->>F: 通过 Sink 显式开始录制
-    H->>I: 安装采集定时任务
-    loop 有限运行时间
-        I->>P: Collect 后 Enqueue
-        P->>F: 经 Sink 写入批次
-    end
-    H->>I: 停定时器并排空采集
-    H->>P: Stop 并等待输出
-    H->>I: Stop 共享资源
+    participant TW as TimerWheel
+    participant CP as CollectPool
+    participant SK as Sink
+
+    H->>R: CreateSource / CreateSink
+    H->>R: Init 插件
+    H->>I: Start()
+    H->>P: 组装 + Start()
+    H->>SK: 显式开始录制（可选）
+    H->>TW: AddRepeating(Collect)
+    TW->>CP: Submit
+    CP->>P: Enqueue
+    P->>SK: Write
+    H->>TW: Stop()
+    H->>CP: DrainAndStop()
+    H->>P: Stop()
+    H->>I: Stop()
 ```
 
 </div>
 
-该闭环已经能在没有 Server 与前端的情况下运行。实际 CLI 目前只装配 Source 与 recording Sink，更复杂的处理链通过 C++ SDK 组装。
+CLI 的 `RuntimeShutdown` 就是按这个顺序实现的。
 
-## 6. 演进时保持的边界
+## 9. 源码地图
 
-新增业务采集应作为 Source 或宿主配置进入，而非恢复引擎内业务 Driver。新增持久化应作为 Sink 适配层进入。新增控制服务可以持有宿主运行对象，但应继续遵守外部生产者的关闭顺序。
+| 路径 | 职责 |
+| --- | --- |
+| `src/core/common/` | DataBatch、Config、Status、JSON、日志 |
+| `src/core/memory/` | Arena、LockFreeQueue |
+| `src/core/engine/` | Pipeline、AsyncChannel、TimerWheel、InfrastructureManager、PidManager |
+| `src/core/threading/` | ThreadPool、线程工具 |
+| `src/plugin/api/` | 四类插件接口、Plugin API、eBPF Source 基类 |
+| `src/plugin/infra/` | Registry、Manager、SoLoader、内建注册 |
+| `src/plugin/sinks/recording_sink/` | `.ilr` 录制 |
+| `src/ebpf_common/` | 事件结构、loader 工具、feature probe |
+| `src/storage/` | StorageBackend、SQLite |
+| `src/cli/` | 最小宿主与 demo |
+| `src/*/test/` | GoogleTest 与 CLI 冒烟 |
 
-后续若引入 RuntimeContext、多实例隔离或调度句柄，应优先替换隐式全局依赖和裸指针回调，不改变批次处理语义。未解决的 ABI、热更新和并发输出问题见 [核心审阅](./10-core-audit-and-evolution.md)。
+## 10. 扩展边界
+
+新增插件时：
+
+1. 放在 `src/plugin/{sources,processors,aggregators,sinks}/` 下（当前目录只有 BUILD 占位）。
+2. 只依赖 `plugin/api` 和 `core/common`，不要依赖 `core/engine` 或 CLI。
+3. 在 `RegisterBuiltinPlugins()` 或独立注册入口显式注册，不要依赖链接器保留静态对象。
+4. 如果要做动态库，保持宿主与插件的工具链兼容。
+
+不要恢复已删除的 Server/Feature/Driver 层；当前目标是可独立嵌入的核心引擎。
+
+## 小结
+
+- Illuminator 是“宿主 + 共享基础设施 + 多条 Pipeline + 四类插件”的组合。
+- Host 负责组装、Init、调度和关闭；Pipeline 负责运行期数据路径。
+- TimerWheel、CollectPool、SinkPool 是共享资源；Channel 和 ProcessThread 是每 Pipeline 私有。
+- 构建上引擎依赖插件接口，概念上插件位于引擎之上。
+
+## 边界与后续
+
+- 没有统一的应用层 Feature/Driver 编排。
+- 动态库仍是 C++ SDK，不是跨工具链纯 C ABI。
+- StorageBackend 不自动接入 Pipeline。
+- 当前没有生产 eBPF 探针和前端。
+
+返回 [设计总览](./index.md) · 下一篇：[Pipeline v3 总览](./02-pipeline-v3/index.md)

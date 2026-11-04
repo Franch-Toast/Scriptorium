@@ -1,44 +1,86 @@
 ---
-title: 07 eBPF 公共采集设施
+title: 07 eBPF SDK
 date: 2026-11-04
-description: eBPF Source 基类、skeleton hooks、ring buffer 与 map 采集、内核能力探测、构建及真实探针验收要求。
+description: EbpfSourceBase 的骨架生命周期、hooks、ring buffer/Map 采集、内核能力探测、事件结构与构建规则。
 categories: [撰修司]
-tags: [Illuminator, eBPF, Source, Linux]
+tags: [Illuminator, eBPF, SourcePlugin, libbpf]
 ---
 
-# 07 eBPF 公共采集设施
+# 07 eBPF SDK
 
-当前保留的是 eBPF 插件开发设施：Source 基类、skeleton 回调、内核能力探测、map 与堆栈工具、BPF 兼容头和 Bazel 生成规则。具体 CPU 采集实现已删除，因此“SDK 可编译”与“真实探针可采样”需要分别验证。
+eBPF Source 与普通 Source 的区别在于数据来源：它从内核 ring buffer 和 BPF map 里取事件。为了不让每个探针重复写生命周期代码，Illuminator 提供了 `EbpfSourceBase`：
 
-返回 [设计总览](./index.md)。一般插件接口见 [03](./03-plugin-system.md)。
+```text
+框架 = 不变的生命周期 (open → load → attach → destroy)
+      + 可变的 hooks（子类填 open/attach/采集逻辑）
+```
 
-## 1. 组件关系
+返回 [设计总览](./index.md)。Pipeline 如何使用 Source 见 [02/08](./02-pipeline-v3/08-plugin-walkthrough.md)。
+
+## 1. 在整体架构中的位置
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
 ```mermaid
 %%{init: {"flowchart":{"useMaxWidth":false,"htmlLabels":false}}}%%
-flowchart TB
-    SRC[自定义 eBPF Source] --> BASE[EbpfSourceBase]
-    BASE --> API[SourcePlugin]
-    BASE --> SK[SkelCallbacks]
-    BASE --> RB[libbpf ring buffer]
-    BASE --> FEAT[KernelFeatures]
-    SRC --> UTIL[map / stats / stack 工具]
-    SK --> GEN[bpftool 生成 skeleton]
-    GEN --> OBJ[clang 生成 BPF 对象]
-    OBJ --> CODE[自定义 bpf.c]
-    BASE --> BATCH[DataBatch]
-    BATCH --> PIPE[Pipeline 通道]
+flowchart LR
+    K["内核探针<br/>eBPF program"] --> RB["ring buffer"]
+    K --> MAP["BPF maps"]
+    RB --> EB["EbpfSourceBase::Collect"]
+    MAP --> EB
+    EB --> DB["DataBatch"]
+    DB --> P["Pipeline"]
 ```
 
 </div>
 
-内核探测文件 `src/ebpf_common/loader/feature_probe.h` 中的 feature 指内核特性，不属于已移除的业务 Feature 系统。
+与 `/proc` 轮询 Source 相比：
 
-## 2. skeleton 生命周期
+| 维度 | `/proc` 轮询 | eBPF |
+| --- | --- | --- |
+| 数据频率 | 低（秒级） | 高（事件级） |
+| 权限 | 普通用户通常可读 | 需要 `CAP_BPF`/root |
+| 内核依赖 | 低 | 内核版本、BTF、libbpf |
+| 降级 | 无 | `stub_mode` |
 
-EbpfSourceBase 通过 SkelCallbacks 的 open/load/attach/destroy 函数操作生成的 skeleton。`IL_SKEL_CALLBACKS` 宏可为子类生成这些类型适配回调，避免公共基类依赖每个探针的具体 skeleton 类型。
+## 2. EbpfSourceBase 的 hooks
+
+| Hook | 必须 | 作用 |
+| --- | --- | --- |
+| `MakeSkelCallbacks()` | 是 | 返回 `open/load/attach/destroy` 函数指针 |
+| `OnConfigureRodata(void*)` | 否 | load 前写 rodata |
+| `OnConfigureMaps(void*)` | 否 | load 后配置 map，设置 ringbuf/gate/meta_stats fd |
+| `OnPostAttach(void*)` | 否 | attach 后额外挂载（如 perf_event） |
+| `OnPreDestroy()` | 否 | 停止时清理额外资源 |
+| `GetEventCallback()` | 否 | 返回 ring buffer 事件回调 |
+| `MakeEventBatch()` | 否 | 创建事件批次容器 |
+| `CollectFromMaps()` | 否 | 从 map 读聚合数据 |
+| `OnPause()` / `OnResume()` | 否 | 暂停/恢复的额外动作 |
+
+`IL_SKEL_CALLBACKS(prefix)` 宏为子类生成：
+
+- `skel_t` 类型别名
+- `skel()` 类型安全指针
+- `MakeSkelCallbacks()` 的标准实现
+
+```cpp
+class MyCpuSource : public EbpfSourceBase {
+public:
+    const char* Name() const override { return "cpu_sample"; }
+    const char* Version() const override { return "0.1.0"; }
+    IL_SKEL_CALLBACKS(my_cpu);
+
+protected:
+    void OnConfigureMaps(void* skel) override {
+        auto* s = static_cast<skel_t*>(skel);
+        SetRingBufFd(bpf_map__fd(s->maps.events));
+        SetGateFd(bpf_map__fd(s->maps.gate));
+        SetMetaStatsFd(bpf_map__fd(s->maps.meta_stats));
+    }
+};
+```
+
+## 3. Start 的标准序列
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
@@ -46,148 +88,214 @@ EbpfSourceBase 通过 SkelCallbacks 的 open/load/attach/destroy 函数操作生
 %%{init: {"sequence":{"useMaxWidth":false}}}%%
 sequenceDiagram
     participant H as Pipeline
-    participant B as EbpfSourceBase
-    participant D as 派生 Source hooks
-    participant S as skeleton / libbpf
-    H->>B: Start()
-    B->>B: 检查内核能力
-    B->>S: open()
-    B->>D: OnConfigureRodata(skel)
-    B->>S: load()
-    B->>D: OnConfigureMaps(skel)
-    B->>S: attach()
-    B->>D: OnPostAttach(skel)
-    B->>S: 有 fd 与回调时创建 ring buffer
-    B->>B: running=true，开启 gate
-    B-->>H: Status
+    participant E as EbpfSourceBase
+    participant K as 内核/libbpf
+    H->>E: Start()
+    E->>E: ProbeKernelFeatures()
+    alt 不支持 BPF tracing
+        E->>E: stub_mode_=true
+        E-->>H: Ok（降级）
+    else 支持
+        E->>K: open()
+        E->>E: OnConfigureRodata()
+        E->>K: load()
+        E->>E: OnConfigureMaps()
+        E->>K: attach()
+        E->>E: OnPostAttach()
+        E->>K: ring_buffer__new()
+        E->>E: running=true, gate=true
+        E-->>H: Ok
+    end
 ```
 
 </div>
 
-| Hook | 时机 | 典型职责 |
-| --- | --- | --- |
-| MakeSkelCallbacks | 启停时 | 返回 skeleton 操作函数 |
-| OnConfigureRodata | open 后、load 前 | 采样频率、只读参数 |
-| OnConfigureMaps | load 后、attach 前 | 初始 map 内容，设置 gate、stats、ringbuf fd |
-| OnPostAttach | attach 后 | 附加 perf_event 等额外资源 |
-| OnPreDestroy | Stop 时、skeleton 销毁前 | 关闭派生类额外资源 |
-| GetEventCallback / MakeEventBatch | 消费事件前 | 定义事件转换和目标批次 |
-| CollectFromMaps | 每次 Collect | 读取聚合 map 并生成批次 |
-| OnPause / OnResume | 暂停 / 恢复 | 子类附加控制逻辑 |
+失败语义并不统一：
 
-公共基类在 load、attach 或 ring buffer 初始化失败时销毁 skeleton 并返回错误。派生 hook 创建的额外资源仍需设计失败回滚，不能只依赖正常 Stop 才清理。
-
-## 3. 统一 Pull 采集路径
-
-<div style="overflow-x: auto; margin: 1.5rem 0;">
-
-```mermaid
-%%{init: {"flowchart":{"useMaxWidth":false,"htmlLabels":false}}}%%
-flowchart LR
-    K[内核 BPF 程序] --> R[ring buffer]
-    K --> M[BPF maps]
-    T[TimerWheel] --> C[CollectPool]
-    C --> B[EbpfSourceBase Collect]
-    R --> E[ring_buffer consume 与回调]
-    B --> E
-    E --> EB[event_batch]
-    B --> CM[CollectFromMaps]
-    M --> CM
-    CM --> MB[map_result]
-    EB --> SEL{事件批非空?}
-    MB --> SEL
-    SEL -- 是 --> OE[返回 event_batch]
-    SEL -- 否 --> OM[返回 map_result]
-```
-
-</div>
-
-当前 ring buffer 在 Collect 内主动 consume，没有独立轮询线程，也没有把全部 ring buffer fd 接入统一 epoll。消费频率受 Timer、CollectPool 和 Source interval 影响。
-
-事件回调使用 pending_batch_ 累积数据，临时事件内存不能被 string_view 长期引用，需复制到批次 Arena。同一 Source 的 Collect 不可重叠，否则 pending_batch_ 和读 map 状态可能竞争。
-
-### 3.1 事件与 map 同时启用的限制
-
-当前先执行 CollectFromMaps，再在 event_batch 非空时直接返回事件批次。此时 map_result 中的数据或错误会被丢弃，并未进行合并。若 map 读取同时清除了内核数据，影响可能更大。
-
-在定义并验证合并策略前，不应假设一个混合 Source 能完整输出两类数据。可暂时将实现约束为单一通路；后续再设计合并批次、多个输出批次或不同 Pipeline 的方案，并补齐错误传播。
-
-## 4. 能力探测与 Stub
-
-KernelFeatures 读取 `/sys/kernel/btf/vmlinux` 判断 BTF 可读性，并解析 `/proc/version`，按版本推断 tracing 与 ring buffer 能力。它不是对所有内核配置、权限、helper、attach 类型和 verifier 行为的完整探测。
-
-<div style="overflow-x: auto; margin: 1.5rem 0;">
-
-```mermaid
-%%{init: {"state":{"useMaxWidth":false}}}%%
-stateDiagram-v2
-    [*] --> Checking
-    Checking --> Stub: tracing 不支持或 skeleton open 失败
-    Checking --> Loading: 初步能力满足且 open 成功
-    Loading --> Failed: load / attach / 初始化失败
-    Loading --> Active: 正常启动
-    Active --> Paused: gate 关闭
-    Paused --> Active: gate 开启
-    Active --> Stopped: 关闭 gate 并清理资源
-    Paused --> Stopped: 清理资源
-    Stub --> Stopped: 停止
-```
-
-</div>
-
-缺少 tracing 或 skeleton open 失败可能进入 Stub 并返回 OK；Stub 的 Collect 返回空指标批次。宿主必须查看 IsStub，不能将 Start 成功解释为真实数据链路成功。
-
-版本判断也不提供自动 perf buffer 回退实现。新探针需要自行明确最低内核、BTF、能力和权限要求，并在不满足时选择报错或显式降级。
-
-## 5. 暂停与停止
-
-Pause 关闭 gate、设置暂停标记并调用 OnPause；Resume 调用 OnResume 并重新开启 gate。gate 的具体效果依赖 BPF 程序检查相应 map，公共基类不会自动修改任意内核程序。
-
-Stop 先关闭 gate，再调用 OnPreDestroy，释放 ring buffer、destroy skeleton，并重置缓存 fd。关闭前必须让宿主所有 Collect 已结束；running 原子标志无法防止一个已经执行的 ring_buffer__consume 使用被释放的对象。
-
-同理，PidManager 绑定的 BPF map fd 必须在 skeleton 销毁前撤销使用。map fd 是资源引用，不因保存一个整数就延长其有效寿命。
-
-## 6. 公共工具与构建
-
-| 路径 | 职责 |
+| 阶段 | 失败行为 |
 | --- | --- |
-| `src/ebpf_common/include/bpf_compat.h` | 统一兼容系统 BPF / libbpf 头文件 |
-| `include/common.bpf.h`、`event_types.h` | BPF 公共定义与事件布局 |
-| `loader/bpf_util.h` | map、gate 等用户态操作 |
-| `loader/bpf_stats_reader.h` | 汇总 PERCPU_ARRAY 自观测计数 |
-| `loader/stack_trace_util.h` | 栈数据读取和转换 |
-| `loader/feature_probe.h` | 内核能力信息 |
-| `src/plugin/common/stack_symbol_resolver.h` | proc maps、ELF 符号及地址解析公共工具 |
-| `src/ebpf_common/bpf_probe.bzl` | BPF 对象和 skeleton 生成规则 |
+| 无 BPF tracing | 进入 stub，返回 Ok |
+| `open` 失败 | 进入 stub，返回 Ok |
+| `load` / `attach` / `OnPostAttach` / ring buffer 失败 | destroy 并返回错误 |
+
+因此 **`Start()` 返回 Ok 不等于真实探针在工作**；必须检查 `IsStub()`。
+
+## 4. Collect 的路径
+
+```cpp
+StatusOr<DataBatchPtr> Collect() override {
+    if (stub_mode_) return make_shared<DataBatch>(kMetrics);
+
+    DataBatchPtr event_batch;
+    if (ring_buf_) {
+        if (GetEventCallback()) {
+            pending_batch_ = MakeEventBatch();
+            ring_buffer__consume(ring_buf_);
+            event_batch = std::move(pending_batch_);
+            pending_batch_ = nullptr;
+        } else {
+            ring_buffer__consume(ring_buf_);   // 没有回调，消费后丢弃
+        }
+    }
+
+    auto map_result = CollectFromMaps();
+
+    if (event_batch && !event_batch->Empty()) {
+        return event_batch;   // map_result 被丢弃
+    }
+    return map_result;
+}
+```
 
 <div style="overflow-x: auto; margin: 1.5rem 0;">
 
 ```mermaid
 %%{init: {"flowchart":{"useMaxWidth":false,"htmlLabels":false}}}%%
-flowchart LR
-    C[探针 bpf.c 与公共头] --> CL[clang -target bpf -O2 -g]
-    CL --> O[bpf.o]
-    O --> BP[bpftool gen skeleton]
-    BP --> H[skel.h]
-    H --> CPP[C++ 派生 Source]
-    CPP --> LIB[内建目标或动态库]
+flowchart TD
+    A["Collect()"] --> B{"stub_mode?"}
+    B -- 是 --> C["返回空 kMetrics batch"]
+    B -- 否 --> D{"ring_buf_?"}
+    D -- 是 --> E{"GetEventCallback?"}
+    E -- 是 --> F["MakeEventBatch + consume"]
+    E -- 否 --> G["consume 但丢弃事件"]
+    D -- 否 --> H["跳过 ring buffer"]
+    F --> I["CollectFromMaps()"]
+    G --> I
+    H --> I
+    I --> J{"event_batch 非空?"}
+    J -- 是 --> K["返回 event_batch<br/>map_result 丢弃"]
+    J -- 否 --> L["返回 map_result"]
 ```
 
 </div>
 
-bpf_probe 生成 `.bpf.o`；bpf_skeleton 进一步生成 skeleton 及 cc_library 包装。规则默认 arch=x86，可显式传入架构。当前编译使用系统 clang、系统 include 和 bpftool；`.bazelrc` 配置 BPF_CLANG。它不是完全封闭的跨平台工具链。
+两个重要限制：
 
-vmlinux 头、BPF 事件结构、用户态解码与工具版本必须协调。CO-RE/BTF 可以缓解内核布局差异，但不保证任意内核上的挂载点、helper 和权限都满足。
+1. **事件批次非空时，map 结果（包括错误）被丢弃。**
+2. `GetEventCallback() == nullptr` 时，如果 `ring_buf_` 存在，仍会消费事件并丢弃。
 
-## 7. 真实探针接入验收
+## 5. 事件结构
 
-后续新增探针至少验证：
+`src/ebpf_common/include/event_types.h` 定义了内核/用户态共享结构：
 
-1. 目标内核与权限下 load/attach 成功，IsStub=false，确实收到预期数据。
-2. 用户态事件结构与内核布局一致，时间转换、PID、CPU 和单位正确。
-3. ring buffer 满、过滤和丢弃有可读计数，采集频率变化时数据语义可解释。
-4. map 读取是否清空、重复采样是否重计、与事件通路如何合并有明确定义。
-5. 暂停恢复、进程退出、PID 复用和信号停机后没有残留资源访问。
-6. 符号解析使用匹配版本的二进制；保留 frame pointer 并实测用户栈覆盖率。
+| 结构 | 用途 | 关键字段 |
+| --- | --- | --- |
+| `il_pidns_config` | PID namespace 过滤 | `dev`, `ino` |
+| `il_stack_key` | 栈聚合键 | `pid`, `tid`, `kernel_stack_id`, `user_stack_id`, `comm` |
+| `il_cpu_sample_event` | CPU 采样 | `timestamp_ns`, `pid`, `tid`, `cpu`, `comm`, 栈 ID |
+| `il_mem_event` | 内存分配/释放 | `addr`, `size`, `alloc` |
+| `il_net_event` | 网络连接 | `saddr`, `daddr`, `sport`, `dport`, `protocol`, `event_type` |
+| `il_bio_event` | 块 IO | `sector`, `nr_sector`, `dev`, `latency_ns`, `rwflag` |
+| `il_sched_event` | 调度事件 | `prev/next pid/tid/comm`, `cpu`, `latency_ns`, `event_type` |
+| `il_offcpu_event` | Off-CPU | `duration_ns`, 栈 ID, `comm` |
+| `il_sched_stats` | 调度聚合 | `switch_count`, `total/max_runqueue_latency_ns`, `migrate_count` |
 
-当前测试中的真实 `.so` Source 是合成数据，只借助包含 EbpfSourceBase 头提供 SDK 编译覆盖，不能替代上述内核实机验证。未来的统一 poll、批量 map 读取和生产探针集合仍属于演进工作。
+常量：
+
+- `MAX_STACK_DEPTH = 127`
+- `TASK_COMM_LEN = 16`
+
+这些结构必须同时兼容 BPF C 和 C++ 编译器，因此只能使用固定大小整数，不能有指针、`std::string` 或动态容器。
+
+## 6. 用户态转换
+
+| 工具 | 作用 |
+| --- | --- |
+| `LookupBpfStackTrace(stacks_fd, stack_id)` | 从 stack trace map 读取地址，生成 `StackFrame` |
+| `IsCanonicalAddress(addr)` | 过滤非法地址 |
+| `ReadBpfMetaStats(fd)` | 读取 ring buffer 溢出/丢弃/过滤计数 |
+| `PidManager` | 维护目标 PID 并同步 BPF map |
+| `bpf_util.h` | PID/comm 过滤、perf_event 等辅助 |
+
+`LookupBpfStackTrace` 只填 `address`，不会自动符号化；函数名、文件名、行号需要另做符号解析。
+
+事件内存必须复制进 `DataBatch` 的 Arena：ring buffer 的内存只在回调期间有效，不能直接把指针/`string_view` 留到批次里。
+
+## 7. KernelFeatures 与 stub
+
+```cpp
+struct KernelFeatures {
+    bool has_btf;
+    bool has_ringbuf;      // >= 5.8
+    bool has_bpf_tracing;  // >= 4.14
+    int major, minor, patch;
+};
+```
+
+`ProbeKernelFeatures()`：
+
+1. 检查 `/sys/kernel/btf/vmlinux`。
+2. 从 `/proc/version` 解析主/次/修订版本。
+3. `has_ringbuf = major>5 || (major==5 && minor>=8)`。
+4. `has_bpf_tracing = major>4 || (major==4 && minor>=14)`。
+
+stub 模式：
+
+- `IsStub() == true`
+- `HasBpfProbe() == false`
+- `Collect()` 返回空 `kMetrics` 批次
+- `Pause/Resume` 直接返回 Ok
+
+展示层必须把 stub 标为“降级运行”，不能显示为正常采样。
+
+## 8. 构建
+
+`src/ebpf_common/bpf_probe.bzl` 提供两个规则：
+
+### 8.1 `bpf_probe`
+
+```python
+bpf_probe(
+    name = "my_probe",
+    src = "my_probe.bpf.c",
+    arch = "x86",
+)
+```
+
+执行：
+
+```bash
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
+  -Isrc/ebpf_common/include -isystem /usr/include \
+  -c my_probe.bpf.c -o my_probe.bpf.o
+```
+
+### 8.2 `bpf_skeleton`
+
+生成三个目标：
+
+- `<name>_bpf`：`.bpf.o`
+- `<name>_skel_gen`：`.skel.h`（`bpftool gen skeleton`）
+- `<name>_skel`：包装头文件的 `cc_library`
+
+依赖：
+
+- `clang`（可用 `BPF_CLANG` 覆盖）
+- `bpftool`（可用 `BPF_BPFTOOL` 覆盖）
+- `libbpf-dev`、`libelf-dev`、`zlib1g-dev`
+- `vmlinux.h`、`common.bpf.h`、`event_types.h`
+
+架构通过 `arch` 参数传给 `-D__TARGET_ARCH_<arch>`。
+
+## 9. 接入验收清单
+
+1. `Start()` 返回 Ok 后检查 `IsStub()`。
+2. `OnConfigureMaps` 是否正确设置 ringbuf/gate/meta_stats fd。
+3. ring buffer 回调是否把事件复制进批次 Arena。
+4. 事件批次非空时，确认 map 数据被丢弃是否可以接受。
+5. `GetEventCallback()` 为空时，是否真的不需要 ring buffer。
+6. `Stop()` 是否先关 gate，再 free ring buffer、destroy skeleton。
+7. 权限：`CAP_BPF`/root、`RLIMIT_MEMLOCK`、`perf_event_paranoid`。
+8. 内核：BTF、ring buffer、目标 hook 是否存在。
+9. 符号化：是否单独实现，不要假设 `LookupBpfStackTrace` 会解析函数名。
+10. 压测：高事件率下 ring buffer 是否溢出，`MetaStats` 是否增长。
+
+## 10. 边界与后续
+
+- 当前仓库没有生产 eBPF 探针；SDK 可编译不等于内核可采样。
+- `Collect` 的事件/map 二选一逻辑会丢 map 结果。
+- stub 与失败语义不一致：open 失败降级，load/attach 失败报错。
+- 没有 perf buffer 回退实现；`has_ringbuf` 只是能力标志。
+- 没有内置符号化、build-id 捕获或跨内核 CO-RE 验证流程。
+
+返回 [设计总览](./index.md) · 上一篇：[调度与自观测](./06-scheduling-and-observability.md) · 下一篇：[录制与存储](./08-recording-and-storage.md)
