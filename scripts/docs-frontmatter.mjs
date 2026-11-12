@@ -30,7 +30,7 @@ function listMarkdownFiles(root) {
   const visit = current => {
     for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const file = path.join(current, entry.name);
-      if (entry.isDirectory()) visit(file);
+      if (entry.isDirectory() && entry.name !== "assets") visit(file);
       else if (entry.isFile() && entry.name.endsWith(".md") && entry.name !== "index.md") files.push(file);
     }
   };

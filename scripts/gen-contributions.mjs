@@ -12,6 +12,7 @@ const outDir = path.join(repoRoot, ".vitepress", "generated");
 // 内容文档口径：docs/ 下除功能页(@pages)、站点页(index/about)与各库目录首页外的 md
 function isContentDoc(file) {
   const rel = file.slice(5); // 去掉 "docs/"
+  if (rel.split("/").includes("assets")) return false;
   if (rel.startsWith("@pages/") || rel === "index.md" || rel === "about.md") return false;
   if (rel.endsWith("/index.md")) return false;
   return true;

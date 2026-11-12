@@ -3,11 +3,21 @@ import { generateSidebar } from "vitepress-sidebar";
 import { createRewrites } from "vitepress-plugin-permalink";
 import { withMermaid } from "vitepress-plugin-mermaid";
 import { defineTeekConfig } from "vitepress-theme-teek/config";
+import { cp, mkdir, readdir } from "node:fs/promises";
+import { join, relative } from "node:path";
 
 // Teek 主题配置：关闭博客风首页，保留 VitePress 原生 Hero 落地页
 const teekConfig = defineTeekConfig({
   teekHome: false,
   vpHome: true,
+  vitePlugins: {
+    sidebarOption: { ignoreList: ["assets"] },
+    permalinkOption: { ignoreList: ["assets"] },
+    mdH1Option: { ignoreList: ["assets"] },
+    docAnalysisOption: { ignoreList: ["assets"] },
+    catalogueOption: { ignoreList: ["assets"] },
+    fileContentLoaderIgnore: ["**/assets/**"],
+  },
 });
 
 // 六大分区定义（藏经阁导航与各库侧边栏共用的单一事实来源）
@@ -40,6 +50,8 @@ function libSidebar(dir: string, title: string) {
       // 相对项目根（构建 cwd）；scanStartPath 相对它解析，最终指向 docs/document/<分区>
       documentRootPath: "docs",
       scanStartPath: libPath,
+      // assets 只保存正文引用的材料，不生成侧边栏目录或文章条目。
+      excludeByGlobPattern: ["**/assets", "**/assets/**"],
       useTitleFromFrontmatter: true,
       useFolderTitleFromIndexFile: true,
       // 目录节点链接到其 index.md：点击目录名进入该目录的显示页；
@@ -84,12 +96,33 @@ export default withMermaid(
     extends: teekConfig,
   // 内容目录（相对 VitePress root=项目根）：docs 只放页面与文档内容，工程全部在根 .vitepress
   srcDir: "docs",
+  srcExclude: ["**/assets/**"],
+  // 附件链接保留相对路径；非 Markdown 材料原样复制到产物对应位置。
+  async buildEnd(siteConfig) {
+    async function copyAssets(dir: string) {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const source = join(dir, entry.name);
+        if (entry.name === "assets") {
+          const target = join(siteConfig.outDir, relative(siteConfig.srcDir, source));
+          await mkdir(target, { recursive: true });
+          await cp(source, target, {
+            recursive: true,
+            filter: path => !/\.md$/i.test(path),
+          });
+        } else {
+          await copyAssets(source);
+        }
+      }
+    }
+    await copyAssets(join(siteConfig.srcDir, "document"));
+  },
   // 依赖缓存显式指回根 .vitepress（VitePress 默认会落在 srcDir 下的 .vitepress/cache）
   cacheDir: ".vitepress/cache",
   // 功能页 permalink（/archives、/catalogue*）落地为根路径物理文件：
   // Teek 的 permalink 插件仅在 dev 模式拦截，纯静态托管（GitHub Pages）下会 404，
   // 这里改用其 createRewrites 生成 VitePress 原生 rewrites，dev/build 均生效
-  rewrites: createRewrites({ srcDir: "docs" }),
+  rewrites: createRewrites({ srcDir: "docs", ignoreList: ["assets"] }),
   lang: "zh-CN",
   title: "Scriptorium",
   description: "个人文档知识库 —— 收集、整理、沉淀，让知识在时间线上生长",
