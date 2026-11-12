@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 440" role="img" aria-labelledby="title desc">
+<title id="title">同一片道路，可以建立不同候选资料夹</title><desc id="desc">可通行区域中两条示意参考曲线关联同一障碍物，候选资料夹分别保存几何、对象、决策、路径与速度。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+<style>text{font-family:system-ui,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d;font-size:20px} .small{font-size:17px} .head{font-size:26px;font-weight:650} .muted{fill:#475569} .axis{stroke:#475569;stroke-width:2;marker-end:url(#arrow)} .blue{stroke:#2563eb;stroke-width:4;fill:none} .green{stroke:#15803d;stroke-width:5;fill:none} .orange{fill:#ffedd5;stroke:#c2410c;stroke-width:2} .dash{stroke-dasharray:10 8}</style>
+<rect width="1100" height="440" rx="16" fill="#f8fafc"/><text x="35" y="43" class="head">同一片道路，可以建立不同候选资料夹</text>
+<path d="M55 350 V150 C350 150 520 60 740 105 L770 290 C520 255 330 350 55 350" fill="#dbeafe" stroke="#64748b" stroke-width="3"/>
+<path d="M70 260 C340 260 490 150 740 190" class="blue dash"/>
+<path d="M70 260 C350 260 520 225 740 245" stroke="#7c3aed" stroke-width="4" fill="none" stroke-dasharray="10 8"/>
+<rect x="400" y="210" width="85" height="45" rx="5" class="orange"/>
+<text x="90" y="130">候选 A：蓝线</text><text x="90" y="320">候选 B：紫线</text>
+<rect x="800" y="100" width="260" height="110" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+<text x="820" y="133">资料夹 A</text><text x="820" y="166" class="small">几何、对象关联、决策</text><text x="820" y="194" class="small">路径、速度、轨迹、代价</text>
+<rect x="800" y="235" width="260" height="110" rx="10" fill="#f5f3ff" stroke="#7c3aed"/>
+<text x="820" y="269">资料夹 B</text><text x="820" y="301" class="small">同一对象在此候选中</text><text x="820" y="328" class="small">可能有不同投影与影响</text>
+<text x="55" y="410" class="small">浅蓝表示教学用可通行区域。候选几何仍需后续约束、对象关联与有效性判断。</text>
+</svg>

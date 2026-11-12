@@ -1,0 +1,55 @@
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
+#include <benchmark/benchmark.h>
+
+#include "base/synchronization/condition_variable.h"
+
+using namespace deeproute::base;
+
+template <typename ConditionVariableType>
+static void BM_PingPong(benchmark::State& state) {
+  ConditionVariableType cv1, cv2;
+  std::mutex mutex;
+  bool data_ready = false;
+  bool should_exit = false;
+  size_t counter = 0;
+  const size_t iterations_per_test = 10000;
+
+  std::thread pong([&]() {
+    while (!should_exit) {
+      std::unique_lock<std::mutex> lock(mutex);
+      cv2.wait(lock, [&]() { return data_ready || should_exit; });
+      if (should_exit) break;
+      data_ready = false;
+      cv1.notify_one();
+    }
+  });
+
+  for (auto _ : state) {
+    counter = 0;
+    while (counter < iterations_per_test) {
+      std::unique_lock<std::mutex> lock(mutex);
+      cv1.wait(lock, [&]() { return !data_ready; });
+      data_ready = true;
+      counter++;
+      cv2.notify_one();
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    should_exit = true;
+    data_ready = true;
+  }
+  cv2.notify_one();
+  pong.join();
+
+  state.SetItemsProcessed(state.iterations() * iterations_per_test);
+}
+
+BENCHMARK_TEMPLATE(BM_PingPong, std::condition_variable);
+BENCHMARK_TEMPLATE(BM_PingPong, ConditionVariable);
+
+BENCHMARK_MAIN();

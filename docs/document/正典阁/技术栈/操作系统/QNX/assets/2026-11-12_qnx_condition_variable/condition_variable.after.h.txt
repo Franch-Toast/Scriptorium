@@ -1,0 +1,259 @@
+// Copyright 2024 Deeproute.ai. All Rights Reserved.
+
+#pragma once
+
+#include <pthread.h>
+
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <system_error>
+#include <utility>
+
+namespace deeproute::base {
+namespace detail {
+
+// Both platforms preserve the native CLOCK_MONOTONIC wait path and pass the
+// caller's mutex directly to pthread, including RealtimeMutex's PI mutex.
+class MonotonicConditionVariable {
+ public:
+  MonotonicConditionVariable() {
+    pthread_condattr_t attr;
+    int result = pthread_condattr_init(&attr);
+    if (result != 0) {
+      throw std::system_error(result, std::system_category(),
+                              "Failed to initialize condition attributes");
+    }
+    result = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (result == 0) {
+      result = pthread_cond_init(&cv_, &attr);
+    }
+    pthread_condattr_destroy(&attr);
+    if (result != 0) {
+      throw std::system_error(result, std::system_category(),
+                              "Failed to initialize condition variable");
+    }
+  }
+  ~MonotonicConditionVariable() { pthread_cond_destroy(&cv_); }
+  MonotonicConditionVariable(const MonotonicConditionVariable&) = delete;
+  MonotonicConditionVariable& operator=(const MonotonicConditionVariable&) =
+      delete;
+
+  template <typename Mutex>
+  void wait(std::unique_lock<Mutex>& lock) {
+    pthread_cond_wait(&cv_, lock.mutex()->native_handle());
+  }
+
+  template <typename Mutex, typename Predicate>
+  void wait(std::unique_lock<Mutex>& lock, Predicate predicate) {
+    while (!predicate()) {
+      wait(lock);
+    }
+  }
+
+  template <typename Mutex>
+  bool wait_for(std::unique_lock<Mutex>& lock,
+                const std::chrono::nanoseconds& duration) {
+    return TimedWait(lock, DeadlineAfter(duration));
+  }
+
+  template <typename Mutex, typename Predicate>
+  bool wait_for(std::unique_lock<Mutex>& lock,
+                const std::chrono::nanoseconds& duration, Predicate predicate) {
+    return TimedWait(lock, DeadlineAfter(duration), std::move(predicate));
+  }
+
+  template <typename Mutex>
+  bool wait_until(std::unique_lock<Mutex>& lock,
+                  const std::chrono::steady_clock::time_point& deadline) {
+    return TimedWait(lock, DeadlineAt(deadline));
+  }
+
+  template <typename Mutex, typename Predicate>
+  bool wait_until(std::unique_lock<Mutex>& lock,
+                  const std::chrono::steady_clock::time_point& deadline,
+                  Predicate predicate) {
+    return TimedWait(lock, DeadlineAt(deadline), std::move(predicate));
+  }
+
+  void notify_one() noexcept { pthread_cond_signal(&cv_); }
+  void notify_all() noexcept { pthread_cond_broadcast(&cv_); }
+
+ private:
+  static timespec DeadlineAfter(const std::chrono::nanoseconds& duration) {
+    timespec deadline = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    // Truncate before subtracting: flooring the minimum duration could
+    // overflow when converting its seconds component back to nanoseconds.
+    const auto seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(duration);
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        duration - seconds);
+    deadline.tv_sec += seconds.count();
+    deadline.tv_nsec += static_cast<long>(nanos.count());
+    if (deadline.tv_nsec >= 1000000000L) {
+      ++deadline.tv_sec;
+      deadline.tv_nsec -= 1000000000L;
+    } else if (deadline.tv_nsec < 0) {
+      --deadline.tv_sec;
+      deadline.tv_nsec += 1000000000L;
+    }
+    return deadline;
+  }
+
+  static timespec DeadlineAt(
+      const std::chrono::steady_clock::time_point& deadline) {
+    const auto duration = deadline.time_since_epoch();
+    const auto seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(duration);
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        duration - seconds);
+    timespec timeout = {static_cast<time_t>(seconds.count()),
+                        static_cast<long>(nanos.count())};
+    if (timeout.tv_nsec < 0) {
+      --timeout.tv_sec;
+      timeout.tv_nsec += 1000000000L;
+    }
+    return timeout;
+  }
+
+  template <typename Mutex>
+  bool TimedWait(std::unique_lock<Mutex>& lock, const timespec& deadline) {
+    return pthread_cond_timedwait(&cv_, lock.mutex()->native_handle(),
+                                  &deadline) == 0;
+  }
+
+  template <typename Mutex, typename Predicate>
+  bool TimedWait(std::unique_lock<Mutex>& lock, const timespec& deadline,
+                 Predicate predicate) {
+    while (!predicate()) {
+      if (!TimedWait(lock, deadline)) {
+        // The predicate can become true while this thread reacquires the
+        // mutex after a timeout; inspect it once more under the lock.
+        return predicate();
+      }
+    }
+    return true;
+  }
+
+  pthread_cond_t cv_;
+};
+
+// A backend parameter allows host tests to run the actual QNX wait path and
+// record notifications at the boundary before pthread_cond_signal/broadcast.
+template <typename Backend>
+class WaiterAwareConditionVariable {
+ public:
+  WaiterAwareConditionVariable() = default;
+  WaiterAwareConditionVariable(const WaiterAwareConditionVariable&) = delete;
+  WaiterAwareConditionVariable& operator=(const WaiterAwareConditionVariable&) =
+      delete;
+
+  template <typename Mutex>
+  void wait(std::unique_lock<Mutex>& lock) {
+    WaitRegistration registration(waiters_);
+    cv_.wait(lock);
+  }
+
+  template <typename Mutex, typename Predicate>
+  void wait(std::unique_lock<Mutex>& lock, Predicate predicate) {
+    WaitRegistration registration(waiters_);
+    cv_.wait(lock, std::move(predicate));
+  }
+
+  template <typename Mutex>
+  bool wait_for(std::unique_lock<Mutex>& lock,
+                const std::chrono::nanoseconds& duration) {
+    WaitRegistration registration(waiters_);
+    return cv_.wait_for(lock, duration);
+  }
+
+  template <typename Mutex, typename Predicate>
+  bool wait_for(std::unique_lock<Mutex>& lock,
+                const std::chrono::nanoseconds& duration, Predicate predicate) {
+    WaitRegistration registration(waiters_);
+    return cv_.wait_for(lock, duration, std::move(predicate));
+  }
+
+  template <typename Mutex>
+  bool wait_until(std::unique_lock<Mutex>& lock,
+                  const std::chrono::steady_clock::time_point& deadline) {
+    WaitRegistration registration(waiters_);
+    return cv_.wait_until(lock, deadline);
+  }
+
+  template <typename Mutex, typename Predicate>
+  bool wait_until(std::unique_lock<Mutex>& lock,
+                  const std::chrono::steady_clock::time_point& deadline,
+                  Predicate predicate) {
+    WaitRegistration registration(waiters_);
+    return cv_.wait_until(lock, deadline, std::move(predicate));
+  }
+
+  void notify_one() noexcept {
+    if (waiters_.load() != 0) {
+      cv_.notify_one();
+    }
+  }
+
+  void notify_all() noexcept {
+    if (waiters_.load() != 0) {
+      cv_.notify_all();
+    }
+  }
+
+ private:
+  class WaitRegistration {
+   public:
+    explicit WaitRegistration(std::atomic<unsigned>& waiters)
+        : waiters_(waiters) {
+      // Register under the predicate mutex before the native wait unlocks it.
+      // A producer changing the predicate under that mutex cannot miss this
+      // registration, including when it notifies after releasing the mutex.
+      waiters_.fetch_add(1);
+    }
+    ~WaitRegistration() { waiters_.fetch_sub(1); }
+    WaitRegistration(const WaitRegistration&) = delete;
+    WaitRegistration& operator=(const WaitRegistration&) = delete;
+
+   private:
+    std::atomic<unsigned>& waiters_;
+  };
+
+  // Count whole wait calls, including predicate loops and mutex reacquisition.
+  // Overcounting may cause an extra notify, but must not skip a required one.
+  // RAII unregisters on normal return, timeout, and predicate exceptions.
+  std::atomic<unsigned> waiters_{0};
+  Backend cv_;
+};
+
+}  // namespace detail
+
+// Supports std::mutex and RealtimeMutex. Timed waits retain the existing bool
+// API: raw waits report notification/spurious wakeup (true) versus timeout
+// (false); predicate waits report the final predicate value.
+//
+// Read AND modify the predicate under the same mutex passed to wait(). All
+// waits and notifications must finish before destruction. QNX registration
+// remains active until the waiter has reacquired that mutex and returned.
+// Native waits must not bypass registration, so no native handle is exposed.
+// Both platforms use native CLOCK_MONOTONIC waits with the caller's mutex.
+// Only QNX skips notifications when no wait call is active. Spurious wakes are
+// allowed on either platform. See condition_variable.md for usage/lifetime.
+class ConditionVariable
+#if defined(__QNX__) || defined(__QNXNTO__)
+    : public detail::WaiterAwareConditionVariable<
+          detail::MonotonicConditionVariable> {
+#else
+    : public detail::MonotonicConditionVariable {
+#endif
+ public:
+  ConditionVariable() = default;
+  ~ConditionVariable() = default;
+  ConditionVariable(const ConditionVariable&) = delete;
+  ConditionVariable& operator=(const ConditionVariable&) = delete;
+  ConditionVariable(ConditionVariable&&) = delete;
+  ConditionVariable& operator=(ConditionVariable&&) = delete;
+};
+
+}  // namespace deeproute::base

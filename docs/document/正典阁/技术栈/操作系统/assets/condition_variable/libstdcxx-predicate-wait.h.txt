@@ -1,0 +1,47 @@
+   *
+   * Classes for condition_variable support.
+   * @{
+   */
+
+  /// cv_status
+  enum class cv_status { no_timeout, timeout };
+
+  /// condition_variable
+  class condition_variable
+  {
+    using steady_clock = chrono::steady_clock;
+    using system_clock = chrono::system_clock;
+#ifdef _GLIBCXX_USE_PTHREAD_COND_CLOCKWAIT
+    using __clock_t = steady_clock;
+#else
+    using __clock_t = system_clock;
+#endif
+
+    __condvar _M_cond;
+
+  public:
+    typedef __gthread_cond_t* 		native_handle_type;
+
+    condition_variable() noexcept;
+    ~condition_variable() noexcept;
+
+    condition_variable(const condition_variable&) = delete;
+    condition_variable& operator=(const condition_variable&) = delete;
+
+    void
+    notify_one() noexcept;
+
+    void
+    notify_all() noexcept;
+
+    void
+    wait(unique_lock<mutex>& __lock) noexcept;
+
+    template<typename _Predicate>
+      void
+      wait(unique_lock<mutex>& __lock, _Predicate __p)
+      {
+	while (!__p())
+	  wait(__lock);
+      }
+

@@ -1,0 +1,134 @@
+load("@deeproute_build_tools//rules/modules:common_cc_wrapper.bzl", "common_cc_library", "common_cc_binary", "common_cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+package(default_visibility = ["//visibility:public"])
+
+common_cc_library(
+    name = "mutex",
+    srcs = [
+        "mutex.cc",
+    ],
+    hdrs = [
+        "mutex.h",
+    ],
+)
+
+common_cc_test(
+    name = "mutex_test",
+    size = "small",
+    srcs = ["mutex_test.cc"],
+    deps = [
+        ":mutex",
+        "@gtest//:gtest_main",
+    ],
+    linkstatic = True,
+    copts = ["-g"],  # Optional: include debug symbols for better coverage report
+)
+
+common_cc_library(
+    name = "condition_variable",
+    hdrs = ["condition_variable.h"],
+)
+
+common_cc_test(
+    name = "condition_variable_test",
+    size = "small",
+    srcs = [
+        "condition_variable_test.cc",
+    ],
+    deps = [
+        ":condition_variable",
+        ":mutex",
+        "@gtest//:gtest_main",
+    ],
+    linkstatic = True,
+)
+
+common_cc_library(
+    name = "gate",
+    hdrs = ["gate.h"],
+)
+
+pkg_tar(
+    name = "condition_variable-hdrs",
+    srcs = ["condition_variable.h"],
+    package_dir = "synchronization",
+)
+
+common_cc_test(
+    name = "gate_test",
+    size = "small",
+    srcs = ["gate_test.cc"],
+    deps = [
+        ":gate",
+        "@gtest//:gtest_main",
+    ],
+    linkstatic = True,
+)
+
+common_cc_library(
+    name = "semaphore",
+    hdrs = [
+        "semaphore.h",      
+    ],
+    deps = [
+        "//common:macros",
+        "//common:log",
+    ],
+)
+
+common_cc_test(
+    name = "semaphore_test",
+    size = "small",
+    srcs = [
+        "semaphore_test.cc",
+    ],
+    deps = [
+        ":semaphore",
+        "@gtest//:gtest_main",
+    ],
+    linkstatic = True,
+)
+
+common_cc_binary(
+    name = "condition_variable_benchmark",
+    srcs = ["condition_variable_benchmark.cc"],
+    deps = [
+        ":condition_variable",
+        "@com_github_google_benchmark//:benchmark",
+    ],
+    copts = [
+        "-O3",
+        "-DNDEBUG",
+    ],
+    linkstatic = True,
+)
+
+common_cc_binary(
+    name = "mutex_benchmark",
+    srcs = ["mutex_benchmark.cc"],
+    deps = [
+        ":mutex",
+        "@com_github_google_benchmark//:benchmark",
+    ],
+    copts = [
+        "-O3",
+        "-DNDEBUG",
+    ],
+    linkstatic = True,
+)
+
+common_cc_binary(
+    name = "semaphore_benchmark",
+    srcs = ["semaphore_benchmark.cc"],
+    deps = [
+        ":semaphore",
+        "@com_github_google_benchmark//:benchmark",
+    ],
+    copts = [
+        "-O3",
+        "-DNDEBUG",
+    ],
+    linkstatic = True,
+)

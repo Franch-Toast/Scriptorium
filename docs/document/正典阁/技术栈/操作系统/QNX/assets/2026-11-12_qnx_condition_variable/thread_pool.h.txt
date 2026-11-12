@@ -1,0 +1,94 @@
+// Copyright 2019 deeproute.ai. All Rights Reserved.
+
+#pragma once
+
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "base/thread/thread.h"
+#include "common/macros.h"
+
+namespace deeproute {
+namespace common {
+
+// Attention: user should make sure that a ThreadPool varialbe is destructed
+// before the destruction of variables that might be used in the threads. Or
+// call StopAndJoin() to clear-up all threads before destruction of related
+// variables.
+
+class ThreadPool {
+  using Thread = ::deeproute::base::Thread;
+
+ public:
+  // thread name max length is 16, if pool_name is longer than 16, it will be
+  // cut
+  explicit ThreadPool(int number_of_threads,
+                      std::string pool_name = "CommonPool");
+
+  ~ThreadPool();
+
+  void Stop();
+
+  void StopAndJoin();
+
+  bool IsStopped() const;
+
+  bool IsEmpty() const;
+
+  bool IsWorkComplete() const;
+
+  template <typename F, typename = std::enable_if_t<
+                            std::is_invocable_r_v<void, std::decay_t<F>>>>
+  bool Enqueue(F&& work) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_work_) {
+        return false;
+      }
+      work_queue_.emplace(std::forward<F>(work));
+    }
+    has_work_.notify_one();
+    return true;
+  }
+
+  int GetNumberOfThreads() const;
+
+  int GetNumberOfActiveThreads() const;
+
+  int GetNumberOfWorksInQueue() const;
+
+  int GetNumberOfUnfinishedWorks() const;
+
+  void ClearWorksInQueue();
+
+  void WaitUntilWorkComplete() const;
+
+  std::vector<unsigned long> GetWorksTarget();
+
+ private:
+  void Work();
+
+  std::vector<Thread> workers_;
+
+  mutable std::mutex mutex_;
+
+  std::queue<std::function<void()>> work_queue_;
+
+  mutable std::condition_variable has_work_;
+
+  mutable std::condition_variable all_work_complete_;
+
+  bool stop_work_ = true;
+
+  int active_threads_ = 0;
+
+  DISALLOW_COPY_AND_ASSIGN(ThreadPool);
+};
+
+}  // namespace common
+}  // namespace deeproute

@@ -1,0 +1,121 @@
+// Copyright 2024 Deeproute.ai. All Rights Reserved.
+
+#pragma once
+
+#include <pthread.h>
+
+#include <chrono>
+#include <functional>
+#include <mutex>
+
+namespace deeproute::base {
+
+#define CV_T_                  \
+  pthread_condattr_t cv_attr_; \
+  pthread_cond_t
+#define CV_INIT_(cv)                                     \
+  pthread_condattr_init(&cv_attr_);                      \
+  pthread_condattr_setclock(&cv_attr_, CLOCK_MONOTONIC); \
+  pthread_cond_init(&cv, &cv_attr_);
+#define CV_DESTROY_(cv)      \
+  pthread_cond_destroy(&cv); \
+  pthread_condattr_destroy(&cv_attr_);
+#define CV_WAIT_(cv, x) pthread_cond_wait(&cv, x)
+#define CV_TIMEDWAIT_(cv, x, y) pthread_cond_timedwait(&cv, x, y)
+#define CV_SIGNAL_(cv) pthread_cond_signal(&cv)
+#define CV_BROADCAST_(cv) pthread_cond_broadcast(&cv)
+
+// In std::condition_variable, even if the clock in use is
+// std::chrono::steady_clock or another monotonic clock, a system clock
+// adjustment may induce a spurious wakeup. See
+// https://en.cppreference.com/w/cpp/thread/condition_variable/wait_until.
+// The 'ConditionVariable' use CLOCK_MONOTONIC default, never induce a spurious
+// wakeup.
+class ConditionVariable {
+ public:
+  ConditionVariable() { CV_INIT_(cv_); }
+  ~ConditionVariable() { CV_DESTROY_(cv_); }
+
+  template <typename Mutex>
+  void wait(std::unique_lock<Mutex>& lock, std::function<bool()> predicate) {
+    while (!predicate()) {
+      CV_WAIT_(cv_, lock.mutex()->native_handle());
+    }
+  }
+
+  template <typename Mutex>
+  void wait(std::unique_lock<Mutex>& lock) {
+    CV_WAIT_(cv_, lock.mutex()->native_handle());
+  }
+
+  template <typename Mutex>
+  bool wait_for(std::unique_lock<Mutex>& lock,
+                const std::chrono::nanoseconds& duration,
+                std::function<bool()> predicate) {
+    struct timespec max_wait = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &max_wait);
+    auto nsecs = duration + std::chrono::nanoseconds(max_wait.tv_nsec);
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(nsecs);
+    nsecs -= secs;
+    max_wait.tv_sec += secs.count();
+    max_wait.tv_nsec = static_cast<int32_t>(nsecs.count());
+    bool ret_value = true;
+    while (ret_value && false == predicate()) {
+      ret_value =
+          (0 == CV_TIMEDWAIT_(cv_, lock.mutex()->native_handle(), &max_wait));
+    }
+    return ret_value;
+  }
+
+  template <typename Mutex>
+  bool wait_for(std::unique_lock<Mutex>& lock,
+                const std::chrono::nanoseconds& duration) {
+    struct timespec max_wait = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &max_wait);
+    auto nsecs = duration + std::chrono::nanoseconds(max_wait.tv_nsec);
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(nsecs);
+    nsecs -= secs;
+    max_wait.tv_sec += secs.count();
+    max_wait.tv_nsec = static_cast<int32_t>(nsecs.count());
+    return (0 == CV_TIMEDWAIT_(cv_, lock.mutex()->native_handle(), &max_wait));
+  }
+
+  template <typename Mutex>
+  bool wait_until(std::unique_lock<Mutex>& lock,
+                  const std::chrono::steady_clock::time_point& abs_time,
+                  std::function<bool()> predicate) {
+    auto secs = std::chrono::time_point_cast<std::chrono::seconds>(abs_time);
+    auto ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(abs_time) -
+              std::chrono::time_point_cast<std::chrono::nanoseconds>(secs);
+    struct timespec max_wait = {secs.time_since_epoch().count(), ns.count()};
+    bool ret_value = true;
+    while (ret_value && false == (ret_value = predicate())) {
+      ret_value =
+          (CV_TIMEDWAIT_(cv_, lock.mutex()->native_handle(), &max_wait) == 0);
+    }
+    return ret_value;
+  }
+
+  template <typename Mutex>
+  bool wait_until(std::unique_lock<Mutex>& lock,
+                  const std::chrono::steady_clock::time_point& abs_time) {
+    auto secs = std::chrono::time_point_cast<std::chrono::seconds>(abs_time);
+    auto ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(abs_time) -
+              std::chrono::time_point_cast<std::chrono::nanoseconds>(secs);
+    struct timespec max_wait = {secs.time_since_epoch().count(), ns.count()};
+    return (0 == CV_TIMEDWAIT_(cv_, lock.mutex()->native_handle(), &max_wait));
+  }
+
+  void notify_one() { CV_SIGNAL_(cv_); }
+
+  void notify_all() { CV_BROADCAST_(cv_); }
+
+ private:
+  CV_T_ cv_;
+  ConditionVariable(const ConditionVariable&) = delete;
+  ConditionVariable& operator=(const ConditionVariable&) = delete;
+  ConditionVariable(ConditionVariable&&) = delete;
+  ConditionVariable& operator=(ConditionVariable&&) = delete;
+};
+
+}  // namespace deeproute::base

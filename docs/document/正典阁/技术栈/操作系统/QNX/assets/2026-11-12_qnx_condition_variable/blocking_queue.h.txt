@@ -1,0 +1,186 @@
+// Copyright 2022 Deeproute.ai. All Rights Reserved.
+// Authors: Jingguang Yun (jingguangyun@deeproute.ai)
+
+#pragma once
+
+#include <atomic>
+#include <deque>
+#include <functional>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#include "base/synchronization/condition_variable.h"
+#include "common/log.h"
+#include "common/macros.h"
+
+namespace deeproute {
+namespace church {
+namespace base {
+
+template <typename T>
+class BlockingQueue final {
+ public:
+  static constexpr int64_t kMaxPendingItems =
+      std::numeric_limits<int64_t>::max();
+
+  BlockingQueue(const std::string& name,
+                int64_t max_pending_items = kMaxPendingItems)
+      : name_(name), max_pending_items_(max_pending_items) {
+    MCHECK_GE(max_pending_items_, 1);
+  }
+  ~BlockingQueue() = default;
+
+  const std::string& name() const { return name_; }
+  int64_t pending_items() const { return pending_items_; }
+
+  // BlockingQueue::Push()
+  //
+  // Push the item T into this queue Q and wake at least one waiter if one
+  // exists, returning `true` upon success and `false` without insertion if
+  // Q has been closed.
+  bool Push(T&& item);
+  bool Push(const T& item) {
+    T push_item = item;
+    return Push(std::move(push_item));
+  }
+
+  // BlockingQueue::Pop*()
+  //
+  // Receive and remove the head item(s) of the queue, waiting if necessary
+  // until at least one item becomes available.
+  //
+  // Return `true` if at least one item is received. Otherwise, return `false`,
+  // if queue is empty when has been closed by a call to `Close()`.
+  bool Pop(T* popped_item);
+  template <typename ContainerOfT>
+  bool PopAll(ContainerOfT* popped_items);
+
+  bool IsEmpty() const { return pending_items_ == 0; }
+  bool IsClosed() const { return closed_; }
+  void Clear();
+
+  // BlockingQueue::Close()
+  //
+  // Close the queue and wake all waiters.
+  //
+  // After the last item has been received from a closed queue,
+  // any further `Pop*()` or `Wait*()` operation will fail and
+  // return `false` without blocking.
+  void Close();
+
+ private:
+  // BlockingQueue::WaitCommonLocked()
+  //
+  // Wait until awakened by a call to `Close()` or `Push()`.
+  //
+  // Return `true` if the queue is non-empty. Otherwise, return `false`
+  // if queue is empty when has been closed by a call to `Close()`.
+  bool WaitCommonLocked(std::unique_lock<std::mutex>* lock);
+
+  const std::string name_;
+  const int64_t max_pending_items_{0};
+
+  std::atomic<int64_t> pending_items_{0};
+  std::atomic<bool> closed_{false};
+
+  std::mutex mutex_;
+  deeproute::base::ConditionVariable cv_;
+  std::deque<T> queue_;
+
+  friend class BlockingQueueTest;
+  DISALLOW_COPY_AND_ASSIGN(BlockingQueue);
+};
+
+using TaskBlockingQueue = base::BlockingQueue<std::function<void()>>;
+
+template <typename T>
+bool BlockingQueue<T>::Push(T&& item) {
+  std::unique_lock scoped_lock(mutex_);
+  if (closed_) {
+    return false;
+  }
+
+  int64_t dropped_items = 0;
+  while (static_cast<int64_t>(queue_.size()) >= max_pending_items_) {
+    queue_.pop_front();
+    dropped_items++;
+  }
+  queue_.push_back(std::move(item));
+  pending_items_ = queue_.size();
+  cv_.notify_one();
+
+  MLOG_IF_EVERY_N(INFO, dropped_items != 0, 1000)
+      << name_ << ": blocking-queue overflow: dropped: " << dropped_items;
+  return true;
+}
+
+template <typename T>
+bool BlockingQueue<T>::Pop(T* popped_item) {
+  if (popped_item == nullptr) {
+    MLOG(ERROR) << "Pop failed: popped item pointer is nullptr.";
+    return false;
+  }
+  std::unique_lock scoped_lock(mutex_);
+  if (!WaitCommonLocked(&scoped_lock)) {
+    return false;
+  }
+  MCHECK(!queue_.empty());
+  *popped_item = std::move(queue_.front());
+  queue_.pop_front();
+  pending_items_ = queue_.size();
+  return true;
+}
+
+template <typename T>
+template <typename ContainerOfT>
+bool BlockingQueue<T>::PopAll(ContainerOfT* popped_items) {
+  if (popped_items == nullptr) {
+    MLOG(ERROR) << "PopAll failed: popped items pointer is nullptr.";
+    return false;
+  }
+  std::deque<T> queue;
+  {
+    std::unique_lock scoped_lock(mutex_);
+    if (!WaitCommonLocked(&scoped_lock)) {
+      return false;
+    }
+    queue.swap(queue_);
+    pending_items_ = queue_.size();
+  }
+
+  while (!queue.empty()) {
+    popped_items->push_back(std::move(queue.front()));
+    queue.pop_front();
+  }
+  return true;
+}
+
+template <typename T>
+void BlockingQueue<T>::Clear() {
+  std::unique_lock scoped_lock(mutex_);
+  queue_.clear();
+  pending_items_ = queue_.size();
+}
+
+template <typename T>
+void BlockingQueue<T>::Close() {
+  std::unique_lock scoped_lock(mutex_);
+  closed_ = true;
+  cv_.notify_all();
+}
+
+template <typename T>
+bool BlockingQueue<T>::WaitCommonLocked(std::unique_lock<std::mutex>* lock) {
+  MCHECK(lock != nullptr);
+  const auto is_notified = [this]() {
+    return static_cast<int64_t>(queue_.size()) > 0 || closed_;
+  };
+  cv_.wait(*lock, is_notified);
+  return !queue_.empty();
+}
+
+}  // namespace base
+}  // namespace church
+}  // namespace deeproute

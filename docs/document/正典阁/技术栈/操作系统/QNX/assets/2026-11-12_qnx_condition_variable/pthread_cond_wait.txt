@@ -1,0 +1,53 @@
+pthread_cond_wait()
+pthread_cond_wait()
+Wait on a condition variable
+Synopsis:
+#include <pthread.h>
+int pthread_cond_wait( pthread_cond_t* cond ,
+pthread_mutex_t* mutex );
+Arguments:
+cond
+A pointer to the pthread_cond_t object that you want
+the threads to block on.
+mutex
+The mutex that you want to unlock.
+Library:
+libc
+Use the -l c option to
+qcc
+to link against this library.
+This library is usually included automatically.
+Description:
+The pthread_cond_wait() function blocks the calling
+thread on the condition variable cond , and unlocks the
+associated mutex mutex . The calling thread must have locked
+mutex before waiting on the condition variable.
+On return from the function, the mutex is again locked and owned by the calling thread.
+The calling thread is blocked until either another thread performs
+a signal or broadcast on the condition variable, a signal is delivered
+to the thread, or the thread is canceled (waiting on a condition
+variable is a cancellation point).
+In all cases, the thread reacquires the mutex before being unblocked.
+If a thread that's blocked on a condition variable is canceled,
+the thread reacquires the mutex that's guarding the condition variable, so
+that the thread's cleanup handlers run in the same state as the critical
+code before and after the call to this function.
+If some other thread owns the lock, the canceled thread blocks until the
+mutex is available.
+Note:
+Don't use a recursive mutex with condition variables.
+Make sure that the thread's cleanup handlers unlock the mutex.
+Spurious wakeups from pthread_cond_wait() may occur. See SyncCondvarWait() for more information on spurious wakeups.
+Returns:
+EOK
+Success, or the call was interrupted by a signal.
+EFAULT
+A fault occurred trying to access the buffers provided.
+EINVAL
+One or both of the following are true:
+One or more of cond or mutex is invalid.
+The mutex has died.
+EPERM
+The current thread doesn't own the mutex.
+ESRCH
+The condvar was destroyed while the thread was blocked on it.

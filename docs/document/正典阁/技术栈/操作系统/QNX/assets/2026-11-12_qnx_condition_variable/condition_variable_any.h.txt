@@ -1,0 +1,116 @@
+  /// condition_variable_any
+  // Like above, but mutex is not required to have try_lock.
+  class condition_variable_any
+  {
+#ifdef _GLIBCXX_USE_PTHREAD_COND_CLOCKWAIT
+    using __clock_t = chrono::steady_clock;
+#else
+    using __clock_t = chrono::system_clock;
+#endif
+    condition_variable			_M_cond;
+    shared_ptr<mutex>			_M_mutex;
+
+    // scoped unlock - unlocks in ctor, re-locks in dtor
+    template<typename _Lock>
+      struct _Unlock
+      {
+	explicit _Unlock(_Lock& __lk) : _M_lock(__lk) { __lk.unlock(); }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+	~_Unlock() noexcept(false)
+	{
+	  if (uncaught_exception())
+	    {
+	      __try
+	      { _M_lock.lock(); }
+	      __catch(const __cxxabiv1::__forced_unwind&)
+	      { __throw_exception_again; }
+	      __catch(...)
+	      { }
+	    }
+	  else
+	    _M_lock.lock();
+	}
+#pragma GCC diagnostic pop
+
+	_Unlock(const _Unlock&) = delete;
+	_Unlock& operator=(const _Unlock&) = delete;
+
+	_Lock& _M_lock;
+      };
+
+  public:
+    condition_variable_any() : _M_mutex(std::make_shared<mutex>()) { }
+    ~condition_variable_any() = default;
+
+    condition_variable_any(const condition_variable_any&) = delete;
+    condition_variable_any& operator=(const condition_variable_any&) = delete;
+
+    void
+    notify_one() noexcept
+    {
+      lock_guard<mutex> __lock(*_M_mutex);
+      _M_cond.notify_one();
+    }
+
+    void
+    notify_all() noexcept
+    {
+      lock_guard<mutex> __lock(*_M_mutex);
+      _M_cond.notify_all();
+    }
+
+    template<typename _Lock>
+      void
+      wait(_Lock& __lock)
+      {
+	shared_ptr<mutex> __mutex = _M_mutex;
+	unique_lock<mutex> __my_lock(*__mutex);
+	_Unlock<_Lock> __unlock(__lock);
+	// *__mutex must be unlocked before re-locking __lock so move
+	// ownership of *__mutex lock to an object with shorter lifetime.
+	unique_lock<mutex> __my_lock2(std::move(__my_lock));
+	_M_cond.wait(__my_lock2);
+      }
+
+
+    template<typename _Lock, typename _Predicate>
+      void
+      wait(_Lock& __lock, _Predicate __p)
+      {
+	while (!__p())
+	  wait(__lock);
+      }
+
+    template<typename _Lock, typename _Clock, typename _Duration>
+      cv_status
+      wait_until(_Lock& __lock,
+		 const chrono::time_point<_Clock, _Duration>& __atime)
+      {
+	shared_ptr<mutex> __mutex = _M_mutex;
+	unique_lock<mutex> __my_lock(*__mutex);
+	_Unlock<_Lock> __unlock(__lock);
+	// *__mutex must be unlocked before re-locking __lock so move
+	// ownership of *__mutex lock to an object with shorter lifetime.
+	unique_lock<mutex> __my_lock2(std::move(__my_lock));
+	return _M_cond.wait_until(__my_lock2, __atime);
+      }
+
+    template<typename _Lock, typename _Clock,
+	     typename _Duration, typename _Predicate>
+      bool
+      wait_until(_Lock& __lock,
+		 const chrono::time_point<_Clock, _Duration>& __atime,
+		 _Predicate __p)
+      {
+	while (!__p())
+	  if (wait_until(__lock, __atime) == cv_status::timeout)
+	    return __p();
+	return true;
+      }
+
+    template<typename _Lock, typename _Rep, typename _Period>
+      cv_status
+      wait_for(_Lock& __lock, const chrono::duration<_Rep, _Period>& __rtime)
+      { return wait_until(__lock, __clock_t::now() + __rtime); }

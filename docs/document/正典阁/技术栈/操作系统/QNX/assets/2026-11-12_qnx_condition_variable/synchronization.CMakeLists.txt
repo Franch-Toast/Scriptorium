@@ -1,0 +1,65 @@
+# realtime_mutex
+add_library(realtime_mutex ${LIBRARY_TYPE} mutex.cc mutex.h)
+target_include_directories(realtime_mutex PUBLIC ${REPO_ROOT_PATH}/)
+
+if(${USE_STATIC_LIB})
+else()
+  install(
+    TARGETS realtime_mutex
+    ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+    LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+    RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+endif()
+
+if(BUILD_COMMON_MODULE_TEST)
+    add_executable(mutex_test mutex_test.cc)
+    target_link_libraries(mutex_test realtime_mutex ${GTEST_BOTH_LIBRARIES})
+    add_test(mutex_test ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/mutex_test)
+endif()
+
+# condition_variable: retain the existing target for downstream consumers.
+add_library(realtime_condition_variable INTERFACE)
+target_include_directories(realtime_condition_variable INTERFACE ${REPO_ROOT_PATH}/)
+add_library(condition_variable ALIAS realtime_condition_variable)
+
+if(${USE_STATIC_LIB})
+else()
+  install(
+    TARGETS realtime_condition_variable
+    ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+    LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+    RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+endif()
+
+if(BUILD_COMMON_MODULE_TEST)
+    add_executable(condition_variable_test condition_variable_test.cc)
+    target_link_libraries(condition_variable_test 
+        realtime_condition_variable
+        realtime_mutex
+        ${GTEST_BOTH_LIBRARIES})
+    add_test(condition_variable_test 
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/condition_variable_test)
+endif()
+
+# semaphore
+add_library(semaphore INTERFACE)
+target_include_directories(semaphore INTERFACE ${REPO_ROOT_PATH}/)
+
+if(${USE_STATIC_LIB})
+else()
+  install(
+    TARGETS semaphore
+    ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+    LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+    RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+endif()
+
+if(BUILD_COMMON_MODULE_TEST)
+    add_executable(semaphore_test semaphore_test.cc)
+    target_link_libraries(semaphore_test 
+        semaphore 
+        ${GTEST_BOTH_LIBRARIES}
+        glog)
+    add_test(semaphore_test 
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/semaphore_test)
+endif()

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 440" role="img" aria-labelledby="title desc">
+<title id="title">ST：距离怎样随时间变化</title><desc id="desc">左侧ST图上绿色距离曲线斜率逐渐减小，在停止位置前变平。右侧对应速度曲线逐渐下降至零。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+<style>text{font-family:system-ui,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d;font-size:20px} .small{font-size:17px} .head{font-size:26px;font-weight:650} .muted{fill:#475569} .axis{stroke:#475569;stroke-width:2;marker-end:url(#arrow)} .blue{stroke:#2563eb;stroke-width:4;fill:none} .green{stroke:#15803d;stroke-width:5;fill:none} .orange{fill:#ffedd5;stroke:#c2410c;stroke-width:2} .dash{stroke-dasharray:10 8}</style>
+<rect width="1100" height="440" rx="16" fill="#f8fafc"/><text x="35" y="43" class="head">ST：距离怎样随时间变化</text>
+<path d="M90 340 H535 M90 340 V95" class="axis"/><text x="515" y="377">t</text><text x="58" y="105">s</text>
+<path d="M95 140 H520" stroke="#c2410c" stroke-width="2" stroke-dasharray="8 6"/>
+<text x="110" y="125" class="small">停止位置（相关距离基准）</text>
+<path d="M95 335 C180 230 250 177 340 165 S450 160 520 160" class="green"/>
+<text x="155" y="285">斜率 = ds/dt ≈ 速度</text>
+<path d="M655 340 H1035 M655 340 V95" class="axis"/><text x="1015" y="377">t</text><text x="625" y="105">v</text>
+<path d="M660 140 C770 145 810 280 890 330 C930 337 970 337 1020 337" class="green"/>
+<text x="740" y="245">逐渐减速至停止</text>
+<text x="55" y="415" class="small">曲线没有标数值，表示关系而非实测：s(t) 越平，速度越小。障碍物也可形成 ST 占用区域。</text>
+</svg>

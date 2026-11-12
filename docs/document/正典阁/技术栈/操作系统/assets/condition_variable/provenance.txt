@@ -1,0 +1,34 @@
+File: libstdcxx-predicate-wait.h.txt
+Excerpt: C++ 谓词等待与接口
+来源：`/usr/include/c++/11/condition_variable`，原文件第 59–105 行。
+
+节选 SHA-256：`9e23afe716f7b7adbb2257d99e68208aac2f216e1347f1a5f4500b4ef8101361`。
+Saved content SHA-256: 9e23afe716f7b7adbb2257d99e68208aac2f216e1347f1a5f4500b4ef8101361
+
+File: libstdcxx-predicate-timeout.h.txt
+Excerpt: C++ 超时分支中的最终谓词复查
+来源：`/usr/include/c++/11/condition_variable`，原文件第 145–180 行。
+
+节选 SHA-256：`391cc318d26e0ba4a30ed45de8e15df52c67fbce279eede15f24d0853c13be4c`。
+Saved content SHA-256: 391cc318d26e0ba4a30ed45de8e15df52c67fbce279eede15f24d0853c13be4c
+
+File: linux-futex-ordering.c.txt
+Excerpt: Linux futex 的比较与排队协议
+来源：`Linux 仓库版本 70e422509f253b327d77ed4a8709be10a58c6d77，kernel/futex.c`，原文件第 47–145 行。
+
+节选 SHA-256：`c8dd199f670b241b8ba15c0d7b1a50601f0e35d09a7b80c85ed0636fd30630ad`。
+Saved content SHA-256: c8dd199f670b241b8ba15c0d7b1a50601f0e35d09a7b80c85ed0636fd30630ad
+
+File: linux-futex-wait-setup.c.txt
+Excerpt: Linux futex 等待建立与值比较
+来源：`Linux 仓库版本 70e422509f253b327d77ed4a8709be10a58c6d77，kernel/futex.c`，原文件第 2610–2681 行。
+
+节选 SHA-256：`b1ab10b307f9afc10ddde055fbae2d021e3ad44f915063f62e11d7a9cfc91111`。
+Saved content SHA-256: b1ab10b307f9afc10ddde055fbae2d021e3ad44f915063f62e11d7a9cfc91111
+
+File: linux-futex-schedule.c.txt
+Excerpt: Linux futex 排队后可能跳过调度
+来源：`Linux 仓库版本 70e422509f253b327d77ed4a8709be10a58c6d77，kernel/futex.c`，原文件第 2572–2608 行。
+
+节选 SHA-256：`2baa64f866affe708b4883093000898e3feb674d75f52bec9608bf7250b73958`。
+Saved content SHA-256: 2baa64f866affe708b4883093000898e3feb674d75f52bec9608bf7250b73958

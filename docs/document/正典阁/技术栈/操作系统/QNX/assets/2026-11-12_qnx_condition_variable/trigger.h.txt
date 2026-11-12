@@ -1,0 +1,161 @@
+#pragma once
+
+#include "base/synchronization/condition_variable.h"
+#include "base/synchronization/mutex.h"
+#include "church/node/onboard_message.h"
+#include "church/cache/channel_cache.h"
+#include "church/cache/channel_assemble.h"
+#include "church/component/msg_circular_buffer.h"
+#include "church/proto/component_conf.pb.h"
+
+namespace deeproute {
+namespace church {
+
+class Trigger {
+ public:
+  using OnboardMessageConstPtr = std::shared_ptr<const node::OnboardMessage>;
+  using OnboardMessageConstPtrVector = std::vector<OnboardMessageConstPtr>;
+  using ComponentConfig = proto::ComponentConfig;
+  using ChannelCachePtr = cache::ChannelCachePtr;
+  using MsgCircularBufferPtr = std::unique_ptr<MsgCircularBuffer>;
+  using StagingCache = std::unordered_map<std::string, MsgCircularBufferPtr>;
+  using ChannelAssembler = deeproute::church::cache::ChannelAssembler;
+
+  // Constructor with initialization parameters
+  Trigger(const std::vector<ChannelCachePtr>& caches,
+          const ComponentConfig& config) {
+    channelassemble_ = std::make_unique<ChannelAssembler>(caches, config);
+    InitializeStagingCache();
+  }
+
+  virtual ~Trigger() = default;
+
+  // Open trigger - no parameters needed now
+  virtual bool Open() { return true; }
+
+  // Close trigger
+  virtual void Close() {
+    std::unique_lock scoped_lock(mutex_);
+    closed_.store(true, std::memory_order_release);
+    cv_.notify_all();
+  }
+
+  // Wait for trigger signal
+  virtual bool Wait(std::chrono::microseconds timevalue) {
+    std::unique_lock scoped_lock(mutex_);
+    const auto is_notified = [this]() {
+      bool old = false;
+      std::swap(is_triggered_, old);
+      if (old) {
+        FlushStagingCacheToChannelCache();
+      }
+      return old || closed_.load(std::memory_order_acquire);
+    };
+    //如果channel_assembler要求再次组装，则按照trigger的要求继续组装
+    if(assemble_again_) {
+      //组装前强制Flash一下，此处有锁保护
+      FlushStagingCacheToChannelCache();
+      return true;
+    }
+    //此处必须是wait_until，能保证Timeout定时器的精度
+    auto next_wakeup_time_ = std::chrono::steady_clock::now() + timevalue;
+    return cv_.wait_until(scoped_lock,next_wakeup_time_,is_notified);
+  }
+
+  // Trigger signal from external with message
+  virtual void TriggerSignal(const OnboardMessageConstPtr& message) {
+    std::unique_lock scoped_lock(mutex_);
+    PushMessageImpl(message);
+    is_triggered_ = true;
+    cv_.notify_one();
+  }
+
+  // Assemble data for processing
+  virtual bool Assemble(OnboardMessageConstPtrVector& generated_input) {
+    bool assemble_again = false;
+    bool ret = channelassemble_->NonFrameSyncAssemble(generated_input,&assemble_again);
+    //两层逻辑，如果assemble失败了，则说明缺少数据，等待下次trigger，assemble_again_为false
+    //如果assemble成功了，则处理assemble_again_
+    if(true == ret) {
+      assemble_again_ = assemble_again;
+    } else {
+      assemble_again_ = false;
+    }
+    return ret;
+  }
+
+  // New methods for data management
+  void PushMessage(const OnboardMessageConstPtr& message);
+  void FlushStagingCacheToChannelCacheWithLock();
+  virtual void SetTimeoutProcessHandler(std::function<void(OnboardMessageConstPtrVector& msgs)> ) 
+  {};
+  virtual uint64_t CalculateFrameID(const OnboardMessageConstPtrVector& ) { return 0; };
+ protected:
+  const std::vector<ChannelCachePtr>& ChannelCache() { return channelassemble_->ChannelCache(); }
+
+  // Protected methods for data management
+  void InitializeStagingCache();
+  void FlushStagingCacheToChannelCache();
+  std::unique_ptr<StagingCache> CreateStagingCache();
+  void PushMessageImpl(const OnboardMessageConstPtr& message);
+
+
+  std::unique_ptr<ChannelAssembler> channelassemble_;
+
+  // Staging cache for trigger - similar to Component
+  std::unique_ptr<StagingCache> staging_cache_;
+  std::unique_ptr<StagingCache> flush_staging_cache_;
+
+  bool assemble_again_{false};
+  bool is_triggered_{false};
+  std::atomic<bool> closed_{false};
+  deeproute::base::RealtimeMutex mutex_;
+  deeproute::base::ConditionVariable cv_;
+
+};
+
+class TriggerRegistry {
+ public:
+  static void Register(
+      const std::string& name,
+      std::function<std::unique_ptr<Trigger>(
+          const std::vector<deeproute::church::cache::ChannelCachePtr>&,
+          const deeproute::church::proto::ComponentConfig&)>
+          func);
+
+  static std::unique_ptr<Trigger> Create(
+      const std::string& name,
+      const std::vector<deeproute::church::cache::ChannelCachePtr>& caches,
+      const deeproute::church::proto::ComponentConfig& config);
+
+ private:
+  TriggerRegistry() = delete;
+};
+
+#define CHURCH_REGISTER_TRIGGER_INTERNAL2(name, var_name, ...)          \
+  namespace {                                                           \
+  struct TriggerRegistry_##var_name {                                   \
+    TriggerRegistry_##var_name() {                                      \
+      deeproute::church::TriggerRegistry::Register(#name, __VA_ARGS__); \
+    }                                                                   \
+    ~TriggerRegistry_##var_name() {}                                    \
+  };                                                                    \
+  }                                                                     \
+  static TriggerRegistry_##var_name trigger_registry_##var_name;
+
+#define CHURCH_REGISTER_TRIGGER_INTERNAL(name, id, ...) \
+  CHURCH_REGISTER_TRIGGER_INTERNAL2(name, id, __VA_ARGS__)
+
+#define CHURCH_REGISTER_TRIGGER_FUNCTION(name, ...) \
+  CHURCH_REGISTER_TRIGGER_INTERNAL(name, __COUNTER__, __VA_ARGS__)
+
+#define CHURCH_REGISTER_TRIGGER(name)                                          \
+  CHURCH_REGISTER_TRIGGER_FUNCTION(                                            \
+      name,                                                                    \
+      [](const std::vector<deeproute::church::cache::ChannelCachePtr>& caches, \
+         const deeproute::church::proto::ComponentConfig& config) {            \
+        return std::make_unique<name>(caches, config);                         \
+      })
+
+}  // namespace church
+}  // namespace deeproute

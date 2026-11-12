@@ -1,0 +1,36 @@
+    template<typename _Clock, typename _Duration, typename _Predicate>
+      bool
+      wait_until(unique_lock<mutex>& __lock,
+		 const chrono::time_point<_Clock, _Duration>& __atime,
+		 _Predicate __p)
+      {
+	while (!__p())
+	  if (wait_until(__lock, __atime) == cv_status::timeout)
+	    return __p();
+	return true;
+      }
+
+    template<typename _Rep, typename _Period>
+      cv_status
+      wait_for(unique_lock<mutex>& __lock,
+	       const chrono::duration<_Rep, _Period>& __rtime)
+      {
+	using __dur = typename steady_clock::duration;
+	return wait_until(__lock,
+			  steady_clock::now() +
+			  chrono::__detail::ceil<__dur>(__rtime));
+      }
+
+    template<typename _Rep, typename _Period, typename _Predicate>
+      bool
+      wait_for(unique_lock<mutex>& __lock,
+	       const chrono::duration<_Rep, _Period>& __rtime,
+	       _Predicate __p)
+      {
+	using __dur = typename steady_clock::duration;
+	return wait_until(__lock,
+			  steady_clock::now() +
+			  chrono::__detail::ceil<__dur>(__rtime),
+			  std::move(__p));
+      }
+
