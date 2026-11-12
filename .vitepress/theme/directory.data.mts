@@ -9,7 +9,7 @@ export interface DirectoryDocument {
 // 构建期扫描 srcDir 下全部文档，url 原样下发：散文档为 .html 形态，
 // 目录 index 为尾斜杠形态（/xxx/）——组件据此识别子目录入口并链接
 // 到目录 URL（静态托管友好的 clean URL）；各库自身的 index 由组件排除。
-export default createContentLoader<DirectoryDocument[]>("document/**/*.md", {
+export default createContentLoader<DirectoryDocument[]>(["document/**/*.md", "!document/**/assets/**"], {
   transform: data =>
     data
       .filter(page => page.url !== "/")

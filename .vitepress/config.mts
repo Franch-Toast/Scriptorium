@@ -3,6 +3,8 @@ import { withMermaid } from "vitepress-plugin-mermaid";
 import { generateSidebar } from "vitepress-sidebar";
 import type { ThemeConfig } from "vitepress-carbon";
 import baseConfig from "vitepress-carbon/dist/theme/config/baseConfig.js";
+import { cp, mkdir, readdir } from "node:fs/promises";
+import { join, relative } from "node:path";
 
 // 六大分区定义（与个人站 master 保持一致的目录约定，cherry-pick 路径零冲突的前提）
 const libs = [
@@ -32,6 +34,8 @@ function libSidebar(dir: string, title: string) {
     {
       documentRootPath: "docs",
       scanStartPath: libPath,
+      // assets 只保存正文引用的材料，不生成侧边栏目录或文章条目。
+      excludeByGlobPattern: ["**/assets", "**/assets/**"],
       useTitleFromFrontmatter: true,
       useFolderTitleFromIndexFile: true,
       // 目录节点链接到其 index.md：点击目录名进入该目录的显示页；
@@ -73,6 +77,27 @@ export default withMermaid(
     // build 脚本后置 cp 完成——VitePress 1.6.4 build 硬编码拷贝 srcDir/public，
     // 不读 publicDir 配置
     srcDir: "docs",
+    srcExclude: ["**/assets/**"],
+    // Markdown 中的附件链接保留相对路径；将材料原样复制到产物对应位置。
+    async buildEnd(siteConfig) {
+      async function copyAssets(dir: string) {
+        for (const entry of await readdir(dir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const source = join(dir, entry.name);
+          if (entry.name === "assets") {
+            const target = join(siteConfig.outDir, relative(siteConfig.srcDir, source));
+            await mkdir(target, { recursive: true });
+            await cp(source, target, {
+              recursive: true,
+              filter: path => !/\.md$/i.test(path),
+            });
+          } else {
+            await copyAssets(source);
+          }
+        }
+      }
+      await copyAssets(join(siteConfig.srcDir, "document"));
+    },
     cacheDir: ".vitepress/cache",
     lang: "zh-CN",
     title: "Scriptorium",

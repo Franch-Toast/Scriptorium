@@ -19,6 +19,13 @@
   --vp-doc-content-max-width: calc(100vw - 800px);
 }
 
+/* 小屏不同时展示两侧栏，正文应使用可用宽度，避免桌面公式成为负值。 */
+@media (max-width: 1279px) {
+  :root {
+    --vp-doc-content-max-width: 100%;
+  }
+}
+
 @media (min-width: 1440px) {
   /* 左侧导航贴屏幕左缘（清掉容器上的居中收缩 gutter） */
   body .VPSidebar.VPSidebar {
