@@ -1,0 +1,83 @@
+`deeproute::base::ConditionVariable` is the common condition-variable wrapper.
+Include `base/synchronization/condition_variable.h` and depend on
+`//base/synchronization:condition_variable`. The CMake target
+`realtime_condition_variable` remains available; `condition_variable` is its
+alias. Its existing namespace, header, generic mutex support, and bool
+timed-wait return types are retained.
+
+Both Linux and QNX retain the native `pthread_cond_t` initialized with
+`CLOCK_MONOTONIC`. Waits pass the caller's native mutex directly to pthread,
+including the priority-inheritance mutex supplied by `RealtimeMutex`; no
+intermediate mutex is introduced. `wait_for` reads `CLOCK_MONOTONIC` explicitly
+with `clock_gettime` and constructs one absolute deadline for the whole wait.
+
+Only QNX adds a counter tracking complete wait calls and skips `notify_one()`
+and `notify_all()` when the count is zero. Registration happens while the
+predicate mutex is still locked; RAII removes it after the wait returns, times
+out, or a predicate throws. Counts include threads reacquiring the mutex, so an
+occasional unnecessary notify is allowed. Linux notifications keep the direct
+pthread path without waiter counting.
+
+```cpp
+std::mutex mutex;  // RealtimeMutex also works.
+deeproute::base::ConditionVariable cv;
+bool ready = false;
+
+// Consumer:
+std::unique_lock<std::mutex> lock(mutex);
+cv.wait(lock, [&] { return ready; });
+
+// Producer, in another thread:
+{
+  std::lock_guard<std::mutex> guard(mutex);
+  ready = true;
+}
+cv.notify_one();
+```
+
+Read and modify the predicate using the same mutex passed to `wait`. An atomic
+predicate alone does not prevent a lost notification between checking it and
+going to sleep. This mutex discipline also orders QNX waiter registration with
+notifications made after releasing the mutex.
+
+The object must outlive all waits AND notifications: join its users before
+destruction. In particular, QNX waits touch the counter after reacquiring the
+mutex and before returning, which is stricter than the standard condition
+variable's non-predicate wait destruction rule. Do not destroy the object while
+such a wait is still returning, or while a producer can notify after unlocking.
+No native handle is exposed because native waits would bypass registration.
+`std::notify_all_at_thread_exit()` does not accept this wrapper.
+
+Timed waits keep the existing API:
+
+- `wait_for` accepts a `std::chrono::nanoseconds` duration, including durations
+  implicitly convertible to it. `wait_until` accepts a `steady_clock` deadline.
+- Raw timed waits return `true` after a notification or spurious wakeup and
+  `false` after a timeout; callers must still inspect their protected state.
+- Predicate timed waits return the final predicate value. They recheck it after
+  reacquiring the mutex even when the native wait timed out. This corrects the
+  previous implementation's false result when the predicate became true
+  during that reacquisition.
+- Predicate waits retain a single deadline through repeated wakeups. Spurious
+  wakeups are permitted on either platform. Both platforms retain the native
+  monotonic wait clock; this does not eliminate spurious wakeups.
+
+The class layout changes on both platforms. Rebuild all components using this
+header together; binary compatibility with previously built objects is not
+promised. Existing users of `ConditionVariable` automatically use the updated
+implementation after rebuilding. No business call sites are edited in this
+change. Both platforms preserve the caller-mutex and monotonic-clock behavior;
+QNX additionally checks waiter registration before notifying.
+
+This optimization still constructs and destroys its underlying condition
+variable. It does not affect condition variables hidden inside
+`std::shared_mutex`, `future`/`promise`, or third-party libraries. The waiter
+counter also has a cost on QNX, so measure the net CPU change with the same
+workload on the target hardware.
+
+`condition_variable_test` runs the native backend, the actual QNX
+waiter-counting/native-wait backend on Linux, and the public class. It covers
+wakeups, repeated wait/notify transitions, timeouts, predicate exceptions,
+`RealtimeMutex`/`UniqueLock` compatibility, and bool return types. A recording
+native backend verifies that idle notifications never reach the backend and
+that registration is cleaned up after all wait overloads.

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 440" role="img" aria-labelledby="title desc">
+<title id="title">先选规划起点，再把历史与新段衔接</title><desc id="desc">上方时间轴标记当前帧和规划起点，下方蓝色历史保留段连接绿色新段；灰色表示已经过去的部分。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+<style>text{font-family:system-ui,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d;font-size:20px} .small{font-size:17px} .head{font-size:26px;font-weight:650} .muted{fill:#475569} .axis{stroke:#475569;stroke-width:2;marker-end:url(#arrow)} .blue{stroke:#2563eb;stroke-width:4;fill:none} .green{stroke:#15803d;stroke-width:5;fill:none} .orange{fill:#ffedd5;stroke:#c2410c;stroke-width:2} .dash{stroke-dasharray:10 8}</style>
+<rect width="1100" height="440" rx="16" fill="#f8fafc"/><text x="35" y="43" class="head">先选规划起点，再把历史与新段衔接</text>
+<path d="M85 110 H1020" class="axis"/><text x="990" y="90">时间</text>
+<path d="M330 110 V330 M510 110 V330" stroke="#94a3b8" stroke-dasharray="6 6"/>
+<text x="270" y="155">本帧处理时刻</text><text x="480" y="195">规划起点</text>
+<path d="M90 300 C210 300 240 270 330 270" stroke="#94a3b8" stroke-width="6" fill="none"/>
+<path d="M330 270 C390 270 440 250 510 250" class="blue"/>
+<path d="M510 250 C650 250 695 210 850 225 S970 245 1015 240" class="green"/>
+<circle cx="510" cy="250" r="7" fill="#172b4d"/>
+<text x="105" y="355">已过去的历史部分</text><text x="355" y="355">历史保留段</text><text x="695" y="355">本帧新求解段</text>
+<text x="55" y="410" class="small">起点准备影响新段求解；PrependTrajectory 在结果形成后处理连接。比例和保留长度均为教学示意。</text>
+</svg>

@@ -1,0 +1,28 @@
+pthread_cond_broadcast()
+pthread_cond_broadcast()
+Unblock threads waiting on a condition
+Synopsis:
+#include <pthread.h>
+int pthread_cond_broadcast( pthread_cond_t* cond );
+Arguments:
+cond
+A pointer to the pthread_cond_t object for which you want to unblock the threads.
+Library:
+libc
+Use the -l c option to
+qcc
+to link against this library.
+This library is usually included automatically.
+Description:
+The pthread_cond_broadcast() function unblocks all threads
+currently blocked on the condition variable cond .
+All affected blocked threads become runnable and are scheduled using the usual scheduling rules,
+which means the order in which these threads are unblocked (or woken up) is different than the
+order in which they were blocked.
+Returns:
+EOK
+Success.
+EFAULT
+A fault occurred trying to access the buffers provided.
+EINVAL
+Invalid condition variable cond .

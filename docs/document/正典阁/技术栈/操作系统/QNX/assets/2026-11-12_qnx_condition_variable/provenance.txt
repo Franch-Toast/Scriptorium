@@ -1,0 +1,184 @@
+File: condition_variable.before.h.txt
+Excerpt: 修复前的 `condition_variable.h`
+来源：common，版本 `5fef431a51699cc0bcec600f7496f8e938c8b6a2`，文件 `base/synchronization/condition_variable.h`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`fd7bd0824fa01d548688a587d618acb96eaf5b4bb9ee463e7943599a2501dc75`。
+Saved content SHA-256: fd7bd0824fa01d548688a587d618acb96eaf5b4bb9ee463e7943599a2501dc75
+
+File: condition_variable.after.h.txt
+Excerpt: 修复后的 `condition_variable.h`
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/condition_variable.h`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`7f25efb7252e41c334ee924f8442e124ace7f01831eaba010ad0e00bc2ce0aca`。
+Saved content SHA-256: 7f25efb7252e41c334ee924f8442e124ace7f01831eaba010ad0e00bc2ce0aca
+
+File: mutex.cc.txt
+Excerpt: 优先级继承 `mutex.cc`
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/mutex.cc`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`66d45523258507952894eab10800e9b7582953038381058d9c34d383bc6d639a`。
+Saved content SHA-256: 66d45523258507952894eab10800e9b7582953038381058d9c34d383bc6d639a
+
+File: mutex.h.txt
+Excerpt: 原生句柄与 UniqueLock：`mutex.h`
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/mutex.h`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`a7f017a660bed85c0c24aeec8eb1293ee31443c6d9687628eefbc7d642aabb29`。
+Saved content SHA-256: a7f017a660bed85c0c24aeec8eb1293ee31443c6d9687628eefbc7d642aabb29
+
+File: condition_variable-usage.txt
+Excerpt: ConditionVariable 使用约定
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/condition_variable.md`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`87aa9681dd2ad3a82a7a10db3b997cd553fa91b0ca302fbb6ac8d232de26de86`。
+Saved content SHA-256: 87aa9681dd2ad3a82a7a10db3b997cd553fa91b0ca302fbb6ac8d232de26de86
+
+File: synchronization.BUILD.txt
+Excerpt: Bazel 同步模块入口
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/BUILD`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`ea6e4edb7e43a6a0cdfd79cc88dd2979695f7aad979b43c1de1573afbe2a7c70`。
+Saved content SHA-256: ea6e4edb7e43a6a0cdfd79cc88dd2979695f7aad979b43c1de1573afbe2a7c70
+
+File: synchronization.CMakeLists.txt
+Excerpt: CMake 同步模块入口
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/CMakeLists.txt`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`ccf76e8a3e0bdc7afbae23970a75adccd40d97f09facf2d92358ebd2c9a00613`。
+Saved content SHA-256: ccf76e8a3e0bdc7afbae23970a75adccd40d97f09facf2d92358ebd2c9a00613
+
+File: base.BUILD.txt
+Excerpt: Bazel base 头文件打包
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/BUILD`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`0684f3ab01c60011397ea2963f093ebb09b94ec930108d4a4ba8a1a2e89e5d63`。
+Saved content SHA-256: 0684f3ab01c60011397ea2963f093ebb09b94ec930108d4a4ba8a1a2e89e5d63
+
+File: thread_pool.h.txt
+Excerpt: 仍使用标准条件变量的 ThreadPool
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `common/thread_pool.h`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`838a8553f37147fa800dcd9b3cfbff5b90a7376f61c02eeff7de8a99db47d2b5`。
+Saved content SHA-256: 838a8553f37147fa800dcd9b3cfbff5b90a7376f61c02eeff7de8a99db47d2b5
+
+File: condition_variable_benchmark.cc.txt
+Excerpt: 既有 ping-pong benchmark
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/condition_variable_benchmark.cc`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`9ca970ace9699db54db4d51ce76672affa96c0fccc6f1ab0fc794ef704119fb1`。
+Saved content SHA-256: 549ae2c17fd0c3ddfb86e73c9a9ec3ed26d10a1e05e899b9b931067a2b28497a
+
+File: condition_variable_test.cc.txt
+Excerpt: `condition_variable_test.cc`
+来源：common，版本 `dc124ca42ab1f9f04e3717bc75d9c7e8c5be8456`，文件 `base/synchronization/condition_variable_test.cc`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`e1404024eb9c866ba21428f283186da99c04fbf579305b50f494661703e71022`。
+Saved content SHA-256: e1404024eb9c866ba21428f283186da99c04fbf579305b50f494661703e71022
+
+File: blocking_queue.h.txt
+Excerpt: BlockingQueue
+来源：platform，版本 `55b503c91f7eaaef78d90b538f34c65f0ea4b154`，文件 `church/base/container/blocking_queue.h`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`16ca694e17f4adacbadf5d609d7327558f327ecf6b51fbf69d77adbe76642850`。
+Saved content SHA-256: 16ca694e17f4adacbadf5d609d7327558f327ecf6b51fbf69d77adbe76642850
+
+File: notification.h.txt
+Excerpt: Notification
+来源：platform，版本 `55b503c91f7eaaef78d90b538f34c65f0ea4b154`，文件 `church/base/synchronization/notification.h`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`2686dcf719a9e19d1c672d89c15ac57f277d1349bbc4a594a65127f6627c0f74`。
+Saved content SHA-256: 2686dcf719a9e19d1c672d89c15ac57f277d1349bbc4a594a65127f6627c0f74
+
+File: trigger.h.txt
+Excerpt: Trigger
+来源：platform，版本 `55b503c91f7eaaef78d90b538f34c65f0ea4b154`，文件 `church/component/trigger.h`。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`3cfd4bd7251aad9c8c7b750d2864ef3987f8a5cecb9e16a16f76f101a67bdb24`。
+Saved content SHA-256: 3cfd4bd7251aad9c8c7b750d2864ef3987f8a5cecb9e16a16f76f101a67bdb24
+
+File: qnx71-notify-disassembly.txt
+Excerpt: QNX 7.1 AArch64
+样本：`/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5`。
+
+二进制 SHA-256：`bbcb7def7605d223a96a54d1ac2ae2e3eab7661fe2a9046a9027f2b0b4c18c0f`。
+
+原始 objdump 输出：
+Saved content SHA-256: 2b1f908300136dbf867151b88a44d368a55b458beaf3e658ee510ea0c0b36394
+
+File: qnx80-notify-disassembly.txt
+Excerpt: QNX 8.0 AArch64
+样本：`/sandbox/toolchains_qnx_sdp8/target/qnx/aarch64le/lib/libc.so.6`。
+
+二进制 SHA-256：`54f790b253b9ae928c7bcd511adc42e14a05e2c42a70be5989ada33c51964b8d`。
+
+原始 objdump 输出：
+Saved content SHA-256: 7ff22674837e1fad3dbb15b14614a8a7a49506a604665733e838cdb35492b3be
+
+File: glibc-notify-disassembly.txt
+Excerpt: Linux glibc 空等待者判断及返回路径
+来源：宿主机 `glibc 2.31`，`/lib/x86_64-linux-gnu/libpthread.so.0`，`pthread_cond_signal@@GLIBC_2.3.2` 的入口及零等待者返回片段；此处是节选而非完整函数。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`f05345adf05eb80d6fde5b632984b0653a0dfe2c386781e6cc695c4dae02d4c6`。
+Saved content SHA-256: f05345adf05eb80d6fde5b632984b0653a0dfe2c386781e6cc695c4dae02d4c6
+
+File: condition_variable_any.h.txt
+Excerpt: condition_variable_any 的内部 mutex 与 wait 适配
+来源：宿主机 libstdc++ 11，`/usr/include/c++/11/condition_variable`，原文件第 240–355 行节选；块内第 1 行对应原文件第 240 行。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`9b622fe7b507010129dc0eaf031f26336e65503d2b482441918bc472bca05be8`。
+Saved content SHA-256: 9b622fe7b507010129dc0eaf031f26336e65503d2b482441918bc472bca05be8
+
+File: SyncCondvarSignal.txt
+Excerpt: SyncCondvarSignal 与 SyncCondvarSignal_r
+通知是内核调用，`broadcast=0` 选择一个等待者、非零选择全部；调用自身不阻塞，被唤醒者返回前需要重新取得关联 mutex。
+
+原始文件：`/sandbox/toolchains_qnx_sdp8/target/qnx/usr/help/eclipse/plugins/com.qnx.doc.neutrino.lib_ref/topic/s/synccondvarsignal.html`。
+
+原始 HTML SHA-256：`07a3de8316cdbaba1c4bd0114afb93323d563fb98482ecf56acc5cb4bac3b124`。
+
+以下为 HTML 转纯文本后的相关原文：
+Saved content SHA-256: aaf3bcbd9082c9f880942cc1ed596559a0c12d332f0d2d4c64fb3c13674d790b
+
+File: pthread_cond_signal.txt
+Excerpt: pthread_cond_signal
+唤醒最高优先级的等待者；最高优先级相同时选择等待最久者。
+
+原始文件：`/sandbox/toolchains_qnx_sdp8/target/qnx/usr/help/eclipse/plugins/com.qnx.doc.neutrino.lib_ref/topic/p/pthread_cond_signal.html`。
+
+原始 HTML SHA-256：`9be4666f294266a3425efc6a3f01917c2286f9c66c57dbd94cd8d431195c8778`。
+
+以下为 HTML 转纯文本后的相关原文：
+Saved content SHA-256: 6f38da04706b4ab1c0087264f40e4082ec79a5134c2d11e7b3f93dccca60c116
+
+File: pthread_cond_broadcast.txt
+Excerpt: pthread_cond_broadcast
+解除全部当前等待者的条件等待，之后仍按调度和 mutex 竞争规则运行。
+
+原始文件：`/sandbox/toolchains_qnx_sdp8/target/qnx/usr/help/eclipse/plugins/com.qnx.doc.neutrino.lib_ref/topic/p/pthread_cond_broadcast.html`。
+
+原始 HTML SHA-256：`be0d69ec15e46a6ab130d6ddbf911f41540af7593b730d1021481bfbae1ecdb6`。
+
+以下为 HTML 转纯文本后的相关原文：
+Saved content SHA-256: 6a9ed870131fd7f9e0db1da923181c891dfff41655ec948effb91f7bbb2fda31
+
+File: pthread_cond_wait.txt
+Excerpt: pthread_cond_wait
+调用时必须已持有关联 mutex；返回前重新取得 mutex；允许虚假唤醒；文档明确不应将 recursive mutex 用于此等待。
+
+原始文件：`/sandbox/toolchains_qnx_sdp8/target/qnx/usr/help/eclipse/plugins/com.qnx.doc.neutrino.lib_ref/topic/p/pthread_cond_wait.html`。
+
+原始 HTML SHA-256：`d7b0d30cd734cf5f322891b862a40ae2d3b1e9872ee2d3523e1e51558ee5ec4a`。
+
+以下为 HTML 转纯文本后的相关原文：
+Saved content SHA-256: ae04a736b9962bb5d1cef450b3c032a504c7bfc3090338a612a5a5d7a568829f
+
+File: pthread_cond_timedwait.txt
+Excerpt: pthread_cond_timedwait
+使用绝对期限，返回前重新取得 mutex；EOK 也可能表示被信号打断，非零值包含超时及其他错误。
+
+原始文件：`/sandbox/toolchains_qnx_sdp8/target/qnx/usr/help/eclipse/plugins/com.qnx.doc.neutrino.lib_ref/topic/p/pthread_cond_timedwait.html`。
+
+原始 HTML SHA-256：`184031189d4b62114a2b0578733cb693eb19a3adeab8e64305a92e0f9bf98d6b`。
+
+以下为 HTML 转纯文本后的相关原文：
+Saved content SHA-256: 60c15d6b40d618657f6006afcfff58d6d23264dc3f1bb160cdea5653e5f39cc9

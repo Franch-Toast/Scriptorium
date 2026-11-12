@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 440" role="img" aria-labelledby="title desc">
+<title id="title">从车辆状态到未来运动</title><desc id="desc">简化车辆在XY坐标中，速度沿朝向，曲率描述转弯，优化jerk和曲率二阶变化以推进模型状态。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+<style>text{font-family:system-ui,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d;font-size:20px} .small{font-size:17px} .head{font-size:26px;font-weight:650} .muted{fill:#475569} .axis{stroke:#475569;stroke-width:2;marker-end:url(#arrow)} .blue{stroke:#2563eb;stroke-width:4;fill:none} .green{stroke:#15803d;stroke-width:5;fill:none} .orange{fill:#ffedd5;stroke:#c2410c;stroke-width:2} .dash{stroke-dasharray:10 8}</style>
+<rect width="1100" height="440" rx="16" fill="#f8fafc"/><text x="35" y="43" class="head">从车辆状态到未来运动</text>
+<path d="M100 340 H520 M100 340 V100" class="axis"/><text x="525" y="350">x</text><text x="82" y="95">y</text>
+<path d="M280 280 C390 220 440 170 450 90" class="blue dash"/>
+<rect x="233" y="255" width="100" height="48" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="3" transform="rotate(-30 280 280)"/>
+<circle cx="280" cy="280" r="5" fill="#172b4d"/><path d="M280 280 L397 212" class="axis"/>
+<path d="M280 280 H395" stroke="#64748b" stroke-dasharray="5 5"/><path d="M347 280 Q347 258 337 247" stroke="#c2410c" stroke-width="3" fill="none"/>
+<text x="359" y="264">θ</text><text x="377" y="194">v</text><text x="182" y="325">位置 (x,y)</text><text x="463" y="147">曲率 κ</text>
+<rect x="640" y="110" width="400" height="220" rx="12" fill="#eff6ff" stroke="#93c5fd"/>
+<text x="665" y="151">状态：位置、速度、朝向等</text><text x="665" y="195">控制：j 与 κ̈</text><text x="665" y="239">车辆模型：推进到下一时刻</text><text x="665" y="283">代价：评估跟踪、运动、对象等</text>
+<text x="55" y="410" class="small">曲率与转角存在车辆模型关系，但不是方向盘角度本身；优化控制量还要经下游控制跟踪。</text>
+</svg>

@@ -1,0 +1,31 @@
+load("@deeproute_build_tools//rules/modules:common_cc_wrapper.bzl", "common_cc_library")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+common_cc_library(
+    name = "deeproute_path",
+    hdrs = [
+        "deeproute_path.h",
+    ],
+    deps = [
+        "//common:log",
+    ],
+    alwayslink = True,
+)
+
+pkg_tar(
+    name = "base-hdrs",
+    srcs = glob([
+        "*.h",
+        "*.hpp",
+    ]),
+    deps = [
+        "//base/synchronization:condition_variable-hdrs",
+        "//base/time:time-hdrs",
+        "//base/thread:thread-hdrs",
+        "//base/trace:trace-hdrs",
+    ],
+    package_dir = "base",
+)

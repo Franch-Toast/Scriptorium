@@ -1,0 +1,377 @@
+// Copyright 2026 Deeproute.ai. All Rights Reserved.
+
+#include "base/synchronization/condition_variable.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <stdexcept>
+#include <thread>
+#include <type_traits>
+#include <vector>
+
+#include "base/synchronization/mutex.h"
+#include "gtest/gtest.h"
+
+namespace deeproute::base {
+namespace {
+
+using namespace std::chrono_literals;
+using CountedConditionVariable =
+    detail::WaiterAwareConditionVariable<detail::MonotonicConditionVariable>;
+
+#if defined(__QNX__) || defined(__QNXNTO__)
+static_assert(std::is_base_of_v<CountedConditionVariable, ConditionVariable>);
+#else
+static_assert(
+    std::is_base_of_v<detail::MonotonicConditionVariable, ConditionVariable>);
+#endif
+static_assert(!std::is_copy_constructible_v<ConditionVariable>);
+static_assert(!std::is_move_constructible_v<ConditionVariable>);
+
+template <typename CV>
+class ConditionVariableTest : public ::testing::Test {};
+
+// Exercise the actual QNX implementation on the host as well as the platform
+// class. The first type provides the native backend without waiter counting.
+using Implementations =
+    ::testing::Types<detail::MonotonicConditionVariable,
+                     CountedConditionVariable, ConditionVariable>;
+TYPED_TEST_SUITE(ConditionVariableTest, Implementations);
+
+TYPED_TEST(ConditionVariableTest, TimeoutAndAlreadySatisfiedPredicate) {
+  TypeParam cv;
+  std::mutex mutex;
+  std::unique_lock<std::mutex> lock(mutex);
+  const auto deadline = std::chrono::steady_clock::now() + 1ms;
+  auto status = cv.wait_for(lock, 1ms);
+  // Non-predicate waits may wake spuriously. Keep the original deadline.
+  while (status) {
+    status = cv.wait_until(lock, deadline);
+  }
+  EXPECT_FALSE(cv.wait_until(lock, std::chrono::steady_clock::now()));
+  EXPECT_FALSE(cv.wait_for(lock, std::chrono::nanoseconds::min()));
+  EXPECT_FALSE(
+      cv.wait_until(lock, std::chrono::steady_clock::time_point::min()));
+  EXPECT_TRUE(lock.owns_lock());
+  EXPECT_FALSE(cv.wait_for(lock, 1ms, [] { return false; }));
+  EXPECT_FALSE(cv.wait_until(lock, std::chrono::steady_clock::now(),
+                             [] { return false; }));
+  EXPECT_TRUE(cv.wait_for(lock, -1ms, [] { return true; }));
+  EXPECT_TRUE(cv.wait_until(lock, std::chrono::steady_clock::now(),
+                            [] { return true; }));
+  cv.wait(lock, [] { return true; });
+  EXPECT_TRUE(lock.owns_lock());
+}
+
+TYPED_TEST(ConditionVariableTest, RawWaitReacquiresMutex) {
+  TypeParam cv;
+  std::mutex mutex;
+  std::condition_variable entered_cv;
+  bool entered = false;
+  bool done = false;
+  std::thread waiter([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered = true;
+    entered_cv.notify_one();
+    while (!done) {
+      cv.wait(lock);
+      EXPECT_TRUE(lock.owns_lock());
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered_cv.wait(lock, [&] { return entered; });
+    done = true;
+    cv.notify_one();
+  }
+  waiter.join();
+}
+
+TYPED_TEST(ConditionVariableTest, NotifyAllReleasesAllWaiters) {
+  TypeParam cv;
+  std::mutex mutex;
+  std::condition_variable entered_cv;
+  int entered = 0;
+  int finished = 0;
+  bool ready = false;
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 8; ++i) {
+    threads.emplace_back([&] {
+      std::unique_lock<std::mutex> lock(mutex);
+      ++entered;
+      entered_cv.notify_one();
+      EXPECT_TRUE(cv.wait_for(lock, 10s, [&] { return ready; }));
+      ++finished;
+    });
+  }
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered_cv.wait(lock, [&] { return entered == 8; });
+    ready = true;
+  }
+  cv.notify_all();
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_EQ(finished, 8);
+}
+
+TYPED_TEST(ConditionVariableTest, RepeatedWaitNotifyTransitions) {
+  TypeParam cv;
+  std::mutex mutex;
+  int turn = 0;
+  int completed = 0;
+  bool stop = false;
+  auto exchange = [&](int own_turn) {
+    for (int i = 0; i < 5000; ++i) {
+      std::unique_lock<std::mutex> lock(mutex);
+      const bool woke =
+          cv.wait_for(lock, 10s, [&] { return stop || turn == own_turn; });
+      if (!woke || stop) {
+        EXPECT_TRUE(woke);
+        stop = true;
+        cv.notify_all();
+        return;
+      }
+      ++completed;
+      turn = 1 - own_turn;
+      // Both permitted notification patterns must work at zero/nonzero waiter
+      // transitions. State changes always use the predicate mutex.
+      if (i % 2 == 0) {
+        lock.unlock();
+      }
+      cv.notify_one();
+    }
+  };
+  std::thread first(exchange, 0);
+  std::thread second(exchange, 1);
+  first.join();
+  second.join();
+  EXPECT_EQ(completed, 10000);
+}
+
+TYPED_TEST(ConditionVariableTest, MoveOnlyAndThrowingPredicates) {
+  TypeParam cv;
+  std::mutex mutex;
+  std::unique_lock<std::mutex> lock(mutex);
+  cv.wait(lock, [value = std::make_unique<bool>(true)] { return *value; });
+  EXPECT_TRUE(cv.wait_for(
+      lock, 1ms, [value = std::make_unique<bool>(true)] { return *value; }));
+  EXPECT_TRUE(
+      cv.wait_until(lock, std::chrono::steady_clock::now(),
+                    [value = std::make_unique<bool>(true)] { return *value; }));
+  auto throws = []() -> bool { throw std::runtime_error("predicate"); };
+  EXPECT_THROW(cv.wait(lock, throws), std::runtime_error);
+  EXPECT_THROW(cv.wait_for(lock, 1ms, throws), std::runtime_error);
+  EXPECT_THROW(cv.wait_until(lock, std::chrono::steady_clock::now(), throws),
+               std::runtime_error);
+  EXPECT_TRUE(lock.owns_lock());
+}
+
+// Preserve the existing API used by platform and someip-adapter. Exercise all
+// six wait overloads with the actual priority-inheritance mutex and the legacy
+// UniqueLock subclass, rather than only checking that signatures compile.
+TYPED_TEST(ConditionVariableTest, RealtimeMutexAndBoolTimedWaitCompatibility) {
+  TypeParam cv;
+  RealtimeMutex mutex;
+  UniqueLock<RealtimeMutex> lock(mutex);
+  static_assert(std::is_same_v<decltype(cv.wait_for(lock, 1ms)), bool>);
+  static_assert(std::is_same_v<decltype(cv.wait_until(
+                                   lock, std::chrono::steady_clock::now())),
+                               bool>);
+  cv.wait(lock, [] { return true; });
+  EXPECT_FALSE(cv.wait_for(lock, 1ms, [] { return false; }));
+  EXPECT_FALSE(cv.wait_until(lock, std::chrono::steady_clock::now(),
+                             [] { return false; }));
+  EXPECT_TRUE(cv.wait_for(lock, 1ms, [] { return true; }));
+  EXPECT_TRUE(cv.wait_until(lock, std::chrono::steady_clock::now(),
+                            [] { return true; }));
+
+  // Holding the same mutex ensures the notifier cannot run before the wait
+  // has released it. Loop around raw wait to permit spurious notifications.
+  bool ready = false;
+  std::thread notifier([&] {
+    std::lock_guard<RealtimeMutex> guard(mutex);
+    ready = true;
+    cv.notify_one();
+  });
+  while (!ready) {
+    cv.wait(lock);
+  }
+  EXPECT_TRUE(lock.owns_lock());
+  lock.unlock();
+  notifier.join();
+
+  for (bool relative : {false, true}) {
+    lock.lock();
+    ready = false;
+    std::thread timed_notifier([&] {
+      std::lock_guard<RealtimeMutex> guard(mutex);
+      ready = true;
+      cv.notify_one();
+    });
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    bool notified = true;
+    while (!ready && notified) {
+      notified =
+          relative ? cv.wait_for(lock, 10s) : cv.wait_until(lock, deadline);
+    }
+    EXPECT_TRUE(notified);
+    EXPECT_TRUE(ready);
+    EXPECT_TRUE(lock.owns_lock());
+    lock.unlock();
+    timed_notifier.join();
+  }
+}
+
+TYPED_TEST(ConditionVariableTest,
+           PredicateRecheckedAfterTimedWaitReacquiresLock) {
+  TypeParam cv;
+  std::mutex mutex;
+  std::condition_variable entered_cv;
+  bool entered = false;
+  bool ready = false;
+  std::chrono::steady_clock::time_point deadline;
+  std::thread waiter([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    deadline = std::chrono::steady_clock::now() + 100ms;
+    entered = true;
+    entered_cv.notify_one();
+    EXPECT_TRUE(cv.wait_until(lock, deadline, [&] { return ready; }));
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered_cv.wait(lock, [&] { return entered; });
+    // Hold the mutex past the deadline, then change the predicate. A timeout
+    // alone must not cause false after the predicate becomes true.
+    std::this_thread::sleep_until(deadline + 10ms);
+    ready = true;
+  }
+  waiter.join();
+}
+
+// Count backend notifications, including those which a Linux libc would itself
+// avoid sending to the kernel. This checks the QNX optimization at its
+// boundary.
+class RecordingBackend : public detail::MonotonicConditionVariable {
+ public:
+  inline static std::atomic<int> one_calls{0};
+  inline static std::atomic<int> all_calls{0};
+
+  void notify_one() noexcept {
+    ++one_calls;
+    detail::MonotonicConditionVariable::notify_one();
+  }
+  void notify_all() noexcept {
+    ++all_calls;
+    detail::MonotonicConditionVariable::notify_all();
+  }
+};
+
+class WaiterAccountingTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    RecordingBackend::one_calls = 0;
+    RecordingBackend::all_calls = 0;
+  }
+  void ExpectIdleNotificationsSkipped() {
+    const int one_before = RecordingBackend::one_calls;
+    const int all_before = RecordingBackend::all_calls;
+    cv.notify_one();
+    cv.notify_all();
+    EXPECT_EQ(RecordingBackend::one_calls.load(), one_before);
+    EXPECT_EQ(RecordingBackend::all_calls.load(), all_before);
+  }
+  detail::WaiterAwareConditionVariable<RecordingBackend> cv;
+  std::mutex mutex;
+};
+
+TEST_F(WaiterAccountingTest, SkipsAllIdleNotifications) {
+  for (int i = 0; i < 10000; ++i) {
+    cv.notify_one();
+    cv.notify_all();
+  }
+  EXPECT_EQ(RecordingBackend::one_calls.load(), 0);
+  EXPECT_EQ(RecordingBackend::all_calls.load(), 0);
+}
+
+TEST_F(WaiterAccountingTest, RegistrationSurvivesSpuriousNotification) {
+  std::condition_variable entered_cv;
+  int predicate_checks = 0;
+  bool ready = false;
+  std::thread waiter([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, 10s, [&] {
+      ++predicate_checks;
+      entered_cv.notify_one();
+      return ready;
+    }));
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered_cv.wait(lock, [&] { return predicate_checks > 0; });
+    const int checks_before = predicate_checks;
+    // Registration remains active across the predicate loop.
+    cv.notify_one();
+    entered_cv.wait(lock, [&] { return predicate_checks > checks_before; });
+    ready = true;
+    cv.notify_all();
+  }
+  waiter.join();
+  EXPECT_EQ(RecordingBackend::one_calls.load(), 1);
+  EXPECT_EQ(RecordingBackend::all_calls.load(), 1);
+  ExpectIdleNotificationsSkipped();
+}
+
+TEST_F(WaiterAccountingTest, RawWaitCleansUpAfterNotification) {
+  std::condition_variable entered_cv;
+  bool entered = false;
+  bool done = false;
+  std::thread waiter([&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered = true;
+    entered_cv.notify_one();
+    while (!done) {
+      cv.wait(lock);
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered_cv.wait(lock, [&] { return entered; });
+    done = true;
+    cv.notify_one();
+  }
+  waiter.join();
+  EXPECT_EQ(RecordingBackend::one_calls.load(), 1);
+  ExpectIdleNotificationsSkipped();
+}
+
+TEST_F(WaiterAccountingTest, CleansUpEveryTimedWaitAndException) {
+  std::unique_lock<std::mutex> lock(mutex);
+  while (cv.wait_for(lock, 1ms)) {
+  }
+  ExpectIdleNotificationsSkipped();
+  EXPECT_FALSE(cv.wait_for(lock, 1ms, [] { return false; }));
+  ExpectIdleNotificationsSkipped();
+  EXPECT_FALSE(cv.wait_until(lock, std::chrono::steady_clock::now()));
+  ExpectIdleNotificationsSkipped();
+  EXPECT_FALSE(cv.wait_until(lock, std::chrono::steady_clock::now(),
+                             [] { return false; }));
+  ExpectIdleNotificationsSkipped();
+  cv.wait(lock, [] { return true; });
+  ExpectIdleNotificationsSkipped();
+
+  auto throws = []() -> bool { throw std::runtime_error("predicate"); };
+  EXPECT_THROW(cv.wait(lock, throws), std::runtime_error);
+  ExpectIdleNotificationsSkipped();
+  EXPECT_THROW(cv.wait_for(lock, 1ms, throws), std::runtime_error);
+  ExpectIdleNotificationsSkipped();
+  EXPECT_THROW(cv.wait_until(lock, std::chrono::steady_clock::now(), throws),
+               std::runtime_error);
+  ExpectIdleNotificationsSkipped();
+}
+
+}  // namespace
+}  // namespace deeproute::base

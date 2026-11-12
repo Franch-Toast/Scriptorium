@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 440" role="img" aria-labelledby="title desc">
+<title id="title">参考线、路径与轨迹：同路不同职责</title><desc id="desc">两条车道边界之间，参考线保持笔直，绿色路径绕开橙色障碍物；绿色点标明不同时间的位置。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+<style>text{font-family:system-ui,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d;font-size:20px} .small{font-size:17px} .head{font-size:26px;font-weight:650} .muted{fill:#475569} .axis{stroke:#475569;stroke-width:2;marker-end:url(#arrow)} .blue{stroke:#2563eb;stroke-width:4;fill:none} .green{stroke:#15803d;stroke-width:5;fill:none} .orange{fill:#ffedd5;stroke:#c2410c;stroke-width:2} .dash{stroke-dasharray:10 8}</style>
+<rect width="1100" height="440" rx="16" fill="#f8fafc"/><text x="35" y="43" class="head">参考线、路径与轨迹：同路不同职责</text>
+<rect x="55" y="130" width="990" height="220" fill="#eef2f6"/>
+<path d="M55 130 H1045 M55 350 H1045" stroke="#64748b" stroke-width="5"/>
+<path d="M60 240 H1040" class="blue dash"/>
+<rect x="490" y="215" width="90" height="50" rx="7" class="orange"/>
+<path d="M100 240 C260 240 300 170 430 168 S610 175 695 220 S900 240 1010 240" class="green"/>
+<g fill="#15803d" stroke="white" stroke-width="3"><circle cx="120" cy="240" r="8"/><circle cx="255" cy="217" r="8"/><circle cx="354" cy="181" r="8"/><circle cx="430" cy="168" r="8"/></g>
+<text x="100" y="283">t₀</text><text x="243" y="258">t₁</text><text x="343" y="217">t₂</text><text x="415" y="141">t₃</text>
+<text x="725" y="100">灰边：道路边界</text><text x="735" y="281" fill="#2563eb">蓝虚线：参考基准</text>
+<text x="425" y="100">绿线：绕行路径</text><text x="480" y="307">障碍物</text>
+<text x="55" y="400" class="small">绿点带有时间与运动状态，构成轨迹；等时间间隔的点可有不同空间间距。图形为教学示意。</text>
+</svg>

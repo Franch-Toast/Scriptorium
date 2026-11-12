@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 440" role="img" aria-labelledby="title desc">
+<title id="title">道路与开放空间：两种问题形态</title><desc id="desc">左侧是道路中沿向前参考走向的曲线，右侧是进入车位的前进和倒车分段示意。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs>
+<style>text{font-family:system-ui,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d;font-size:20px} .small{font-size:17px} .head{font-size:26px;font-weight:650} .muted{fill:#475569} .axis{stroke:#475569;stroke-width:2;marker-end:url(#arrow)} .blue{stroke:#2563eb;stroke-width:4;fill:none} .green{stroke:#15803d;stroke-width:5;fill:none} .orange{fill:#ffedd5;stroke:#c2410c;stroke-width:2} .dash{stroke-dasharray:10 8}</style>
+<rect width="1100" height="440" rx="16" fill="#f8fafc"/><text x="35" y="43" class="head">道路与开放空间：两种问题形态</text>
+<rect x="65" y="110" width="400" height="245" fill="#e2e8f0" rx="10"/>
+<path d="M105 125 V340 M425 125 V340" stroke="#64748b" stroke-width="4"/>
+<path d="M265 335 C270 255 230 220 250 130" class="blue dash"/>
+<path d="M260 325 C260 245 315 210 285 130" class="green"/>
+<text x="125" y="95">道路：参考走向缩小问题</text>
+<rect x="600" y="110" width="440" height="245" fill="#f1f5f9" stroke="#94a3b8"/>
+<path d="M885 130 V225 H1005 V130" fill="none" stroke="#475569" stroke-width="4"/>
+<rect x="615" y="130" width="90" height="55" rx="5" class="orange"/>
+<path d="M650 310 C740 310 785 280 820 230" class="green"/>
+<path d="M820 230 C840 300 945 295 945 175" class="blue dash"/>
+<text x="620" y="95">开放空间：位置、朝向与换向</text>
+<text x="677" y="275" class="small">前进段</text><text x="899" y="330" class="small">倒车段</text><text x="920" y="153" class="small">车位</text>
+<text x="55" y="410" class="small">这是问题形态示意，不是可达性验证或真实搜索结果。OpenSpace 还可用于部分绕行相关任务。</text>
+</svg>

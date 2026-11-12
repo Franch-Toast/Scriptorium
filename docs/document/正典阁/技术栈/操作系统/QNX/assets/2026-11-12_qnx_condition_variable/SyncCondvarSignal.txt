@@ -1,0 +1,60 @@
+SyncCondvarSignal(), SyncCondvarSignal_r()
+SyncCondvarSignal() , SyncCondvarSignal_r()
+Wake up any threads that are blocked on a synchronization object
+Synopsis:
+#include <sys/neutrino.h>
+int SyncCondvarSignal( sync_t * condvar ,
+int broadcast );
+int SyncCondvarSignal_r( sync_t * condvar ,
+int broadcast );
+Arguments:
+condvar
+A pointer to a sync_t for the condition variable.
+You must have initialized this argument by calling
+SyncTypeCreate()
+or statically initialized it with the manifest
+PTHREAD_COND_INITIALIZER .
+broadcast
+Zero if you want to make ready to run the thread with the highest
+priority that's been waiting the longest, or nonzero if you want to make
+all waiting threads ready.
+Library:
+libc
+Use the -l c option to
+qcc
+to link against this library.
+This library is usually included automatically.
+Description:
+The SyncCondvarSignal() and SyncCondvarSignal_r()
+kernel calls wake up one or all
+threads that are blocked on the condition variable, condvar .
+These functions are similar, except in the way they indicate errors.
+See the Returns section for details.
+Note:
+Instead of using these kernel calls directly, consider calling
+pthread_cond_broadcast()
+or
+pthread_cond_signal() .
+In all cases, each awakened thread attempts to reacquire the
+controlling mutex passed in
+SyncCondvarWait()
+before control is returned to the thread.
+If the mutex is already locked when the
+kernel attempts to lock it, the thread becomes blocked on the mutex
+until it's unlocked.
+Blocking states
+These calls don't block.
+Returns:
+The only difference between these functions is the way they indicate errors:
+SyncCondvarSignal()
+If an error occurs, the function returns -1 and sets
+errno .
+Any other value returned indicates success.
+SyncCondvarSignal_r()
+EOK is returned on success. This function does NOT set errno .
+If an error occurs, any value in the Errors section may be returned.
+Errors:
+EFAULT
+A fault occurred when the kernel tried to access condvar .
+EINVAL
+The synchronization ID specified in condvar doesn't exist.

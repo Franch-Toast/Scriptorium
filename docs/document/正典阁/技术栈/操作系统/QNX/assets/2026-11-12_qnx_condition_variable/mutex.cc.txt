@@ -1,0 +1,77 @@
+// Copyright 2024 Deeproute.ai. All Rights Reserved.
+
+#include "base/synchronization/mutex.h"
+
+#include <system_error>
+
+namespace {
+class MutexAttrGuard {
+ public:
+  inline explicit MutexAttrGuard(pthread_mutexattr_t& attr) : m_attr(attr) {}
+  inline ~MutexAttrGuard() { pthread_mutexattr_destroy(&m_attr); }
+
+  MutexAttrGuard(const MutexAttrGuard&) = delete;
+  MutexAttrGuard& operator=(const MutexAttrGuard&) = delete;
+
+ private:
+  pthread_mutexattr_t& m_attr;
+};
+}  // namespace
+
+namespace deeproute::base {
+
+// RealtimeMutex
+RealtimeMutex::RealtimeMutex() {
+  pthread_mutexattr_t attr;
+  int result = pthread_mutexattr_init(&attr);
+  if (result != 0) {
+    throw std::system_error(result, std::system_category(),
+                            "Failed to initialize mutex attributes");
+  }
+
+  MutexAttrGuard attrGuard(attr);
+
+  result = pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+  if (result != 0) {
+    throw std::system_error(result, std::system_category(),
+                            "Failed to set mutex protocol");
+  }
+
+  result = pthread_mutex_init(&m_mutex, &attr);
+  if (result != 0) {
+    throw std::system_error(result, std::system_category(),
+                            "Failed to initialize mutex");
+  }
+}
+
+// RecursiveRealtimeMutex
+RecursiveRealtimeMutex::RecursiveRealtimeMutex() {
+  pthread_mutexattr_t attr;
+  int result = pthread_mutexattr_init(&attr);
+  if (result != 0) {
+    throw std::system_error(result, std::system_category(),
+                            "Failed to initialize mutex attributes");
+  }
+
+  MutexAttrGuard attrGuard(attr);
+
+  result = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  if (result != 0) {
+    throw std::system_error(result, std::system_category(),
+                            "Failed to set mutex type to recursive");
+  }
+
+  result = pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+  if (result != 0) {
+    throw std::system_error(result, std::system_category(),
+                            "Failed to set mutex protocol");
+  }
+
+  result = pthread_mutex_init(&m_mutex, &attr);
+  if (result != 0) {
+    throw std::system_error(result, std::system_category(),
+                            "Failed to initialize mutex");
+  }
+}
+
+};  // namespace deeproute::base

@@ -1,0 +1,141 @@
+QNX 7.1 AArch64
+样本：`/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5`。
+
+二进制 SHA-256：`bbcb7def7605d223a96a54d1ac2ae2e3eab7661fe2a9046a9027f2b0b4c18c0f`。
+
+原始 objdump 输出：
+
+
+/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+00000000000360b0 <pthread_cond_signal>:
+   360b0:	52800001 	mov	w1, #0x0                   	// #0
+   360b4:	17ffc30b 	b	26ce0 <SyncCondvarSignal_r@plt>
+
+
+/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+00000000000360b8 <pthread_cond_broadcast>:
+   360b8:	52800021 	mov	w1, #0x1                   	// #1
+   360bc:	17ffc309 	b	26ce0 <SyncCondvarSignal_r@plt>
+
+
+/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+0000000000056908 <SyncCondvarSignal_r>:
+   56908:	52800a68 	mov	w8, #0x53                  	// #83
+   5690c:	d4000a21 	svc	#0x51
+   56910:	d65f03c0 	ret
+   56914:	d65f03c0 	ret
+
+
+QNX 8.0 AArch64
+样本：`/sandbox/toolchains_qnx_sdp8/target/qnx/aarch64le/lib/libc.so.6`。
+
+二进制 SHA-256：`54f790b253b9ae928c7bcd511adc42e14a05e2c42a70be5989ada33c51964b8d`。
+
+原始 objdump 输出：
+
+
+/sandbox/toolchains_qnx_sdp8/target/qnx/aarch64le/lib/libc.so.6:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+0000000000034b80 <pthread_cond_signal>:
+   34b80:	52800001 	mov	w1, #0x0                   	// #0
+   34b84:	17ffc2d3 	b	256d0 <SyncCondvarSignal_r@plt>
+
+
+/sandbox/toolchains_qnx_sdp8/target/qnx/aarch64le/lib/libc.so.6:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+0000000000034b20 <pthread_cond_broadcast>:
+   34b20:	52800021 	mov	w1, #0x1                   	// #1
+   34b24:	17ffc2eb 	b	256d0 <SyncCondvarSignal_r@plt>
+
+
+/sandbox/toolchains_qnx_sdp8/target/qnx/aarch64le/lib/libc.so.6:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+0000000000050454 <SyncCondvarSignal_r>:
+   50454:	52800a68 	mov	w8, #0x53                  	// #83
+   50458:	d4000a21 	svc	#0x51
+   5045c:	d65f03c0 	ret
+   50460:	d65f03c0 	ret
+
+
+Linux glibc 空等待者判断及返回路径
+来源：宿主机 `glibc 2.31`，`/lib/x86_64-linux-gnu/libpthread.so.0`，`pthread_cond_signal@@GLIBC_2.3.2` 的入口及零等待者返回片段；此处是节选而非完整函数。以下为原文快照，代码行号以块内第一行为第 1 行。
+
+SHA-256：`f05345adf05eb80d6fde5b632984b0653a0dfe2c386781e6cc695c4dae02d4c6`。
+
+
+/lib/x86_64-linux-gnu/libpthread.so.0:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+000000000000ff40 <pthread_cond_signal@@GLIBC_2.3.2>:
+    ff40:	f3 0f 1e fa          	endbr64 
+    ff44:	41 57                	push   %r15
+    ff46:	41 56                	push   %r14
+    ff48:	41 55                	push   %r13
+    ff4a:	41 54                	push   %r12
+    ff4c:	55                   	push   %rbp
+    ff4d:	53                   	push   %rbx
+    ff4e:	48 83 ec 38          	sub    $0x38,%rsp
+    ff52:	90                   	nop
+    ff53:	8b 6f 24             	mov    0x24(%rdi),%ebp
+    ff56:	89 e8                	mov    %ebp,%eax
+    ff58:	c1 e8 03             	shr    $0x3,%eax
+    ff5b:	0f 84 d7 00 00 00    	je     10038 <pthread_cond_signal@@GLIBC_2.3.2+0xf8>
+    ff61:	49 89 f8             	mov    %rdi,%r8
+    ff64:	83 e5 01             	and    $0x1,%ebp
+    ff67:	0f 85 e3 00 00 00    	jne    10050 <pthread_cond_signal@@GLIBC_2.3.2+0x110>
+    ff6d:	bd                   	.byte 0xbd
+    ff6e:	81                   	.byte 0x81
+	...
+
+
+/lib/x86_64-linux-gnu/libpthread.so.0:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000010038 <pthread_cond_signal@@GLIBC_2.3.2+0xf8>:
+   10038:	48 83 c4 38          	add    $0x38,%rsp
+   1003c:	31 c0                	xor    %eax,%eax
+   1003e:	5b                   	pop    %rbx
+   1003f:	5d                   	pop    %rbp
+   10040:	41 5c                	pop    %r12
+   10042:	41 5d                	pop    %r13
+   10044:	41 5e                	pop    %r14
+   10046:	41 5f                	pop    %r15
+   10048:	c3                   	retq   
+   10049:	0f 1f 80 00 00 00 00 	nopl   0x0(%rax)

@@ -1,0 +1,76 @@
+pthread_cond_timedwait()
+pthread_cond_timedwait()
+Wait on a condition variable, with a time limit
+Synopsis:
+#include <pthread.h>
+#include <time.h>
+int pthread_cond_timedwait(
+pthread_cond_t* cond ,
+pthread_mutex_t* mutex ,
+const struct timespec* abstime );
+Arguments:
+cond
+The condition variable on which to block the thread.
+mutex
+The mutex associated with the condition variable.
+abstime
+A pointer to a
+timespec
+structure that specifies the absolute time at which the timeout is to expire.
+Library:
+libc
+Use the -l c option to
+qcc
+to link against this library.
+This library is usually included automatically.
+Description:
+The pthread_cond_timedwait() function blocks the calling
+thread on the condition variable cond , and unlocks the
+associated mutex mutex . The calling thread must have locked
+mutex before waiting on the condition variable. Upon return
+from the function, the mutex is again locked and owned by the
+calling thread.
+The calling thread is blocked until either another thread performs
+a signal or broadcast on the condition variable, the absolute time
+specified by abstime has passed, a signal is delivered to the
+thread, or the thread is canceled (waiting on a condition variable is a cancellation point).
+In all cases, the thread reacquires the mutex before being unblocked.
+If you want to choose the clock against which the timeout is measured, you can
+instead use pthread_cond_clockwait() ,
+which is similar to pthread_cond_timedwait()
+and differs only because of its clock parameter ( clk ). Choosing the clock prevents the
+timeout from being affected by changes to the system time.
+Note:
+Don't use a recursive mutex with condition variables.
+If a thread that's blocked on a condition variable is canceled,
+the thread reacquires the mutex that's guarding the condition variable, so
+that the thread's cleanup handlers run in the same state as the critical
+code before and after the call to this function.
+If some other thread owns the lock, the canceled thread blocks until the
+mutex is available.
+Note:
+Make sure that the thread's cleanup handlers unlock the mutex.
+To specify a timeout of less than a second, obtain the current time using
+clock_gettime() ,
+and then add the number of nanoseconds to the abstime.tv_nsec field.
+You can use
+nsec2timespec()
+to convert times in nanoseconds to a timespec structure (and
+timespec2nsec()
+to convert them back again).
+Returns:
+EOK
+Success, or the call was interrupted by a signal.
+EFAULT
+A fault occurred trying to access the buffers provided.
+EINVAL
+One or both of the following are true:
+One or more of cond , mutex , and abstime
+is invalid.
+The mutex has died.
+EPERM
+The current thread doesn't own the mutex.
+ESRCH
+The condvar was destroyed while the thread was blocked on it.
+ETIMEDOUT
+The time specified by abstime has passed.

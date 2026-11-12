@@ -1,0 +1,29 @@
+pthread_cond_signal()
+pthread_cond_signal()
+Unblock a thread that's waiting on a condition variable
+Synopsis:
+#include <pthread.h>
+int pthread_cond_signal( pthread_cond_t* cond );
+Arguments:
+cond
+A pointer to the pthread_cond_t object for which you
+want to unblock the highest-priority thread.
+Library:
+libc
+Use the -l c option to
+qcc
+to link against this library.
+This library is usually included automatically.
+Description:
+The pthread_cond_signal() function unblocks the highest
+priority thread that's waiting on the condition variable, cond .
+If more than one thread at the highest priority is waiting,
+pthread_cond_signal() unblocks the one that has been waiting
+the longest.
+Returns:
+EOK
+Success.
+EFAULT
+A fault occurred trying to access the buffers provided.
+EINVAL
+Invalid condition variable cond .

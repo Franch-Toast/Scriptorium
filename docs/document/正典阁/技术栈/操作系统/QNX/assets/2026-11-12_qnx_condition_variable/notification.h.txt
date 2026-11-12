@@ -1,0 +1,78 @@
+// Copyright 2023 Deeproute.ai. All Rights Reserved.
+// Authors: Jingguang Yun (jingguangyun@deeproute.ai)
+
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <mutex>
+
+#include "base/synchronization/condition_variable.h"
+#include "common/macros.h"
+
+namespace deeproute {
+namespace church {
+namespace base {
+
+class Notification final {
+ public:
+  Notification() = default;
+  ~Notification() { Close(); }
+
+  bool Notify(std::function<void()> set_ready) {
+    std::unique_lock scoped_lock(mutex_);
+    set_ready();
+    cv_.notify_one();
+    return !closed_.load(std::memory_order_acquire);
+  }
+
+  bool WaitForNotification(std::function<bool()> is_ready) {
+    std::unique_lock scoped_lock(mutex_);
+    const auto is_notified = [this, &is_ready]() {
+      return is_ready() || closed_.load(std::memory_order_acquire);
+    };
+    cv_.wait(scoped_lock, is_notified);
+    return !closed_.load(std::memory_order_acquire);
+  }
+
+  bool WaitForNotificationWithTimeout(
+      std::function<bool()> is_ready,
+      const std::chrono::microseconds& timeout) {
+    std::unique_lock scoped_lock(mutex_);
+    const auto is_notified = [this, &is_ready]() {
+      return is_ready() || closed_.load(std::memory_order_acquire);
+    };
+    bool notified = cv_.wait_for(scoped_lock, timeout, is_notified);
+    return notified && !closed_.load(std::memory_order_acquire);
+  }
+
+  bool WaitForNotificationWithDeadline(
+      std::function<bool()> is_ready,
+      const std::chrono::time_point<std::chrono::steady_clock>& deadline) {
+    std::unique_lock scoped_lock(mutex_);
+    const auto is_notified = [this, &is_ready]() {
+      return is_ready() || closed_.load(std::memory_order_acquire);
+    };
+    bool notified = cv_.wait_until(scoped_lock, deadline, is_notified);
+    return notified && !closed_.load(std::memory_order_acquire);
+  }
+
+  void Close() {
+    std::unique_lock scoped_lock(mutex_);
+    closed_.store(true, std::memory_order_release);
+    cv_.notify_all();
+  }
+
+  bool IsClosed() { return closed_.load(std::memory_order_acquire); }
+
+ private:
+  std::atomic<bool> closed_{false};
+  std::mutex mutex_;
+  deeproute::base::ConditionVariable cv_;
+  DISALLOW_COPY_AND_ASSIGN(Notification);
+};
+
+}  // namespace base
+}  // namespace church
+}  // namespace deeproute

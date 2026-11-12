@@ -1,0 +1,37 @@
+
+/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+00000000000360b0 <pthread_cond_signal>:
+   360b0:	52800001 	mov	w1, #0x0                   	// #0
+   360b4:	17ffc30b 	b	26ce0 <SyncCondvarSignal_r@plt>
+
+
+/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+00000000000360b8 <pthread_cond_broadcast>:
+   360b8:	52800021 	mov	w1, #0x1                   	// #1
+   360bc:	17ffc309 	b	26ce0 <SyncCondvarSignal_r@plt>
+
+
+/sandbox/toolchains_qnx/target/qnx7/aarch64le/lib/libc.so.5:     file format elf64-littleaarch64
+
+
+Disassembly of section .plt:
+
+Disassembly of section .text:
+
+0000000000056908 <SyncCondvarSignal_r>:
+   56908:	52800a68 	mov	w8, #0x53                  	// #83
+   5690c:	d4000a21 	svc	#0x51
+   56910:	d65f03c0 	ret
+   56914:	d65f03c0 	ret
